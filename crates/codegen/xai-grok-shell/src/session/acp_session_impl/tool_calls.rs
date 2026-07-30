@@ -745,14 +745,99 @@ impl SessionActor {
             map
         };
         let shared_recovery = Arc::new(tokio::sync::OnceCell::<bool>::const_new());
+        let prompt_id = self
+            .current_prompt_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let cooperation = prompt_id.as_deref().and_then(|prompt_id| {
+            crate::agent::turn_coordinator::get(self.session_info.id.0.as_ref(), prompt_id)
+        });
+        let plan_revision = cooperation
+            .as_ref()
+            .map(|turn| turn.plan_revision)
+            .unwrap_or(0);
+        let task_id = cooperation
+            .as_ref()
+            .and_then(|turn| turn.current_task())
+            .map(|task| task.task_id.clone())
+            .unwrap_or_else(|| "direct".to_string());
+        let mut durable_precomputed = Vec::with_capacity(approved.len());
+        for prepared in &mut approved {
+            let Some(prompt_id) = prompt_id.as_deref() else {
+                durable_precomputed.push(None);
+                continue;
+            };
+            let decision = crate::agent::engagement::prepare_action(
+                self.session_info.id.0.as_ref(),
+                prompt_id,
+                plan_revision,
+                &task_id,
+                &prepared.call_id,
+                prepared.hook_tool_name(),
+                &prepared.parsed_args,
+                prepared.is_read_only,
+            )
+            .await
+            .map_err(|error| {
+                acp::Error::internal_error()
+                    .data(format!("durable action preparation failed: {error}"))
+            })?;
+            match decision {
+                None => durable_precomputed.push(None),
+                Some(crate::agent::engagement::DurableActionDecision::Execute { action_key }) => {
+                    crate::agent::engagement::mark_action_dispatched(
+                        self.session_info.id.0.as_ref(),
+                        prompt_id,
+                        &action_key,
+                    )
+                    .await
+                    .map_err(|error| {
+                        acp::Error::internal_error().data(format!(
+                            "durable action dispatch checkpoint failed: {error}"
+                        ))
+                    })?;
+                    prepared.durable_action = Some(DurablePreparedAction {
+                        action_key,
+                        disposition: DurableActionDisposition::Execute,
+                    });
+                    durable_precomputed.push(None);
+                }
+                Some(crate::agent::engagement::DurableActionDecision::Replay {
+                    action_key,
+                    outcome,
+                }) => {
+                    prepared.durable_action = Some(DurablePreparedAction {
+                        action_key,
+                        disposition: DurableActionDisposition::Replay,
+                    });
+                    durable_precomputed.push(Some(*outcome));
+                }
+                Some(crate::agent::engagement::DurableActionDecision::Ambiguous { action_key }) => {
+                    prepared.durable_action = Some(DurablePreparedAction {
+                        action_key: action_key.clone(),
+                        disposition: DurableActionDisposition::Ambiguous,
+                    });
+                    durable_precomputed.push(Some(Err(xai_tool_runtime::ToolError::new(
+                        xai_tool_runtime::ToolErrorKind::Execution,
+                        format!(
+                            "tool action {action_key} has an ambiguous prior dispatch; \
+                             it was not repeated"
+                        ),
+                    ))));
+                }
+            }
+        }
         let workspace_ops = self.workspace_ops.clone();
         let pending_interjections = self.pending_interjections.clone();
         let session_id: Arc<str> = Arc::from(&*self.session_info.id.0);
         let dispatch_futures: Vec<_> = approved
             .iter()
+            .cloned()
+            .zip(durable_precomputed)
             .enumerate()
-            .map(|(idx, prepared)| {
-                let prepared = Arc::new(prepared.clone());
+            .map(|(idx, (prepared, precomputed))| {
+                let prepared = Arc::new(prepared);
                 let am = self.auth_manager.clone();
                 let shared_recovery = Arc::clone(&shared_recovery);
                 let workspace_ops = workspace_ops.clone();
@@ -779,7 +864,9 @@ impl SessionActor {
                             dispatch_tool(&workspace_ops, &prepared, &session_id).await
                         }
                     };
-                    let result = if interruptible {
+                    let result = if let Some(result) = precomputed {
+                        result
+                    } else if interruptible {
                         let _wait_guard = BlockingWaitGuard::enter(blocking_wait_depth.clone());
                         tokio::select! {
                             biased;
@@ -862,6 +949,51 @@ impl SessionActor {
                 if auth_rejected && self.reactive_managed_reauth(&server).await.is_ok() {
                     result = dispatch_tool(&self.workspace_ops, &prepared, &self.session_info.id.0)
                         .await;
+                }
+            }
+            if let (Some(prompt_id), Some(durable_action)) =
+                (prompt_id.as_deref(), prepared.durable_action.as_ref())
+            {
+                match durable_action.disposition {
+                    DurableActionDisposition::Execute => {
+                        crate::agent::engagement::observe_action(
+                            self.session_info.id.0.as_ref(),
+                            prompt_id,
+                            &durable_action.action_key,
+                            &result,
+                        )
+                        .await
+                        .map_err(|error| {
+                            acp::Error::internal_error().data(format!(
+                                "durable action observation checkpoint failed: {error}"
+                            ))
+                        })?;
+                        crate::agent::engagement::commit_action(
+                            self.session_info.id.0.as_ref(),
+                            prompt_id,
+                            &durable_action.action_key,
+                            &result,
+                        )
+                        .await
+                        .map_err(|error| {
+                            acp::Error::internal_error()
+                                .data(format!("durable action commit checkpoint failed: {error}"))
+                        })?;
+                    }
+                    DurableActionDisposition::Replay => {
+                        crate::agent::engagement::commit_action(
+                            self.session_info.id.0.as_ref(),
+                            prompt_id,
+                            &durable_action.action_key,
+                            &result,
+                        )
+                        .await
+                        .map_err(|error| {
+                            acp::Error::internal_error()
+                                .data(format!("durable replay commit checkpoint failed: {error}"))
+                        })?;
+                    }
+                    DurableActionDisposition::Ambiguous => {}
                 }
             }
             let tool_result_size_bytes = match &result {
@@ -1709,6 +1841,7 @@ impl SessionActor {
             concatenated_json_count,
             dispatch_target_name,
             is_read_only,
+            durable_action: None,
         };
         Ok(Ok(prepared))
     }

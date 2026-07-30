@@ -307,10 +307,57 @@ impl SessionActor {
                 self.signals_handle().record_edit_and_retry();
             }
         }
+        let durable_user_request = prompt_blocks.iter().fold(String::new(), |mut text, block| {
+            if let acp::ContentBlock::Text(content) = block {
+                text.push_str(&content.text);
+            }
+            text
+        });
+        let engagement_database =
+            crate::session::persistence::session_dir(&self.session_info).join("engagements.sqlite");
+        let _engagement_guard = crate::agent::engagement::begin_turn(
+            engagement_database,
+            self.session_info.id.0.as_ref(),
+            prompt_id,
+            self.session_info.cwd.as_str(),
+            &durable_user_request,
+        )
+        .await
+        .map_err(|error| {
+            acp::Error::internal_error()
+                .data(format!("durable engagement admission failed: {error}"))
+        })?;
         if let Some(bash_command) = Self::extract_bash_command(&prompt_blocks) {
-            return self
+            crate::agent::engagement::transition(
+                self.session_info.id.0.as_ref(),
+                prompt_id,
+                xai_grok_engagement::EngagementStatus::Executing,
+                Some(xai_grok_engagement::EngagementStage::Direct),
+                xai_grok_engagement::EngagementCheckpoint::default(),
+                serde_json::json!({"mode": "direct_bash"}),
+            )
+            .await
+            .map_err(|error| {
+                acp::Error::internal_error()
+                    .data(format!("durable direct-bash checkpoint failed: {error}"))
+            })?;
+            let result = self
                 .handle_direct_bash_command(prompt_id, bash_command, &prompt_blocks)
                 .await;
+            if result.is_ok() {
+                crate::agent::engagement::complete(
+                    self.session_info.id.0.as_ref(),
+                    prompt_id,
+                    xai_grok_engagement::EngagementCheckpoint::default(),
+                    serde_json::json!({"mode": "direct_bash", "completed": true}),
+                )
+                .await
+                .map_err(|error| {
+                    acp::Error::internal_error()
+                        .data(format!("durable direct-bash completion failed: {error}"))
+                })?;
+            }
+            return result;
         }
         let cooperation =
             crate::agent::turn_coordinator::TurnCooperation::from_blocks(&prompt_blocks);
@@ -836,6 +883,22 @@ impl SessionActor {
             }
         }
         if let Some(turn) = cooperation.as_ref().filter(|turn| turn.mode.plans()) {
+            crate::agent::engagement::transition(
+                self.session_info.id.0.as_ref(),
+                prompt_id,
+                xai_grok_engagement::EngagementStatus::Planning,
+                Some(xai_grok_engagement::EngagementStage::Planner),
+                xai_grok_engagement::EngagementCheckpoint {
+                    model_id: Some(turn.planner_model.clone()),
+                    ..xai_grok_engagement::EngagementCheckpoint::default()
+                },
+                serde_json::json!({"cooperation_mode": turn.mode}),
+            )
+            .await
+            .map_err(|error| {
+                acp::Error::internal_error()
+                    .data(format!("durable planner checkpoint failed: {error}"))
+            })?;
             match self
                 .prepare_cooperation_plan(prompt_id, &prompt_text_for_hook, turn)
                 .await
@@ -857,7 +920,7 @@ impl SessionActor {
                         "objective": plan.objective.clone(),
                         "task_index": 0,
                         "task_count": task_count,
-                        "task": first_task,
+                        "task": first_task.clone(),
                         "task_evidence": task_evidence,
                         "working_evidence":
                             crate::agent::turn_coordinator::recent_evidence(turn, 8),
@@ -867,8 +930,30 @@ impl SessionActor {
                     crate::agent::turn_coordinator::set_plan(
                         self.session_info.id.0.as_ref(),
                         prompt_id,
-                        plan,
+                        plan.clone(),
                     );
+                    crate::agent::engagement::transition(
+                        self.session_info.id.0.as_ref(),
+                        prompt_id,
+                        xai_grok_engagement::EngagementStatus::Executing,
+                        Some(xai_grok_engagement::EngagementStage::Executor),
+                        xai_grok_engagement::EngagementCheckpoint {
+                            plan: serde_json::to_value(&plan).ok(),
+                            plan_revision: 0,
+                            task_id: Some(first_task.task_id.clone()),
+                            task_index: 0,
+                            task_count: u32::try_from(task_count).unwrap_or(u32::MAX),
+                            completion_tests: plan.completion_tests.clone(),
+                            model_id: Some(turn.executor_model.clone()),
+                            ..xai_grok_engagement::EngagementCheckpoint::default()
+                        },
+                        serde_json::json!({"planner": "completed"}),
+                    )
+                    .await
+                    .map_err(|error| {
+                        acp::Error::internal_error()
+                            .data(format!("durable executor checkpoint failed: {error}"))
+                    })?;
                     self.push_system_reminder(&format!(
                         "<cooperation_task>{task_packet}</cooperation_task>\n\
                          Execute only this task against real tools. Return a concise typed \
@@ -885,8 +970,46 @@ impl SessionActor {
                         self.session_info.id.0.as_ref(),
                         prompt_id,
                     );
+                    crate::agent::engagement::transition(
+                        self.session_info.id.0.as_ref(),
+                        prompt_id,
+                        xai_grok_engagement::EngagementStatus::Executing,
+                        Some(xai_grok_engagement::EngagementStage::Direct),
+                        xai_grok_engagement::EngagementCheckpoint {
+                            model_id: Some(turn.executor_model.clone()),
+                            ..xai_grok_engagement::EngagementCheckpoint::default()
+                        },
+                        serde_json::json!({
+                            "planner": "degraded_to_direct",
+                            "error": error,
+                        }),
+                    )
+                    .await
+                    .map_err(|checkpoint_error| {
+                        acp::Error::internal_error().data(format!(
+                            "durable planner degradation checkpoint failed: {checkpoint_error}"
+                        ))
+                    })?;
                 }
             }
+        } else {
+            let model_id = self.current_model_id().await;
+            crate::agent::engagement::transition(
+                self.session_info.id.0.as_ref(),
+                prompt_id,
+                xai_grok_engagement::EngagementStatus::Executing,
+                Some(xai_grok_engagement::EngagementStage::Direct),
+                xai_grok_engagement::EngagementCheckpoint {
+                    model_id: Some(model_id),
+                    ..xai_grok_engagement::EngagementCheckpoint::default()
+                },
+                serde_json::json!({"cooperation_mode": "direct"}),
+            )
+            .await
+            .map_err(|error| {
+                acp::Error::internal_error()
+                    .data(format!("durable direct checkpoint failed: {error}"))
+            })?;
         }
         self.dispatch_hook(
             xai_grok_hooks::event::HookEventName::UserPromptSubmit,
@@ -2515,7 +2638,7 @@ impl SessionActor {
                     let task_packet = serde_json::json!({
                         "task_index": task_index,
                         "task_count": task_count,
-                        "task": task,
+                        "task": task.clone(),
                         "task_evidence": task_evidence,
                         "working_evidence": cooperation
                             .as_ref()
@@ -2524,6 +2647,52 @@ impl SessionActor {
                             })
                             .unwrap_or_default(),
                     });
+                    if let Some(turn_checkpoint) =
+                        crate::agent::turn_coordinator::get(self.session_info.id.0.as_ref(), req_id)
+                    {
+                        let status = if turn_checkpoint.plan_revision > 0 {
+                            xai_grok_engagement::EngagementStatus::Correcting
+                        } else {
+                            xai_grok_engagement::EngagementStatus::Executing
+                        };
+                        let stage = if turn_checkpoint.plan_revision > 0 {
+                            xai_grok_engagement::EngagementStage::Correction
+                        } else {
+                            xai_grok_engagement::EngagementStage::Executor
+                        };
+                        crate::agent::engagement::transition(
+                            self.session_info.id.0.as_ref(),
+                            req_id,
+                            status,
+                            Some(stage),
+                            xai_grok_engagement::EngagementCheckpoint {
+                                plan: turn_checkpoint
+                                    .plan
+                                    .as_ref()
+                                    .and_then(|plan| serde_json::to_value(plan).ok()),
+                                plan_revision: turn_checkpoint.plan_revision,
+                                task_id: Some(task.task_id.clone()),
+                                task_index: u32::try_from(task_index).unwrap_or(u32::MAX),
+                                task_count: u32::try_from(task_count).unwrap_or(u32::MAX),
+                                correction_count: u8::try_from(turn_checkpoint.plan_revision)
+                                    .unwrap_or(u8::MAX),
+                                completion_tests: turn_checkpoint
+                                    .plan
+                                    .as_ref()
+                                    .map(|plan| plan.completion_tests.clone())
+                                    .unwrap_or_default(),
+                                model_id: Some(turn_checkpoint.executor_model),
+                                ..xai_grok_engagement::EngagementCheckpoint::default()
+                            },
+                            serde_json::json!({"task_advanced": task.task_id}),
+                        )
+                        .await
+                        .map_err(|error| {
+                            acp::Error::internal_error().data(format!(
+                                "durable task advancement checkpoint failed: {error}"
+                            ))
+                        })?;
+                    }
                     self.push_system_reminder(&format!(
                         "<cooperation_task>{task_packet}</cooperation_task>\n\
                          Execute only this next task. Use prior tool results as immutable evidence; \
@@ -2539,6 +2708,41 @@ impl SessionActor {
                     let executor_response = response_text_for_cooperation(
                         &self.chat_state_handle.get_conversation().await,
                     );
+                    crate::agent::engagement::transition(
+                        self.session_info.id.0.as_ref(),
+                        req_id,
+                        xai_grok_engagement::EngagementStatus::Reviewing,
+                        Some(xai_grok_engagement::EngagementStage::Reviewer),
+                        xai_grok_engagement::EngagementCheckpoint {
+                            plan: cooperation
+                                .plan
+                                .as_ref()
+                                .and_then(|plan| serde_json::to_value(plan).ok()),
+                            plan_revision: cooperation.plan_revision,
+                            task_id: cooperation.current_task().map(|task| task.task_id.clone()),
+                            task_index: u32::try_from(cooperation.active_task_index)
+                                .unwrap_or(u32::MAX),
+                            task_count: cooperation
+                                .plan
+                                .as_ref()
+                                .map(|plan| u32::try_from(plan.tasks.len()).unwrap_or(u32::MAX))
+                                .unwrap_or(0),
+                            correction_count: cooperation_corrections,
+                            completion_tests: cooperation
+                                .plan
+                                .as_ref()
+                                .map(|plan| plan.completion_tests.clone())
+                                .unwrap_or_default(),
+                            model_id: Some(cooperation.reviewer_model.clone()),
+                            ..xai_grok_engagement::EngagementCheckpoint::default()
+                        },
+                        serde_json::json!({"executor_response_ready": true}),
+                    )
+                    .await
+                    .map_err(|error| {
+                        acp::Error::internal_error()
+                            .data(format!("durable reviewer checkpoint failed: {error}"))
+                    })?;
                     match self
                         .run_cooperation_review(req_id, cooperation, &executor_response)
                         .await
@@ -2572,6 +2776,10 @@ impl SessionActor {
                                     tasks,
                                 )
                             {
+                                let correction_turn = crate::agent::turn_coordinator::get(
+                                    self.session_info.id.0.as_ref(),
+                                    req_id,
+                                );
                                 let task_evidence = self
                                     .cooperation_memory_evidence(
                                         &format!(
@@ -2585,7 +2793,7 @@ impl SessionActor {
                                 let correction = serde_json::json!({
                                     "task_index": 0,
                                     "task_count": task_count,
-                                    "task": task,
+                                    "task": task.clone(),
                                     "task_evidence": task_evidence,
                                     "working_evidence":
                                         crate::agent::turn_coordinator::recent_evidence(
@@ -2593,6 +2801,40 @@ impl SessionActor {
                                             8,
                                         ),
                                 });
+                                if let Some(correction_turn) = correction_turn {
+                                    crate::agent::engagement::transition(
+                                        self.session_info.id.0.as_ref(),
+                                        req_id,
+                                        xai_grok_engagement::EngagementStatus::Correcting,
+                                        Some(xai_grok_engagement::EngagementStage::Correction),
+                                        xai_grok_engagement::EngagementCheckpoint {
+                                            plan: correction_turn
+                                                .plan
+                                                .as_ref()
+                                                .and_then(|plan| serde_json::to_value(plan).ok()),
+                                            plan_revision: correction_turn.plan_revision,
+                                            task_id: Some(task.task_id.clone()),
+                                            task_index: 0,
+                                            task_count: u32::try_from(task_count)
+                                                .unwrap_or(u32::MAX),
+                                            correction_count: cooperation_corrections,
+                                            completion_tests: correction_turn
+                                                .plan
+                                                .as_ref()
+                                                .map(|plan| plan.completion_tests.clone())
+                                                .unwrap_or_default(),
+                                            model_id: Some(correction_turn.executor_model),
+                                            ..xai_grok_engagement::EngagementCheckpoint::default()
+                                        },
+                                        serde_json::json!({"correction_cycle": 1}),
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        acp::Error::internal_error().data(format!(
+                                            "durable correction checkpoint failed: {error}"
+                                        ))
+                                    })?;
+                                }
                                 self.push_system_reminder(&format!(
                                     "<cooperation_correction>{correction}</cooperation_correction>\n\
                                      Perform only this correction task using existing evidence. \
@@ -2707,6 +2949,25 @@ impl SessionActor {
                     }
                     _ => None,
                 };
+                crate::agent::engagement::complete(
+                    self.session_info.id.0.as_ref(),
+                    req_id,
+                    durable_completion_checkpoint(
+                        self.session_info.id.0.as_ref(),
+                        req_id,
+                        cooperation_corrections,
+                    ),
+                    serde_json::json!({
+                        "tools_called": turn_tools_called.clone(),
+                        "structured_output": structured_output.clone(),
+                        "refused": turn_refused,
+                    }),
+                )
+                .await
+                .map_err(|error| {
+                    acp::Error::internal_error()
+                        .data(format!("durable turn completion failed: {error}"))
+                })?;
                 return Ok(TurnOutcome::Completed {
                     snapshot: Box::new(snapshot),
                     tools_called: turn_tools_called,
@@ -2734,6 +2995,25 @@ impl SessionActor {
                                 model_fingerprint.clone(),
                             )
                             .await;
+                        crate::agent::engagement::complete(
+                            self.session_info.id.0.as_ref(),
+                            req_id,
+                            durable_completion_checkpoint(
+                                self.session_info.id.0.as_ref(),
+                                req_id,
+                                cooperation_corrections,
+                            ),
+                            serde_json::json!({
+                                "tools_called": turn_tools_called.clone(),
+                                "structured_output": validated.clone(),
+                            }),
+                        )
+                        .await
+                        .map_err(|error| {
+                            acp::Error::internal_error().data(format!(
+                                "durable structured-output completion failed: {error}"
+                            ))
+                        })?;
                         return Ok(TurnOutcome::Completed {
                             snapshot: Box::new(snapshot),
                             tools_called: turn_tools_called,
@@ -2901,6 +3181,48 @@ fn hash_step_signature(signature: &str) -> u64 {
 }
 fn command_is_true(cmd: &str) -> bool {
     cmd.trim().eq_ignore_ascii_case("true")
+}
+
+fn durable_completion_checkpoint(
+    session_id: &str,
+    prompt_id: &str,
+    correction_count: u8,
+) -> xai_grok_engagement::EngagementCheckpoint {
+    let Some(cooperation) = crate::agent::turn_coordinator::get(session_id, prompt_id) else {
+        return xai_grok_engagement::EngagementCheckpoint::default();
+    };
+    xai_grok_engagement::EngagementCheckpoint {
+        plan: cooperation
+            .plan
+            .as_ref()
+            .and_then(|plan| serde_json::to_value(plan).ok()),
+        plan_revision: cooperation.plan_revision,
+        task_id: cooperation.current_task().map(|task| task.task_id.clone()),
+        task_index: u32::try_from(cooperation.active_task_index).unwrap_or(u32::MAX),
+        task_count: cooperation
+            .plan
+            .as_ref()
+            .map(|plan| u32::try_from(plan.tasks.len()).unwrap_or(u32::MAX))
+            .unwrap_or(0),
+        correction_count,
+        completion_tests: cooperation
+            .plan
+            .as_ref()
+            .map(|plan| plan.completion_tests.clone())
+            .unwrap_or_default(),
+        evidence_ids: cooperation
+            .evidence
+            .snapshot()
+            .into_iter()
+            .map(|record| record.evidence_id.0)
+            .collect(),
+        model_id: Some(if cooperation.mode.reviews() {
+            cooperation.reviewer_model
+        } else {
+            cooperation.executor_model
+        }),
+        ..xai_grok_engagement::EngagementCheckpoint::default()
+    }
 }
 
 fn response_text_for_cooperation(conversation: &[ConversationItem]) -> String {

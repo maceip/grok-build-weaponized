@@ -558,6 +558,22 @@ pub(crate) struct PreparedToolCall {
     dispatch_target_name: Option<String>,
     /// Read-only per `ToolKind`; decides whether the call takes the per-file lock.
     is_read_only: bool,
+    /// Durable action identity and whether this dispatch is new, replayed, or
+    /// blocked on an ambiguous prior side effect.
+    durable_action: Option<DurablePreparedAction>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DurablePreparedAction {
+    action_key: String,
+    disposition: DurableActionDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableActionDisposition {
+    Execute,
+    Replay,
+    Ambiguous,
 }
 impl PreparedToolCall {
     /// The tool name hooks see: the resolved dispatch target, else the wire name.

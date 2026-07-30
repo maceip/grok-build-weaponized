@@ -2651,7 +2651,9 @@ mod tests {
             )
             .is_err()
         );
-        assert!(serde_json::from_str::<BashToolInput>(r#"{"command":"x"}"#).is_err());
+        let minimal = parse(r#"{"command":"x"}"#);
+        assert!(minimal.description.is_empty());
+        assert!(!minimal.is_background);
     }
 
     // A foreground command must not block longer than the cap, whatever its
@@ -3198,7 +3200,10 @@ mod tests {
 
         // Small limit so truncation fires early; ~1.8 KB of ASCII output over
         // ~1.8s easily exceeds it and keeps emitting across the shrinking tail.
-        let (resources, _tmp) = make_real_resources(Some(200));
+        // Keep the threshold below one normal 100 ms notification batch. That
+        // makes the first data delta truncated even when the full suite delays
+        // timer polling and coalesces several command writes into one tick.
+        let (resources, _tmp) = make_real_resources(Some(32));
         let tool = BashTool;
         let mut stream = xai_tool_runtime::Tool::execute(
             &tool,

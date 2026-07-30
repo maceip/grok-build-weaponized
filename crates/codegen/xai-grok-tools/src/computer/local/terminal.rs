@@ -74,6 +74,38 @@ const MAX_SESSION_OUTPUT_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
 const MAX_GLOBAL_OUTPUT_BYTES: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB
 static PROCESS_SPOOL_BYTES: AtomicU64 = AtomicU64::new(0);
 
+fn execution_command_hash(request: &TerminalRunRequest) -> String {
+    let mut environment = request.env.iter().collect::<Vec<_>>();
+    environment.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let mut hasher = blake3::Hasher::new();
+    for part in [
+        request.command.as_bytes(),
+        request.working_directory.as_os_str().as_encoded_bytes(),
+    ] {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    for (key, value) in environment {
+        for part in [key.as_bytes(), value.as_bytes()] {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn durable_process_group_id(pid: Option<u32>) -> Option<i64> {
+    #[cfg(unix)]
+    {
+        pid.map(i64::from)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 fn output_file_cap_from_env() -> u64 {
     std::env::var("GROK_MAX_OUTPUT_FILE_BYTES")
         .ok()
@@ -1248,11 +1280,13 @@ impl LocalTerminalActor {
         // Generate an internal ID — foreground callers never see this; the reply
         // goes back on the oneshot channel.
         let internal_id = uuid::Uuid::now_v7().to_string();
-        let execution_job = match ExecutionSupervisor::global().jobs().register(
+        let execution_job = match ExecutionSupervisor::global().register_job(
             internal_id.clone(),
             ExecutionJobKind::Terminal,
             request.owner_session_id.clone(),
             Some(request.output_file.clone()),
+            Some(&request.tool_call_id),
+            execution_command_hash(&request),
         ) {
             Ok(job) => job,
             Err(error) => {
@@ -1260,6 +1294,13 @@ impl LocalTerminalActor {
                 return;
             }
         };
+        if let Err(error) = execution_job.persist_spawn_intent().await {
+            execution_job.fail(error.clone());
+            let _ = reply.send(Err(ComputerError::io(format!(
+                "failed to persist process spawn intent: {error}"
+            ))));
+            return;
+        }
         let file_handle = match open_output_file(&request.output_file).await {
             Ok(file) => Some(file),
             Err(error) => {
@@ -1284,6 +1325,19 @@ impl LocalTerminalActor {
                 return;
             }
         };
+        let pid = child.id();
+        if let Err(error) = execution_job
+            .attach_process(pid, durable_process_group_id(pid))
+            .await
+        {
+            let _ = process_group.terminate();
+            let _ = child.wait().await;
+            execution_job.fail(error.clone());
+            let _ = reply.send(Err(ComputerError::io(format!(
+                "failed to persist spawned process identity: {error}"
+            ))));
+            return;
+        }
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdout_closed = stdout.is_none();
@@ -1407,11 +1461,13 @@ impl LocalTerminalActor {
     ) {
         // Generate task_id — the actor owns the identity.
         let task_id = uuid::Uuid::now_v7().to_string();
-        let execution_job = match ExecutionSupervisor::global().jobs().register(
+        let execution_job = match ExecutionSupervisor::global().register_job(
             task_id.clone(),
             ExecutionJobKind::Terminal,
             request.owner_session_id.clone(),
             Some(request.output_file.clone()),
+            Some(&request.tool_call_id),
+            execution_command_hash(&request),
         ) {
             Ok(job) => job,
             Err(error) => {
@@ -1419,6 +1475,13 @@ impl LocalTerminalActor {
                 return;
             }
         };
+        if let Err(error) = execution_job.persist_spawn_intent().await {
+            execution_job.fail(error.clone());
+            let _ = reply.send(Err(ComputerError::io(format!(
+                "failed to persist process spawn intent: {error}"
+            ))));
+            return;
+        }
         let file_handle = match open_output_file(&request.output_file).await {
             Ok(file) => Some(file),
             Err(error) => {
@@ -1444,6 +1507,19 @@ impl LocalTerminalActor {
                 return;
             }
         };
+        let pid = child.id();
+        if let Err(error) = execution_job
+            .attach_process(pid, durable_process_group_id(pid))
+            .await
+        {
+            let _ = process_group.terminate();
+            let _ = child.wait().await;
+            execution_job.fail(error.clone());
+            let _ = reply.send(Err(ComputerError::io(format!(
+                "failed to persist spawned process identity: {error}"
+            ))));
+            return;
+        }
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdout_closed = stdout.is_none();
@@ -1615,7 +1691,7 @@ impl LocalTerminalActor {
         let Some(process_key) = self.stream_routes.get(&stream_id).cloned() else {
             return;
         };
-        let (bytes_added, owner, task_total) = {
+        let (bytes_added, owner, task_total, durable_update) = {
             let mut bytes_added = 0_u64;
             let Some(process) = self.processes.get_mut(&process_key) else {
                 return;
@@ -1675,11 +1751,20 @@ impl LocalTerminalActor {
                 bytes_added,
                 process.owner_session_id.clone(),
                 u64::try_from(process.total_bytes).unwrap_or(u64::MAX),
+                (
+                    process.execution_job.clone(),
+                    process.stdout_bytes,
+                    process.stderr_bytes,
+                    process.execution_payload(),
+                ),
             )
         };
         if bytes_added == 0 {
             return;
         }
+        durable_update
+            .0
+            .update_streams(durable_update.1, durable_update.2, durable_update.3);
 
         self.total_spool_bytes = self.total_spool_bytes.saturating_add(bytes_added);
         let owner_key = owner.unwrap_or_else(|| "<unowned>".to_string());

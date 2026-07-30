@@ -14286,6 +14286,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-grok-engagement"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "xai-sqlite-journal",
+]
+
+[[package]]
 name = "xai-grok-env"
 version = "0.1.0"
 dependencies = [
@@ -14956,6 +14972,7 @@ dependencies = [
  "xai-grok-compaction",
  "xai-grok-config",
  "xai-grok-config-types",
+ "xai-grok-engagement",
  "xai-grok-hooks",
  "xai-grok-http",
  "xai-grok-mcp",
@@ -15143,6 +15160,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "base64 0.22.1",
+ "blake3",
  "chrono",
  "command-fds",
  "crc32fast",
@@ -15199,6 +15217,7 @@ dependencies = [
  "xai-computer-hub-sdk",
  "xai-file-utils",
  "xai-grok-config",
+ "xai-grok-engagement",
  "xai-grok-env",
  "xai-grok-sandbox",
  "xai-grok-test-support",

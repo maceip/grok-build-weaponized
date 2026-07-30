@@ -127,6 +127,7 @@ pub(crate) struct TurnCooperation {
     pub executor_model: String,
     pub reviewer_model: String,
     pub plan: Option<PlanPacket>,
+    pub plan_revision: u32,
     pub active_task_index: usize,
     pub reviewer_memory: Option<Vec<serde_json::Value>>,
     pub reviewer_memory_prefetch_started: bool,
@@ -146,6 +147,7 @@ impl TurnCooperation {
             executor_model: meta.get(META_EXECUTOR)?.as_str()?.to_string(),
             reviewer_model: meta.get(META_REVIEWER)?.as_str()?.to_string(),
             plan: None,
+            plan_revision: 0,
             active_task_index: 0,
             reviewer_memory: None,
             reviewer_memory_prefetch_started: false,
@@ -329,6 +331,7 @@ pub(crate) fn begin_correction(
     let first = tasks.first()?.clone();
     let count = tasks.len();
     turn.plan.as_mut()?.tasks = tasks;
+    turn.plan_revision = turn.plan_revision.saturating_add(1);
     turn.active_task_index = 0;
     turn.reviewer_memory = None;
     turn.reviewer_memory_prefetch_started = false;
@@ -506,6 +509,7 @@ mod tests {
                 executor_model: "qwen".to_string(),
                 reviewer_model: "vibe".to_string(),
                 plan: None,
+                plan_revision: 0,
                 active_task_index: 0,
                 reviewer_memory: None,
                 reviewer_memory_prefetch_started: false,

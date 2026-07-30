@@ -513,11 +513,24 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
         })
         .await;
 }
-#[tokio::test(flavor = "current_thread")]
-async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
+#[test]
+fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
+    // This fixture materializes the complete SessionActor inside one async
+    // state machine. Run it on the same class of explicitly sized thread used
+    // by production sessions instead of the test harness's small default
+    // thread stack.
+    std::thread::Builder::new()
+        .name("memory-injection-disabled".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("memory-injection-disabled runtime");
+            runtime.block_on(async {
+                let local = tokio::task::LocalSet::new();
+                local
+                    .run_until(async {
             let session_dir = tempfile::tempdir().expect("tempdir");
             let session_info = crate::session::info::Info {
                 id: acp::SessionId::new("persist-memory-disabled"),
@@ -850,8 +863,13 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     .injection_count
                     .load(std::sync::atomic::Ordering::Relaxed)
             );
+                    })
+                    .await;
+            });
         })
-        .await;
+        .expect("memory-injection-disabled test thread")
+        .join()
+        .expect("memory-injection-disabled test thread panicked");
 }
 /// Hard teardown (`kill_background_tasks = true`, the subagent-shutdown path)
 /// aborts the running turn AND drains every queued prompt, responding

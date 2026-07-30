@@ -114,6 +114,13 @@ fn nmap_job_response(
             job_id: snapshot.job_id,
             elapsed_millis: snapshot.elapsed_millis,
         }),
+        ExecutionJobLifecycle::Lost => Ok(NativeNmapJobResponse::Failed {
+            job_id: snapshot.job_id,
+            elapsed_millis: snapshot.elapsed_millis,
+            error: snapshot.error.unwrap_or_else(|| {
+                "native Nmap process identity could not be safely recovered".to_string()
+            }),
+        }),
     }
 }
 
@@ -299,9 +306,19 @@ impl xai_tool_runtime::Tool for NativeNmapJobTool {
     #[tracing::instrument(name = "tool.native_nmap_job", skip_all)]
     async fn run(
         &self,
-        _ctx: xai_tool_runtime::ToolCallContext,
+        ctx: xai_tool_runtime::ToolCallContext,
         input: NativeNmapJobRequest,
     ) -> Result<NativeNmapJobResponse, xai_tool_runtime::ToolError> {
+        let owner_session_id =
+            if let Ok(resources) = crate::types::tool_metadata::shared_resources(&ctx) {
+                resources
+                    .lock()
+                    .await
+                    .get::<crate::types::resources::OwnerSessionId>()
+                    .map(|owner| owner.0.clone())
+            } else {
+                None
+            };
         match input {
             NativeNmapJobRequest::Start { scan } => {
                 let scope_targets = configured_scope().ok_or_else(|| {
@@ -335,11 +352,29 @@ impl xai_tool_runtime::Tool for NativeNmapJobTool {
                     ));
                 }
                 let job_id = uuid::Uuid::now_v7().simple().to_string();
-                let job = registry
-                    .register(job_id.clone(), ExecutionJobKind::Nmap, None, None)
+                let command_hash = blake3::hash(
+                    &serde_json::to_vec(&scan).unwrap_or_else(|_| scan.target.as_bytes().to_vec()),
+                )
+                .to_hex()
+                .to_string();
+                let job = ExecutionSupervisor::global()
+                    .register_job(
+                        job_id.clone(),
+                        ExecutionJobKind::Nmap,
+                        owner_session_id,
+                        None,
+                        Some(ctx.call_id.as_str()),
+                        command_hash,
+                    )
                     .map_err(|error| {
                         xai_tool_runtime::ToolError::custom("native_nmap_job", error)
                     })?;
+                job.persist_spawn_intent().await.map_err(|error| {
+                    xai_tool_runtime::ToolError::custom(
+                        "native_nmap_job",
+                        format!("failed to persist Nmap spawn intent: {error}"),
+                    )
+                })?;
                 job.update(serde_json::json!([]));
                 tokio::spawn(run_background_nmap_job(driver, scope, scan, job));
                 Ok(NativeNmapJobResponse::Started { job_id })
