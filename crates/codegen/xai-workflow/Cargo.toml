@@ -7,6 +7,7 @@ description = "Rhai-scripted dynamic workflow engine: scripts orchestrate agents
 
 [dependencies]
 rhai = { workspace = true }
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -14,6 +15,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+xai-sqlite-journal = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

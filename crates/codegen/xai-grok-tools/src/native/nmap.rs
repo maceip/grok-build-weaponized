@@ -1,10 +1,12 @@
 //! Scoped native Nmap driver.
 //!
 //! The driver accepts typed options only, invokes a resolved local `nmap`
-//! executable without a shell, parses its XML incrementally, and returns a
-//! typed report suitable for direct JSON serialization. NSE scripts, raw arguments,
-//! OS detection, spoofing, and other active options are intentionally outside
-//! this low-risk observability interface.
+//! executable with a fixed argument builder, parses its XML incrementally, and
+//! returns a typed report suitable for direct JSON serialization. Foreground
+//! scans launch Nmap directly; background scans use a fixed guardian shell that
+//! preserves child-owned artifacts and atomically records exit status. NSE
+//! scripts, raw arguments, OS detection, spoofing, and other active options are
+//! intentionally outside this low-risk observability interface.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -181,6 +183,7 @@ pub enum NmapScanEvent {
     Started {
         target: String,
         profile: ScanProfile,
+        pid: u32,
     },
     HostDiscovered {
         host_index: usize,
@@ -280,6 +283,13 @@ pub struct NativeNmapDriver {
     binary: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct NmapScanArtifacts {
+    pub xml: PathBuf,
+    pub stderr: PathBuf,
+    pub status: PathBuf,
+}
+
 impl NativeNmapDriver {
     pub fn discover() -> Result<Self, NmapError> {
         which::which("nmap")
@@ -360,6 +370,11 @@ impl NativeNmapDriver {
             command.args(["-p", &ports]);
         }
         command.arg(&request.target);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
 
         // Construct with std::process::Command (no shell), then hand ownership
         // to Tokio so long scans do not block the interactive runtime.
@@ -370,6 +385,9 @@ impl NativeNmapDriver {
                 let mut command = tokio::process::Command::from(command);
                 command.kill_on_drop(true);
                 let mut child = command.spawn().map_err(NmapError::Spawn)?;
+                let pid = child.id().ok_or_else(|| {
+                    NmapError::Spawn(std::io::Error::other("spawned Nmap process has no PID"))
+                })?;
                 let stdout = child.stdout.take().ok_or_else(|| {
                     NmapError::Spawn(std::io::Error::other("stdout pipe missing"))
                 })?;
@@ -382,6 +400,7 @@ impl NativeNmapDriver {
                         .send(NmapScanEvent::Started {
                             target: scan_target.clone(),
                             profile: scan_profile,
+                            pid,
                         })
                         .await;
                 }
@@ -422,6 +441,235 @@ impl NativeNmapDriver {
             .await
             .map_err(|_| NmapError::TimedOut(timeout))?
     }
+
+    /// Run a long-lived scan with output owned by the subprocess rather than
+    /// by parent-side pipes. The XML, stderr, and atomic exit record therefore
+    /// keep advancing if the TUI restarts while the process remains alive.
+    #[cfg(unix)]
+    pub async fn scan_with_events_to_artifacts(
+        &self,
+        scope: &ScanScope,
+        request: NmapScanRequest,
+        artifacts: NmapScanArtifacts,
+        events: Option<mpsc::Sender<NmapScanEvent>>,
+    ) -> Result<NmapScanReport, NmapError> {
+        if !scope.allows(&request.target)? {
+            return Err(NmapError::OutOfScope(request.target.clone()));
+        }
+        if request.ports.len() > MAX_PORTS {
+            return Err(NmapError::TooManyPorts);
+        }
+        let timeout = request
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_TIMEOUT);
+        if timeout.is_zero() || timeout > MAX_TIMEOUT {
+            return Err(NmapError::InvalidTimeout);
+        }
+        for path in [&artifacts.xml, &artifacts.stderr, &artifacts.status] {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(NmapError::Spawn)?;
+            }
+        }
+        std::fs::File::create(&artifacts.xml).map_err(NmapError::Spawn)?;
+        let stderr = std::fs::File::create(&artifacts.stderr).map_err(NmapError::Spawn)?;
+        match std::fs::remove_file(&artifacts.status) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(NmapError::Spawn(error)),
+        }
+
+        let mut nmap_args = vec![
+            "--noninteractive".to_string(),
+            "-n".to_string(),
+            "-oX".to_string(),
+            artifacts.xml.to_string_lossy().into_owned(),
+        ];
+        match request.profile {
+            ScanProfile::HostDiscovery => nmap_args.push("-sn".to_string()),
+            ScanProfile::TcpConnect => nmap_args.push("-sT".to_string()),
+            ScanProfile::ServiceDiscovery => {
+                nmap_args.extend(["-sT", "-sV", "--version-light"].map(str::to_string));
+            }
+        }
+        if !request.ports.is_empty() {
+            let ports = request
+                .ports
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|port| port.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            nmap_args.extend(["-p".to_string(), ports]);
+        }
+        nmap_args.push(request.target.clone());
+
+        const GUARDIAN: &str = r#"
+status_path=$1
+shift
+"$@" &
+child_pid=$!
+forward_signal() {
+  kill -TERM "$child_pid" 2>/dev/null || true
+}
+trap forward_signal TERM INT HUP
+wait "$child_pid"
+exit_code=$?
+status_tmp="${status_path}.tmp.$$"
+( umask 077; printf '{"exit_code":%s,"signal":null}\n' "$exit_code" > "$status_tmp" ) &&
+  mv -f "$status_tmp" "$status_path"
+exit "$exit_code"
+"#;
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(GUARDIAN)
+            .arg("grok-nmap-guardian")
+            .arg(&artifacts.status)
+            .arg(&self.binary)
+            .args(nmap_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .kill_on_drop(true);
+        command.process_group(0);
+        let mut child = command.spawn().map_err(NmapError::Spawn)?;
+        let pid = child.id().ok_or_else(|| {
+            NmapError::Spawn(std::io::Error::other("spawned Nmap guardian has no PID"))
+        })?;
+        let mut process_guard = NmapProcessGroupGuard::new(pid);
+        if let Some(events) = events.as_ref() {
+            let _ = events
+                .send(NmapScanEvent::Started {
+                    target: request.target.clone(),
+                    profile: request.profile,
+                    pid,
+                })
+                .await;
+        }
+
+        let mut emitted_hosts = 0_usize;
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        let status = loop {
+            tokio::select! {
+                status = child.wait() => {
+                    break status.map_err(NmapError::Read)?;
+                }
+                _ = &mut deadline => {
+                    process_guard.terminate();
+                    let _ = child.wait().await;
+                    return Err(NmapError::TimedOut(timeout));
+                }
+                _ = interval.tick() => {
+                    if let Ok(xml) = std::fs::read(&artifacts.xml) {
+                        if xml.len() > MAX_XML_BYTES {
+                            process_guard.terminate();
+                            let _ = child.wait().await;
+                            return Err(NmapError::XmlTooLarge);
+                        }
+                        if let Ok(report) = parse_nmap_xml(
+                            &request.target,
+                            request.profile,
+                            &xml,
+                        ) {
+                            if let Some(events) = events.as_ref() {
+                                for (host_index, host) in report
+                                    .hosts
+                                    .iter()
+                                    .enumerate()
+                                    .skip(emitted_hosts)
+                                {
+                                    let _ = events
+                                        .send(NmapScanEvent::HostDiscovered {
+                                            host_index,
+                                            host: host.clone(),
+                                        })
+                                        .await;
+                                }
+                            }
+                            emitted_hosts = report.hosts.len();
+                        }
+                    }
+                }
+            }
+        };
+        process_guard.disarm();
+        let stderr = read_bounded_file(&artifacts.stderr).map_err(NmapError::Read)?;
+        if !status.success() {
+            return Err(NmapError::Unsuccessful {
+                code: status.code(),
+                stderr,
+            });
+        }
+        let xml = std::fs::read(&artifacts.xml).map_err(NmapError::Read)?;
+        if xml.len() > MAX_XML_BYTES {
+            return Err(NmapError::XmlTooLarge);
+        }
+        let report = parse_nmap_xml(&request.target, request.profile, &xml)?;
+        if let Some(events) = events.as_ref() {
+            for (host_index, host) in report.hosts.iter().enumerate().skip(emitted_hosts) {
+                let _ = events
+                    .send(NmapScanEvent::HostDiscovered {
+                        host_index,
+                        host: host.clone(),
+                    })
+                    .await;
+            }
+            let _ = events
+                .send(NmapScanEvent::Finished {
+                    hosts_up: report.hosts_up,
+                    hosts_down: report.hosts_down,
+                    hosts_total: report.hosts_total,
+                })
+                .await;
+        }
+        Ok(report)
+    }
+}
+
+#[cfg(unix)]
+struct NmapProcessGroupGuard {
+    pid: u32,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl NmapProcessGroupGuard {
+    fn new(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn terminate(&mut self) {
+        if self.armed {
+            use nix::sys::signal::{Signal, killpg};
+            use nix::unistd::Pid;
+            let pid = Pid::from_raw(i32::try_from(self.pid).unwrap_or(i32::MAX));
+            let _ = killpg(pid, Signal::SIGKILL);
+            self.armed = false;
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for NmapProcessGroupGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+fn read_bounded_file(path: &Path) -> std::io::Result<String> {
+    const PREVIEW_BYTES: usize = 8 * 1024;
+    let bytes = std::fs::read(path)?;
+    Ok(String::from_utf8_lossy(&bytes[..bytes.len().min(PREVIEW_BYTES)]).into_owned())
 }
 
 async fn read_bounded_stderr(mut stderr: impl AsyncRead + Unpin) -> std::io::Result<String> {

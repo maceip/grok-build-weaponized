@@ -1,6 +1,7 @@
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use rusqlite::{Connection, params};
 use sha2::Digest as _;
 
 pub const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
@@ -21,6 +22,8 @@ pub struct JournalEntry {
 pub enum JournalError {
     #[error("journal io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("journal sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
     #[error("journal parse at line {line}: {error}")]
     Parse { line: usize, error: String },
     #[error("journal restore rejected (limit {limit}): {reason}")]
@@ -43,105 +46,101 @@ pub enum JournalError {
     Divergence { seq: u64, kind: String },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Journal {
     entries: Vec<JournalEntry>,
-    path: Option<PathBuf>,
+    store: Box<dyn StateStore>,
     bytes: u64,
     last_line_start: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct LoadedState {
+    pub entries: Vec<JournalEntry>,
+    pub bytes: u64,
+    pub last_record_offset: Option<u64>,
+}
+
+/// Persistence boundary shared by the legacy JSONL workflow journal and the
+/// transactional SQLite backend. `Journal` owns deterministic replay policy;
+/// stores own durable append/truncate semantics only.
+pub trait StateStore: std::fmt::Debug + Send {
+    fn load(&mut self) -> Result<LoadedState, JournalError>;
+    fn append(&mut self, entry: &JournalEntry, encoded: &str) -> Result<(), JournalError>;
+    fn truncate_last(&mut self, entry: &JournalEntry, new_len: u64) -> Result<(), JournalError>;
+}
+
+#[derive(Debug, Default)]
+struct MemoryStateStore;
+
+#[derive(Debug)]
+pub struct JsonlStateStore {
+    path: PathBuf,
+}
+
+pub struct SqliteStateStore {
+    connection: Connection,
+    stream_id: String,
+}
+
+impl std::fmt::Debug for SqliteStateStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SqliteStateStore")
+            .field("stream_id", &self.stream_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for Journal {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl Journal {
     pub fn new(path: Option<PathBuf>) -> Self {
         Self {
             entries: Vec::new(),
-            path,
+            store: path.map_or_else(
+                || Box::<MemoryStateStore>::default() as Box<dyn StateStore>,
+                |path| Box::new(JsonlStateStore { path }),
+            ),
             bytes: 0,
             last_line_start: None,
         }
     }
 
     pub fn load(path: PathBuf) -> Result<Self, JournalError> {
-        let content = match read_journal_bounded(&path) {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                return Err(JournalError::UnsafeRestore {
-                    limit: MAX_JOURNAL_BYTES,
-                    reason: error.to_string(),
-                });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let mut entries = Vec::new();
-        let mut offset = 0usize;
-        let mut line_number = 0usize;
-        let mut bytes = content.len() as u64;
-        let mut last_line_start = None;
-        while offset < content.len() {
-            line_number += 1;
-            let Some(relative_newline) = content[offset..].iter().position(|byte| *byte == b'\n')
-            else {
-                let tail = &content[offset..];
-                if tail.iter().all(u8::is_ascii_whitespace) {
-                    truncate_tail(&path, offset as u64)?;
-                    bytes = offset as u64;
-                    break;
-                }
-                match serde_json::from_slice::<JournalEntry>(tail) {
-                    Ok(entry) => {
-                        if entries.len() >= MAX_JOURNAL_ENTRIES {
-                            return Err(JournalError::UnsafeRestore {
-                                limit: MAX_JOURNAL_ENTRIES as u64,
-                                reason: "too many journal entries".into(),
-                            });
-                        }
-                        validate_sequence(&entries, &entry)?;
-                        entries.push(entry);
-                        last_line_start = Some(offset as u64);
-                        terminate_line(&path)?;
-                        bytes = bytes.saturating_add(1);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            line = line_number,
-                            %error,
-                            "truncating torn workflow journal tail"
-                        );
-                        truncate_tail(&path, offset as u64)?;
-                        bytes = offset as u64;
-                    }
-                }
-                break;
-            };
-            let end = offset + relative_newline;
-            let line = &content[offset..end];
-            let line_start = offset as u64;
-            offset = end + 1;
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            let entry = serde_json::from_slice::<JournalEntry>(line).map_err(|error| {
-                JournalError::Parse {
-                    line: line_number,
-                    error: error.to_string(),
-                }
-            })?;
-            if entries.len() >= MAX_JOURNAL_ENTRIES {
+        Self::from_store(Box::new(JsonlStateStore { path }))
+    }
+
+    pub fn load_sqlite(path: PathBuf, stream_id: impl Into<String>) -> Result<Self, JournalError> {
+        Self::from_store(Box::new(SqliteStateStore::open(path, stream_id.into())?))
+    }
+
+    pub fn from_store(mut store: Box<dyn StateStore>) -> Result<Self, JournalError> {
+        let loaded = store.load()?;
+        for (index, entry) in loaded.entries.iter().enumerate() {
+            if index >= MAX_JOURNAL_ENTRIES {
                 return Err(JournalError::UnsafeRestore {
                     limit: MAX_JOURNAL_ENTRIES as u64,
                     reason: "too many journal entries".into(),
                 });
             }
-            validate_sequence(&entries, &entry)?;
-            entries.push(entry);
-            last_line_start = Some(line_start);
+            validate_sequence(&loaded.entries[..index], entry)?;
+        }
+        if loaded.bytes > MAX_JOURNAL_BYTES {
+            return Err(JournalError::UnsafeRestore {
+                limit: MAX_JOURNAL_BYTES,
+                reason: format!("journal contains {} encoded bytes", loaded.bytes),
+            });
         }
         Ok(Self {
-            entries,
-            path: Some(path),
-            bytes,
-            last_line_start,
+            entries: loaded.entries,
+            store,
+            bytes: loaded.bytes,
+            last_line_start: loaded.last_record_offset,
         })
     }
 
@@ -215,9 +214,7 @@ impl Journal {
                 limit: MAX_JOURNAL_BYTES,
             });
         }
-        if let Some(path) = &self.path {
-            append_line(path, &line)?;
-        }
+        self.store.append(&entry, &line)?;
         self.last_line_start = Some(self.bytes);
         self.bytes = self.bytes.saturating_add(line.len() as u64);
         self.entries.push(entry);
@@ -242,14 +239,242 @@ impl Journal {
                 "journal cannot locate the trailing entry's byte offset",
             )));
         };
-        if let Some(path) = &self.path {
-            truncate_tail(path, new_len)?;
-        }
+        self.store.truncate_last(last, new_len)?;
         self.entries.pop();
         self.bytes = new_len;
         self.last_line_start = None;
         Ok(true)
     }
+}
+
+impl StateStore for MemoryStateStore {
+    fn load(&mut self) -> Result<LoadedState, JournalError> {
+        Ok(LoadedState {
+            entries: Vec::new(),
+            bytes: 0,
+            last_record_offset: None,
+        })
+    }
+
+    fn append(&mut self, _entry: &JournalEntry, _encoded: &str) -> Result<(), JournalError> {
+        Ok(())
+    }
+
+    fn truncate_last(&mut self, _entry: &JournalEntry, _new_len: u64) -> Result<(), JournalError> {
+        Ok(())
+    }
+}
+
+impl StateStore for JsonlStateStore {
+    fn load(&mut self) -> Result<LoadedState, JournalError> {
+        load_jsonl_state(&self.path)
+    }
+
+    fn append(&mut self, _entry: &JournalEntry, encoded: &str) -> Result<(), JournalError> {
+        append_line(&self.path, encoded)?;
+        Ok(())
+    }
+
+    fn truncate_last(&mut self, _entry: &JournalEntry, new_len: u64) -> Result<(), JournalError> {
+        truncate_tail(&self.path, new_len)?;
+        Ok(())
+    }
+}
+
+impl SqliteStateStore {
+    pub fn open(path: PathBuf, stream_id: String) -> Result<Self, JournalError> {
+        if stream_id.trim().is_empty() {
+            return Err(JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workflow journal stream ID must not be empty",
+            )));
+        }
+        let connection = xai_sqlite_journal::JournalMode::for_db_path(&path).open(&path)?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS workflow_journal(
+                stream_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                req_hash TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                at_ms INTEGER NOT NULL,
+                encoded_bytes INTEGER NOT NULL,
+                PRIMARY KEY(stream_id, seq)
+             );",
+        )?;
+        Ok(Self {
+            connection,
+            stream_id,
+        })
+    }
+}
+
+impl StateStore for SqliteStateStore {
+    fn load(&mut self) -> Result<LoadedState, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT seq, kind, req_hash, result_json, at_ms, encoded_bytes
+             FROM workflow_journal
+             WHERE stream_id=?1
+             ORDER BY seq",
+        )?;
+        let rows = statement.query_map([self.stream_id.as_str()], |row| {
+            let result_json: String = row.get(3)?;
+            Ok((
+                JournalEntry {
+                    seq: row.get(0)?,
+                    kind: row.get(1)?,
+                    req_hash: row.get(2)?,
+                    result: serde_json::from_str(&result_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    at_ms: row.get(4)?,
+                },
+                row.get::<_, u64>(5)?,
+            ))
+        })?;
+        let mut entries = Vec::new();
+        let mut bytes = 0_u64;
+        let mut last_record_offset = None;
+        for row in rows {
+            let (entry, encoded_bytes) = row?;
+            last_record_offset = Some(bytes);
+            bytes = bytes.saturating_add(encoded_bytes);
+            entries.push(entry);
+        }
+        Ok(LoadedState {
+            entries,
+            bytes,
+            last_record_offset,
+        })
+    }
+
+    fn append(&mut self, entry: &JournalEntry, encoded: &str) -> Result<(), JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO workflow_journal(
+                stream_id, seq, kind, req_hash, result_json, at_ms, encoded_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                self.stream_id,
+                entry.seq,
+                entry.kind,
+                entry.req_hash,
+                serde_json::to_string(&entry.result).map_err(std::io::Error::other)?,
+                entry.at_ms,
+                encoded.len() as u64,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn truncate_last(&mut self, entry: &JournalEntry, _new_len: u64) -> Result<(), JournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "DELETE FROM workflow_journal WHERE stream_id=?1 AND seq=?2",
+            params![self.stream_id, entry.seq],
+        )?;
+        if changed != 1 {
+            return Err(JournalError::Io(std::io::Error::other(format!(
+                "workflow journal cannot truncate missing sequence {}",
+                entry.seq
+            ))));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+fn load_jsonl_state(path: &Path) -> Result<LoadedState, JournalError> {
+    let content = match read_journal_bounded(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(JournalError::UnsafeRestore {
+                limit: MAX_JOURNAL_BYTES,
+                reason: error.to_string(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    let mut line_number = 0usize;
+    let mut bytes = content.len() as u64;
+    let mut last_record_offset = None;
+    while offset < content.len() {
+        line_number += 1;
+        let Some(relative_newline) = content[offset..].iter().position(|byte| *byte == b'\n')
+        else {
+            let tail = &content[offset..];
+            if tail.iter().all(u8::is_ascii_whitespace) {
+                truncate_tail(path, offset as u64)?;
+                bytes = offset as u64;
+                break;
+            }
+            match serde_json::from_slice::<JournalEntry>(tail) {
+                Ok(entry) => {
+                    if entries.len() >= MAX_JOURNAL_ENTRIES {
+                        return Err(JournalError::UnsafeRestore {
+                            limit: MAX_JOURNAL_ENTRIES as u64,
+                            reason: "too many journal entries".into(),
+                        });
+                    }
+                    validate_sequence(&entries, &entry)?;
+                    entries.push(entry);
+                    last_record_offset = Some(offset as u64);
+                    terminate_line(path)?;
+                    bytes = bytes.saturating_add(1);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        line = line_number,
+                        %error,
+                        "truncating torn workflow journal tail"
+                    );
+                    truncate_tail(path, offset as u64)?;
+                    bytes = offset as u64;
+                }
+            }
+            break;
+        };
+        let end = offset + relative_newline;
+        let line = &content[offset..end];
+        let line_start = offset as u64;
+        offset = end + 1;
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let entry =
+            serde_json::from_slice::<JournalEntry>(line).map_err(|error| JournalError::Parse {
+                line: line_number,
+                error: error.to_string(),
+            })?;
+        if entries.len() >= MAX_JOURNAL_ENTRIES {
+            return Err(JournalError::UnsafeRestore {
+                limit: MAX_JOURNAL_ENTRIES as u64,
+                reason: "too many journal entries".into(),
+            });
+        }
+        validate_sequence(&entries, &entry)?;
+        entries.push(entry);
+        last_record_offset = Some(line_start);
+    }
+    Ok(LoadedState {
+        entries,
+        bytes,
+        last_record_offset,
+    })
 }
 
 fn read_journal_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -669,6 +894,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut loaded = Journal::load(dir.path().join("missing.jsonl")).unwrap();
         assert!(!loaded.prune_trailing_host_error("boom").unwrap());
+    }
+
+    #[test]
+    fn sqlite_state_store_replays_and_transactionally_prunes_one_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflow-state.sqlite");
+        let mut first = Journal::load_sqlite(path.clone(), "run-a").unwrap();
+        first
+            .record(
+                0,
+                "spawn_agent",
+                "hash-a".into(),
+                serde_json::json!({"ok": true}),
+            )
+            .unwrap();
+        first
+            .record(
+                1,
+                "write_scratch_file",
+                "hash-b".into(),
+                serde_json::json!({ HOST_ERROR_KEY: "quota" }),
+            )
+            .unwrap();
+        let mut other = Journal::load_sqlite(path.clone(), "run-b").unwrap();
+        other
+            .record(0, "log", "other".into(), serde_json::json!("separate"))
+            .unwrap();
+
+        let mut restored = Journal::load_sqlite(path.clone(), "run-a").unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(
+            restored.replay(0, "spawn_agent", "hash-a").unwrap(),
+            Some(serde_json::json!({"ok": true}))
+        );
+        assert!(restored.prune_trailing_host_error("quota").unwrap());
+        assert_eq!(
+            Journal::load_sqlite(path.clone(), "run-a").unwrap().len(),
+            1
+        );
+        assert_eq!(Journal::load_sqlite(path, "run-b").unwrap().len(), 1);
     }
 
     #[test]

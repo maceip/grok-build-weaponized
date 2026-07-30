@@ -504,7 +504,8 @@ async fn fail_all(inner: &Arc<WorkerClientInner>, error: SamplingError) {
 
 fn event_request_id(event: &RuntimeEvent) -> &str {
     match event {
-        RuntimeEvent::StreamStarted { request_id, .. }
+        RuntimeEvent::Admitted { request_id, .. }
+        | RuntimeEvent::StreamStarted { request_id, .. }
         | RuntimeEvent::FirstToken { request_id }
         | RuntimeEvent::ChannelToken { request_id, .. }
         | RuntimeEvent::ToolCallDelta { request_id, .. } => request_id,

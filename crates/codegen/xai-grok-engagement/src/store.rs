@@ -4,17 +4,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
 
 use crate::types::{
-    ActionIdentity, ActionRecord, ActionResolution, ActionSpec, ActionStatus, EngagementCheckpoint,
-    EngagementEvent, EngagementId, EngagementRecord, EngagementSnapshot, EngagementStage,
-    EngagementStatus, JobCheckpoint, JobKind, JobLifecycle, NewEngagement, QueuePriority,
+    ActionIdentity, ActionRecord, ActionReplayPolicy, ActionResolution, ActionSpec, ActionStatus,
+    ArtifactReference, BackgroundJobCursor, EngagementCheckpoint, EngagementEvent, EngagementId,
+    EngagementRecord, EngagementSnapshot, EngagementStage, EngagementStatus, JobCheckpoint,
+    JobKind, JobLifecycle, NewEngagement, QueuePriority, RuntimeAdmissionRecord,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 4;
 const MAX_CHECKPOINT_BYTES: usize = 1024 * 1024;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_ACTION_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_EVENT_PAGE: usize = 1_000;
 const MAX_LIST_PAGE: usize = 512;
+const MAX_ACCEPTED_NONTERMINAL_ENGAGEMENTS: usize = 4_096;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngagementError {
@@ -24,6 +26,8 @@ pub enum EngagementError {
     Serde(#[from] serde_json::Error),
     #[error("engagement database setup: {0}")]
     Io(#[from] std::io::Error),
+    #[error("engagement database schema {found} is newer than supported schema {supported}")]
+    UnsupportedSchema { found: i64, supported: i64 },
     #[error("engagement not found: {0}")]
     NotFound(String),
     #[error("stale or expired lease for engagement {engagement_id} at epoch {lease_epoch}")]
@@ -49,6 +53,8 @@ pub enum EngagementError {
     InvalidPersistedValue { field: &'static str, value: String },
     #[error("engagement writer stopped")]
     WriterStopped,
+    #[error("engagement admission rejected before acceptance: durable queue capacity {capacity}")]
+    AdmissionOverloaded { capacity: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -67,24 +73,31 @@ pub struct AcceptOutcome {
 pub struct RecoveryReport {
     pub requeued: usize,
     pub parked: usize,
+    pub replayable_actions: usize,
     pub ambiguous_actions: usize,
     pub events: Vec<EngagementEvent>,
 }
 
 pub struct EngagementStore {
     connection: Connection,
+    admission_capacity: usize,
 }
 
 impl EngagementStore {
     pub fn open(path: &Path) -> Result<Self, EngagementError> {
+        Self::open_with_capacity(path, MAX_ACCEPTED_NONTERMINAL_ENGAGEMENTS)
+    }
+
+    fn open_with_capacity(path: &Path, admission_capacity: usize) -> Result<Self, EngagementError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mode = xai_sqlite_journal::JournalMode::for_db_path(path);
-        let connection = mode.open(path)?;
+        let mut connection = mode.open(path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "wal_autocheckpoint", 1_000)?;
+        migrate_legacy_table_names(&connection)?;
         connection.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS engagement_meta(
@@ -118,27 +131,69 @@ impl EngagementStore {
                 ON engagements(session_id)
                 WHERE status IN ('planning', 'executing', 'reviewing', 'correcting');
 
-            CREATE TABLE IF NOT EXISTS engagement_events(
+            CREATE TABLE IF NOT EXISTS pending_stages(
+                engagement_id TEXT PRIMARY KEY REFERENCES engagements(engagement_id) ON DELETE CASCADE,
+                queue_class TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT,
+                available_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_stages_dispatch
+                ON pending_stages(priority DESC, available_at_ms ASC);
+
+            CREATE TABLE IF NOT EXISTS events(
                 engagement_id TEXT NOT NULL REFERENCES engagements(engagement_id) ON DELETE CASCADE,
                 seq INTEGER NOT NULL,
                 event_id TEXT NOT NULL UNIQUE,
                 kind TEXT NOT NULL,
                 lease_epoch INTEGER NOT NULL,
                 stage TEXT,
+                task_id TEXT,
+                action_id TEXT,
+                evidence_id TEXT,
+                artifact_ref TEXT,
                 payload_json TEXT NOT NULL,
                 content_hash TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL,
                 PRIMARY KEY(engagement_id, seq)
             );
 
-            CREATE TABLE IF NOT EXISTS engagement_snapshots(
+            CREATE TABLE IF NOT EXISTS snapshots(
                 engagement_id TEXT PRIMARY KEY REFERENCES engagements(engagement_id) ON DELETE CASCADE,
                 event_seq INTEGER NOT NULL,
                 record_json TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS engagement_actions(
+            CREATE TABLE IF NOT EXISTS stages(
+                engagement_id TEXT NOT NULL REFERENCES engagements(engagement_id) ON DELETE CASCADE,
+                stage_seq INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT,
+                plan_revision INTEGER NOT NULL,
+                task_id TEXT,
+                task_cursor INTEGER NOT NULL,
+                checkpoint_json TEXT NOT NULL,
+                entered_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(engagement_id, stage_seq)
+            );
+
+            CREATE TABLE IF NOT EXISTS tasks(
+                engagement_id TEXT NOT NULL REFERENCES engagements(engagement_id) ON DELETE CASCADE,
+                plan_revision INTEGER NOT NULL,
+                task_id TEXT NOT NULL,
+                task_index INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                task_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(engagement_id, plan_revision, task_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tasks_cursor
+                ON tasks(engagement_id, plan_revision, task_index);
+
+            CREATE TABLE IF NOT EXISTS actions(
                 stable_key TEXT PRIMARY KEY,
                 engagement_id TEXT NOT NULL REFERENCES engagements(engagement_id) ON DELETE CASCADE,
                 plan_revision INTEGER NOT NULL,
@@ -146,6 +201,7 @@ impl EngagementStore {
                 action_id TEXT NOT NULL,
                 action_kind TEXT NOT NULL,
                 command_hash TEXT NOT NULL,
+                replay_policy TEXT NOT NULL DEFAULT 'non_idempotent',
                 status TEXT NOT NULL,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 job_id TEXT,
@@ -157,21 +213,35 @@ impl EngagementStore {
                 updated_at_ms INTEGER NOT NULL,
                 UNIQUE(engagement_id, plan_revision, task_id, action_id)
             );
-            CREATE INDEX IF NOT EXISTS idx_engagement_actions_status
-                ON engagement_actions(engagement_id, status);
+            CREATE INDEX IF NOT EXISTS idx_actions_status
+                ON actions(engagement_id, status);
 
-            CREATE TABLE IF NOT EXISTS engagement_jobs(
+            CREATE TABLE IF NOT EXISTS leases(
+                engagement_id TEXT NOT NULL REFERENCES engagements(engagement_id) ON DELETE CASCADE,
+                lease_epoch INTEGER NOT NULL,
+                owner TEXT NOT NULL,
+                acquired_at_ms INTEGER NOT NULL,
+                expires_at_ms INTEGER NOT NULL,
+                last_heartbeat_at_ms INTEGER NOT NULL,
+                released_at_ms INTEGER,
+                release_reason TEXT,
+                PRIMARY KEY(engagement_id, lease_epoch)
+            );
+
+            CREATE TABLE IF NOT EXISTS job_checkpoints(
                 job_id TEXT PRIMARY KEY,
                 engagement_id TEXT NOT NULL REFERENCES engagements(engagement_id) ON DELETE CASCADE,
-                action_key TEXT REFERENCES engagement_actions(stable_key),
+                action_key TEXT REFERENCES actions(stable_key),
                 kind TEXT NOT NULL,
                 lifecycle TEXT NOT NULL,
                 command_hash TEXT NOT NULL,
                 pid INTEGER,
+                process_start_identity TEXT,
                 process_started_at_ms INTEGER,
                 process_group_id INTEGER,
                 stdout_artifact TEXT,
                 stderr_artifact TEXT,
+                status_artifact TEXT,
                 stdout_cursor INTEGER NOT NULL,
                 stderr_cursor INTEGER NOT NULL,
                 last_activity_at_ms INTEGER NOT NULL,
@@ -179,16 +249,60 @@ impl EngagementStore {
                 payload_json TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_engagement_jobs_recovery
-                ON engagement_jobs(lifecycle, updated_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_job_checkpoints_recovery
+                ON job_checkpoints(lifecycle, updated_at_ms);
             "#,
         )?;
+        ensure_column(&connection, "events", "task_id", "TEXT")?;
+        ensure_column(&connection, "events", "action_id", "TEXT")?;
+        ensure_column(&connection, "events", "evidence_id", "TEXT")?;
+        ensure_column(&connection, "events", "artifact_ref", "TEXT")?;
+        ensure_column(
+            &connection,
+            "actions",
+            "replay_policy",
+            "TEXT NOT NULL DEFAULT 'non_idempotent'",
+        )?;
+        ensure_column(
+            &connection,
+            "job_checkpoints",
+            "process_start_identity",
+            "TEXT",
+        )?;
+        ensure_column(&connection, "job_checkpoints", "status_artifact", "TEXT")?;
+        let stored_version = connection
+            .query_row(
+                "SELECT value FROM engagement_meta WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if stored_version > SCHEMA_VERSION {
+            return Err(EngagementError::UnsupportedSchema {
+                found: stored_version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        backfill_normalized_state(&mut connection)?;
         connection.execute(
             "INSERT INTO engagement_meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [SCHEMA_VERSION.to_string()],
         )?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            admission_capacity,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_test_capacity(
+        path: &Path,
+        admission_capacity: usize,
+    ) -> Result<Self, EngagementError> {
+        Self::open_with_capacity(path, admission_capacity)
     }
 
     pub fn accept(
@@ -215,6 +329,17 @@ impl EngagementStore {
                 event: None,
             });
         }
+        let pending = transaction.query_row(
+            "SELECT COUNT(*) FROM engagements
+             WHERE status NOT IN ('completed','failed','cancelled')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if usize::try_from(pending).unwrap_or(usize::MAX) >= self.admission_capacity {
+            return Err(EngagementError::AdmissionOverloaded {
+                capacity: self.admission_capacity,
+            });
+        }
 
         let now = now_ms();
         let engagement_id = EngagementId::new();
@@ -236,6 +361,14 @@ impl EngagementStore {
                 checkpoint_json,
             ],
         )?;
+        sync_pending_stage_tx(
+            &transaction,
+            &engagement_id,
+            EngagementStatus::Queued,
+            None,
+            QueuePriority::DurableStage,
+            now,
+        )?;
         let payload = serde_json::json!({
             "session_id": input.session_id,
             "prompt_id": input.prompt_id,
@@ -251,6 +384,7 @@ impl EngagementStore {
             payload,
         )?;
         let record = load_engagement_tx(&transaction, &engagement_id)?;
+        record_stage_and_tasks_tx(&transaction, &record, event.seq)?;
         write_snapshot_tx(&transaction, &record, event.seq)?;
         transaction.commit()?;
         Ok(EngagementMutation {
@@ -320,15 +454,19 @@ impl EngagementStore {
         let engagement_id = transaction
             .query_row(
                 "SELECT candidate.engagement_id
-                 FROM engagements candidate
-                 WHERE candidate.status='queued'
+                 FROM pending_stages pending
+                 JOIN engagements candidate
+                   ON candidate.engagement_id=pending.engagement_id
+                 WHERE candidate.status IN ('queued','suspended')
+                   AND pending.available_at_ms <= ?1
                    AND (candidate.lease_expires_at_ms IS NULL OR candidate.lease_expires_at_ms <= ?1)
                    AND NOT EXISTS (
                        SELECT 1 FROM engagements active
                        WHERE active.session_id=candidate.session_id
                          AND active.status IN ('planning','executing','reviewing','correcting')
                    )
-                 ORDER BY candidate.priority DESC, candidate.accepted_at_ms ASC
+                 ORDER BY pending.priority DESC, pending.available_at_ms ASC,
+                          candidate.accepted_at_ms ASC
                  LIMIT 1",
                 [now],
                 |row| row.get::<_, String>(0),
@@ -369,19 +507,28 @@ impl EngagementStore {
         lease_epoch: u64,
         ttl_ms: u64,
     ) -> Result<bool, EngagementError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
-        let changed = self.connection.execute(
+        let expires_at_ms = add_ttl(now, ttl_ms);
+        let changed = transaction.execute(
             "UPDATE engagements
              SET lease_expires_at_ms=?1, updated_at_ms=?2
              WHERE engagement_id=?3 AND lease_epoch=?4
                AND lease_owner IS NOT NULL AND lease_expires_at_ms > ?2",
-            params![
-                add_ttl(now, ttl_ms),
-                now,
-                engagement_id.0,
-                as_i64(lease_epoch),
-            ],
+            params![expires_at_ms, now, engagement_id.0, as_i64(lease_epoch),],
         )?;
+        if changed == 1 {
+            transaction.execute(
+                "UPDATE leases
+                 SET expires_at_ms=?1, last_heartbeat_at_ms=?2
+                 WHERE engagement_id=?3 AND lease_epoch=?4
+                   AND released_at_ms IS NULL",
+                params![expires_at_ms, now, engagement_id.0, as_i64(lease_epoch)],
+            )?;
+        }
+        transaction.commit()?;
         Ok(changed == 1)
     }
 
@@ -391,15 +538,9 @@ impl EngagementStore {
         lease_epoch: u64,
         status: EngagementStatus,
         stage: Option<EngagementStage>,
-        checkpoint: EngagementCheckpoint,
+        mut checkpoint: EngagementCheckpoint,
         detail: serde_json::Value,
     ) -> Result<EngagementMutation<EngagementRecord>, EngagementError> {
-        let checkpoint_bytes = serde_json::to_vec(&checkpoint)?;
-        check_json_size(
-            &checkpoint_bytes,
-            "engagement checkpoint",
-            MAX_CHECKPOINT_BYTES,
-        )?;
         let detail_bytes = serde_json::to_vec(&detail)?;
         check_json_size(
             &detail_bytes,
@@ -411,6 +552,13 @@ impl EngagementStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = load_engagement_tx(&transaction, engagement_id)?;
         ensure_lease(&current, lease_epoch)?;
+        hydrate_checkpoint_job_refs_tx(&transaction, engagement_id, &mut checkpoint)?;
+        let checkpoint_bytes = serde_json::to_vec(&checkpoint)?;
+        check_json_size(
+            &checkpoint_bytes,
+            "engagement checkpoint",
+            MAX_CHECKPOINT_BYTES,
+        )?;
         if !current.status.permits(status) {
             return Err(EngagementError::InvalidTransition {
                 from: current.status.as_str().to_string(),
@@ -420,7 +568,7 @@ impl EngagementStore {
         let now = now_ms();
         let has_active_jobs = transaction.query_row(
             "SELECT EXISTS(
-                 SELECT 1 FROM engagement_jobs
+                 SELECT 1 FROM job_checkpoints
                  WHERE engagement_id=?1 AND lifecycle IN ('running','quiet','stale')
              )",
             [engagement_id.0.as_str()],
@@ -432,17 +580,19 @@ impl EngagementStore {
         // terminal state.
         let release_lease =
             (status.is_terminal() || status == EngagementStatus::Suspended) && !has_active_jobs;
+        let next_priority = queue_priority_for(status, stage, current.priority);
         let changed = transaction.execute(
             "UPDATE engagements
-             SET status=?1, stage=?2, checkpoint_json=?3, updated_at_ms=?4,
-                 lease_owner=CASE WHEN ?5 THEN NULL ELSE lease_owner END,
-                 lease_expires_at_ms=CASE WHEN ?5 THEN NULL ELSE lease_expires_at_ms END
-             WHERE engagement_id=?6 AND lease_epoch=?7
-               AND lease_owner IS NOT NULL AND lease_expires_at_ms > ?4",
+             SET status=?1, stage=?2, checkpoint_json=?3, priority=?4, updated_at_ms=?5,
+                 lease_owner=CASE WHEN ?6 THEN NULL ELSE lease_owner END,
+                 lease_expires_at_ms=CASE WHEN ?6 THEN NULL ELSE lease_expires_at_ms END
+             WHERE engagement_id=?7 AND lease_epoch=?8
+               AND lease_owner IS NOT NULL AND lease_expires_at_ms > ?5",
             params![
                 status.as_str(),
                 stage.map(EngagementStage::as_str),
                 String::from_utf8(checkpoint_bytes).expect("JSON is UTF-8"),
+                next_priority as i64,
                 now,
                 release_lease,
                 engagement_id.0,
@@ -454,6 +604,23 @@ impl EngagementStore {
                 engagement_id: engagement_id.0.clone(),
                 lease_epoch,
             });
+        }
+        sync_pending_stage_tx(
+            &transaction,
+            engagement_id,
+            status,
+            stage,
+            next_priority,
+            now,
+        )?;
+        if release_lease {
+            release_lease_tx(
+                &transaction,
+                engagement_id,
+                lease_epoch,
+                now,
+                status.as_str(),
+            )?;
         }
         let payload = serde_json::json!({
             "from": current.status,
@@ -470,6 +637,72 @@ impl EngagementStore {
             payload,
         )?;
         let record = load_engagement_tx(&transaction, engagement_id)?;
+        record_stage_and_tasks_tx(&transaction, &record, event.seq)?;
+        write_snapshot_tx(&transaction, &record, event.seq)?;
+        transaction.commit()?;
+        Ok(EngagementMutation {
+            value: record,
+            event: Some(event),
+        })
+    }
+
+    pub fn record_runtime_admission(
+        &mut self,
+        engagement_id: &EngagementId,
+        lease_epoch: u64,
+        admission: RuntimeAdmissionRecord,
+    ) -> Result<EngagementMutation<EngagementRecord>, EngagementError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_engagement_tx(&transaction, engagement_id)?;
+        ensure_lease(&current, lease_epoch)?;
+        fence_lease_tx(&transaction, engagement_id, lease_epoch)?;
+        let mut checkpoint = current.checkpoint;
+        checkpoint.runtime_request_id = Some(admission.request_id.clone());
+        if !checkpoint
+            .runtime_request_ids
+            .iter()
+            .any(|request_id| request_id == &admission.request_id)
+        {
+            checkpoint
+                .runtime_request_ids
+                .push(admission.request_id.clone());
+        }
+        checkpoint.model_id = Some(admission.model_id.clone());
+        checkpoint.adapter_id = admission.adapter_id.clone();
+        checkpoint.context_plan_hash = Some(admission.context_plan_hash.clone());
+        hydrate_checkpoint_job_refs_tx(&transaction, engagement_id, &mut checkpoint)?;
+        let checkpoint_json = serde_json::to_string(&checkpoint)?;
+        check_json_size(
+            checkpoint_json.as_bytes(),
+            "engagement checkpoint",
+            MAX_CHECKPOINT_BYTES,
+        )?;
+        let now = now_ms();
+        let changed = transaction.execute(
+            "UPDATE engagements
+             SET checkpoint_json=?1, updated_at_ms=?2
+             WHERE engagement_id=?3 AND lease_epoch=?4
+               AND lease_owner IS NOT NULL AND lease_expires_at_ms > ?2",
+            params![checkpoint_json, now, engagement_id.0, as_i64(lease_epoch)],
+        )?;
+        if changed != 1 {
+            return Err(EngagementError::StaleLease {
+                engagement_id: engagement_id.0.clone(),
+                lease_epoch,
+            });
+        }
+        let event = append_event_tx(
+            &transaction,
+            engagement_id,
+            lease_epoch,
+            current.stage,
+            "runtime_request_admitted",
+            serde_json::to_value(admission)?,
+        )?;
+        let record = load_engagement_tx(&transaction, engagement_id)?;
+        record_stage_and_tasks_tx(&transaction, &record, event.seq)?;
         write_snapshot_tx(&transaction, &record, event.seq)?;
         transaction.commit()?;
         Ok(EngagementMutation {
@@ -535,10 +768,12 @@ impl EngagementStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let engagement = load_engagement_tx(&transaction, engagement_id)?;
         ensure_lease(&engagement, lease_epoch)?;
+        fence_lease_tx(&transaction, engagement_id, lease_epoch)?;
         if let Some(existing) = load_action_tx(&transaction, &stable_key)? {
             if existing.command_hash != spec.command_hash
                 || existing.action_kind != spec.action_kind
                 || existing.identity != spec.identity
+                || existing.replay_policy != spec.replay_policy
             {
                 return Err(EngagementError::ActionConflict(stable_key));
             }
@@ -550,11 +785,13 @@ impl EngagementStore {
         }
         let now = now_ms();
         transaction.execute(
-            "INSERT INTO engagement_actions(
+            "INSERT INTO actions(
                 stable_key, engagement_id, plan_revision, task_id, action_id,
-                action_kind, command_hash, status, attempt_count, payload_json,
-                prepared_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'prepared', 0, ?8, ?9, ?9)",
+                action_kind, command_hash, replay_policy, status, attempt_count,
+                payload_json, prepared_at_ms, updated_at_ms
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'prepared', 0, ?9, ?10, ?10
+             )",
             params![
                 stable_key,
                 engagement_id.0,
@@ -563,6 +800,7 @@ impl EngagementStore {
                 spec.identity.action_id,
                 spec.action_kind,
                 spec.command_hash,
+                spec.replay_policy.as_str(),
                 optional_json(spec.payload.as_ref())?,
                 now,
             ],
@@ -572,6 +810,7 @@ impl EngagementStore {
             "identity": spec.identity,
             "action_kind": spec.action_kind,
             "command_hash": spec.command_hash,
+            "replay_policy": spec.replay_policy,
             "status": ActionStatus::Prepared,
         });
         let event = append_event_tx(
@@ -616,6 +855,7 @@ impl EngagementStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let engagement = load_engagement_tx(&transaction, engagement_id)?;
         ensure_lease(&engagement, lease_epoch)?;
+        fence_lease_tx(&transaction, engagement_id, lease_epoch)?;
         let current = load_action_tx(&transaction, action_key)?
             .ok_or_else(|| EngagementError::NotFound(action_key.to_string()))?;
         if current.engagement_id != *engagement_id {
@@ -632,7 +872,7 @@ impl EngagementStore {
         let increment_attempt =
             status == ActionStatus::Dispatched && current.status != ActionStatus::Dispatched;
         transaction.execute(
-            "UPDATE engagement_actions
+            "UPDATE actions
              SET status=?1,
                  attempt_count=attempt_count + CASE WHEN ?7 THEN 1 ELSE 0 END,
                  job_id=COALESCE(?2, job_id),
@@ -722,10 +962,10 @@ impl EngagementStore {
     ) -> Result<Vec<ActionRecord>, EngagementError> {
         let mut statement = self.connection.prepare(
             "SELECT stable_key, engagement_id, plan_revision, task_id, action_id,
-                    action_kind, command_hash, status, attempt_count, job_id,
-                    evidence_id, payload_json, result_json, prepared_at_ms,
+                    action_kind, command_hash, replay_policy, status, attempt_count,
+                    job_id, evidence_id, payload_json, result_json, prepared_at_ms,
                     dispatched_at_ms, updated_at_ms
-             FROM engagement_actions WHERE engagement_id=?1
+             FROM actions WHERE engagement_id=?1
              ORDER BY prepared_at_ms, stable_key",
         )?;
         let rows = statement.query_map([engagement_id.0.as_str()], decode_action_row)?;
@@ -755,6 +995,7 @@ impl EngagementStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let engagement = load_engagement_tx(&transaction, engagement_id)?;
         ensure_lease(&engagement, lease_epoch)?;
+        fence_lease_tx(&transaction, engagement_id, lease_epoch)?;
         if let Some(existing) = load_job_tx(&transaction, &checkpoint.job_id)?
             && (existing.engagement_id != checkpoint.engagement_id
                 || existing.command_hash != checkpoint.command_hash
@@ -764,31 +1005,33 @@ impl EngagementStore {
         }
         let now = now_ms();
         transaction.execute(
-            "INSERT INTO engagement_jobs(
+            "INSERT INTO job_checkpoints(
                 job_id, engagement_id, action_key, kind, lifecycle, command_hash,
-                pid, process_started_at_ms, process_group_id, stdout_artifact,
-                stderr_artifact, stdout_cursor, stderr_cursor, last_activity_at_ms,
-                exit_code, payload_json, updated_at_ms
+                pid, process_start_identity, process_started_at_ms, process_group_id, stdout_artifact,
+                stderr_artifact, status_artifact, stdout_cursor, stderr_cursor,
+                last_activity_at_ms, exit_code, payload_json, updated_at_ms
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17
+                ?14, ?15, ?16, ?17, ?18, ?19
              )
              ON CONFLICT(job_id) DO UPDATE SET
                 action_key=excluded.action_key,
                 lifecycle=excluded.lifecycle,
                 pid=excluded.pid,
+                process_start_identity=excluded.process_start_identity,
                 process_started_at_ms=excluded.process_started_at_ms,
                 process_group_id=excluded.process_group_id,
                 stdout_artifact=excluded.stdout_artifact,
                 stderr_artifact=excluded.stderr_artifact,
+                status_artifact=excluded.status_artifact,
                 stdout_cursor=excluded.stdout_cursor,
                 stderr_cursor=excluded.stderr_cursor,
                 last_activity_at_ms=excluded.last_activity_at_ms,
                 exit_code=excluded.exit_code,
                 payload_json=excluded.payload_json,
                 updated_at_ms=excluded.updated_at_ms
-             WHERE engagement_jobs.engagement_id=excluded.engagement_id
-               AND engagement_jobs.command_hash=excluded.command_hash",
+             WHERE job_checkpoints.engagement_id=excluded.engagement_id
+               AND job_checkpoints.command_hash=excluded.command_hash",
             params![
                 checkpoint.job_id,
                 engagement_id.0,
@@ -797,6 +1040,7 @@ impl EngagementStore {
                 checkpoint.lifecycle.as_str(),
                 checkpoint.command_hash,
                 checkpoint.pid.map(i64::from),
+                checkpoint.process_start_identity,
                 checkpoint.process_started_at_ms,
                 checkpoint.process_group_id,
                 checkpoint
@@ -805,6 +1049,10 @@ impl EngagementStore {
                     .map(|path| path.to_string_lossy().into_owned()),
                 checkpoint
                     .stderr_artifact
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                checkpoint
+                    .status_artifact
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned()),
                 as_i64(checkpoint.stdout_cursor),
@@ -828,17 +1076,35 @@ impl EngagementStore {
                  WHERE engagement_id=?2
                    AND status IN ('suspended','failed','parked','cancelled','completed')
                    AND NOT EXISTS(
-                       SELECT 1 FROM engagement_jobs
+                       SELECT 1 FROM job_checkpoints
                        WHERE engagement_id=?2
                          AND lifecycle IN ('running','quiet','stale')
                    )",
                 params![now, engagement_id.0],
             )?;
+            let released = transaction.query_row(
+                "SELECT lease_owner IS NULL FROM engagements WHERE engagement_id=?1",
+                [engagement_id.0.as_str()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if released {
+                release_lease_tx(
+                    &transaction,
+                    engagement_id,
+                    lease_epoch,
+                    now,
+                    checkpoint.lifecycle.as_str(),
+                )?;
+            }
         }
         let payload = serde_json::json!({
             "job_id": checkpoint.job_id,
             "kind": checkpoint.kind,
             "lifecycle": checkpoint.lifecycle,
+            "action_key": checkpoint.action_key,
+            "stdout_artifact": checkpoint.stdout_artifact,
+            "stderr_artifact": checkpoint.stderr_artifact,
+            "status_artifact": checkpoint.status_artifact,
             "stdout_cursor": checkpoint.stdout_cursor,
             "stderr_cursor": checkpoint.stderr_cursor,
             "exit_code": checkpoint.exit_code,
@@ -865,10 +1131,10 @@ impl EngagementStore {
     pub fn recoverable_jobs(&self) -> Result<Vec<JobCheckpoint>, EngagementError> {
         let mut statement = self.connection.prepare(
             "SELECT job_id, engagement_id, action_key, kind, lifecycle, command_hash,
-                    pid, process_started_at_ms, process_group_id, stdout_artifact,
-                    stderr_artifact, stdout_cursor, stderr_cursor, last_activity_at_ms,
-                    exit_code, payload_json
-             FROM engagement_jobs
+                    pid, process_start_identity, process_started_at_ms, process_group_id, stdout_artifact,
+                    stderr_artifact, status_artifact, stdout_cursor, stderr_cursor,
+                    last_activity_at_ms, exit_code, payload_json
+             FROM job_checkpoints
              WHERE lifecycle IN ('running','quiet','stale')
              ORDER BY updated_at_ms",
         )?;
@@ -894,8 +1160,9 @@ impl EngagementStore {
         let limit = limit.clamp(1, MAX_EVENT_PAGE);
         let mut statement = self.connection.prepare(
             "SELECT engagement_id, seq, event_id, kind, lease_epoch, stage,
+                    task_id, action_id, evidence_id, artifact_ref,
                     payload_json, content_hash, created_at_ms
-             FROM engagement_events
+             FROM events
              WHERE engagement_id=?1 AND seq>?2
              ORDER BY seq ASC LIMIT ?3",
         )?;
@@ -917,7 +1184,7 @@ impl EngagementStore {
         self.connection
             .query_row(
                 "SELECT event_seq, record_json, created_at_ms
-                 FROM engagement_snapshots WHERE engagement_id=?1",
+                 FROM snapshots WHERE engagement_id=?1",
                 [engagement_id.0.as_str()],
                 |row| {
                     let record_json: String = row.get(1)?;
@@ -966,12 +1233,23 @@ impl EngagementStore {
 
         let mut report = RecoveryReport::default();
         for (engagement_id, lease_epoch, prior_status, stage) in expired {
-            let ambiguous = transaction.execute(
-                "UPDATE engagement_actions
-                 SET status='ambiguous', updated_at_ms=?1
-                 WHERE engagement_id=?2 AND status='dispatched'",
+            let replayable = transaction.execute(
+                "UPDATE actions
+                 SET status='prepared', updated_at_ms=?1
+                 WHERE engagement_id=?2
+                   AND status='dispatched'
+                   AND replay_policy IN ('read_only','idempotent')",
                 params![at_ms, engagement_id.0],
             )?;
+            let ambiguous = transaction.execute(
+                "UPDATE actions
+                 SET status='ambiguous', updated_at_ms=?1
+                 WHERE engagement_id=?2
+                   AND status='dispatched'
+                   AND replay_policy='non_idempotent'",
+                params![at_ms, engagement_id.0],
+            )?;
+            report.replayable_actions = report.replayable_actions.saturating_add(replayable);
             report.ambiguous_actions = report.ambiguous_actions.saturating_add(ambiguous);
             let next_status = if ambiguous > 0 {
                 report.parked += 1;
@@ -991,6 +1269,25 @@ impl EngagementStore {
                     as_i64(lease_epoch),
                 ],
             )?;
+            sync_pending_stage_tx(
+                &transaction,
+                &engagement_id,
+                next_status,
+                stage,
+                queue_priority_for(next_status, stage, QueuePriority::DurableStage),
+                at_ms,
+            )?;
+            release_lease_tx(
+                &transaction,
+                &engagement_id,
+                lease_epoch,
+                at_ms,
+                if ambiguous > 0 {
+                    "ambiguous_action"
+                } else {
+                    "expired"
+                },
+            )?;
             let event = append_event_tx(
                 &transaction,
                 &engagement_id,
@@ -1003,6 +1300,7 @@ impl EngagementStore {
                 },
                 serde_json::json!({
                     "prior_status": prior_status,
+                    "replayable_actions": replayable,
                     "ambiguous_actions": ambiguous,
                 }),
             )?;
@@ -1015,13 +1313,119 @@ impl EngagementStore {
     }
 
     pub fn queue_depth(&self) -> Result<usize, EngagementError> {
-        let count = self.connection.query_row(
-            "SELECT COUNT(*) FROM engagements WHERE status='queued'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
+        let count =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM pending_stages", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
         Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
+}
+
+fn backfill_normalized_state(connection: &mut Connection) -> Result<(), EngagementError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "INSERT OR IGNORE INTO pending_stages(
+             engagement_id, queue_class, priority, status, stage,
+             available_at_ms, updated_at_ms
+         )
+         SELECT engagement_id,
+                CASE
+                    WHEN stage IN ('executor','correction')
+                        THEN 'active_execution_continuation'
+                    WHEN stage='reviewer' THEN 'optional_reviewer'
+                    ELSE 'durable_pending_stage'
+                END,
+                CASE
+                    WHEN stage IN ('executor','correction') THEN 40
+                    WHEN stage='reviewer' THEN 20
+                    ELSE 35
+                END,
+                status, stage, updated_at_ms, updated_at_ms
+         FROM engagements
+         WHERE status IN ('queued','suspended');
+
+         INSERT OR IGNORE INTO leases(
+             engagement_id, lease_epoch, owner, acquired_at_ms, expires_at_ms,
+             last_heartbeat_at_ms
+         )
+         SELECT engagement_id, lease_epoch, lease_owner, updated_at_ms,
+                lease_expires_at_ms, updated_at_ms
+         FROM engagements
+         WHERE lease_owner IS NOT NULL AND lease_expires_at_ms IS NOT NULL;",
+    )?;
+    let records = {
+        let mut statement = transaction.prepare(
+            "SELECT engagement_id, session_id, prompt_id, workspace_id, user_request,
+                    status, stage, priority, lease_epoch, lease_owner,
+                    lease_expires_at_ms, accepted_at_ms, updated_at_ms, checkpoint_json
+             FROM engagements",
+        )?;
+        let rows = statement.query_map([], decode_engagement_row)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        records
+    };
+    for record in records {
+        let event_seq = transaction.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE engagement_id=?1",
+            [record.engagement_id.0.as_str()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        record_stage_and_tasks_tx(&transaction, &record, as_u64(event_seq))?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_legacy_table_names(connection: &Connection) -> Result<(), rusqlite::Error> {
+    for (legacy, current) in [
+        ("engagement_events", "events"),
+        ("engagement_snapshots", "snapshots"),
+        ("engagement_actions", "actions"),
+        ("engagement_jobs", "job_checkpoints"),
+    ] {
+        let legacy_exists = sqlite_object_exists(connection, "table", legacy)?;
+        let current_exists = sqlite_object_exists(connection, "table", current)?;
+        if legacy_exists && !current_exists {
+            connection.execute_batch(&format!("ALTER TABLE {legacy} RENAME TO {current}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_object_exists(
+    connection: &Connection,
+    object_type: &str,
+    name: &str,
+) -> Result<bool, rusqlite::Error> {
+    connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2
+         )",
+        params![object_type, name],
+        |row| row.get(0),
+    )
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), rusqlite::Error> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(());
+        }
+    }
+    connection.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+    ))
 }
 
 fn claim_tx(
@@ -1058,6 +1462,23 @@ fn claim_tx(
         });
     }
     let record = load_engagement_tx(&transaction, engagement_id)?;
+    transaction.execute(
+        "DELETE FROM pending_stages WHERE engagement_id=?1",
+        [engagement_id.0.as_str()],
+    )?;
+    transaction.execute(
+        "INSERT INTO leases(
+            engagement_id, lease_epoch, owner, acquired_at_ms, expires_at_ms,
+            last_heartbeat_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?4)",
+        params![
+            engagement_id.0,
+            as_i64(record.lease_epoch),
+            owner,
+            now,
+            record.lease_expires_at_ms.unwrap_or(now),
+        ],
+    )?;
     let event = append_event_tx(
         &transaction,
         engagement_id,
@@ -1093,6 +1514,321 @@ fn ensure_lease(record: &EngagementRecord, lease_epoch: u64) -> Result<(), Engag
     Ok(())
 }
 
+fn fence_lease_tx(
+    transaction: &Transaction<'_>,
+    engagement_id: &EngagementId,
+    lease_epoch: u64,
+) -> Result<(), EngagementError> {
+    let now = now_ms();
+    let changed = transaction.execute(
+        "UPDATE engagements
+         SET updated_at_ms=updated_at_ms
+         WHERE engagement_id=?1 AND lease_epoch=?2
+           AND lease_owner IS NOT NULL AND lease_expires_at_ms > ?3",
+        params![engagement_id.0, as_i64(lease_epoch), now],
+    )?;
+    if changed != 1 {
+        return Err(EngagementError::StaleLease {
+            engagement_id: engagement_id.0.clone(),
+            lease_epoch,
+        });
+    }
+    Ok(())
+}
+
+fn release_lease_tx(
+    transaction: &Transaction<'_>,
+    engagement_id: &EngagementId,
+    lease_epoch: u64,
+    released_at_ms: i64,
+    reason: &str,
+) -> Result<(), EngagementError> {
+    transaction.execute(
+        "UPDATE leases
+         SET released_at_ms=?1, release_reason=?2
+         WHERE engagement_id=?3 AND lease_epoch=?4 AND released_at_ms IS NULL",
+        params![released_at_ms, reason, engagement_id.0, as_i64(lease_epoch)],
+    )?;
+    Ok(())
+}
+
+fn queue_priority_for(
+    status: EngagementStatus,
+    stage: Option<EngagementStage>,
+    current: QueuePriority,
+) -> QueuePriority {
+    match (status, stage) {
+        (EngagementStatus::Executing | EngagementStatus::Correcting, _) => {
+            QueuePriority::ExecutorContinuation
+        }
+        (EngagementStatus::Reviewing, _) | (_, Some(EngagementStage::Reviewer)) => {
+            QueuePriority::Reviewer
+        }
+        (EngagementStatus::Planning, _) => QueuePriority::Interactive,
+        (
+            EngagementStatus::Queued | EngagementStatus::Suspended,
+            Some(EngagementStage::Executor),
+        )
+        | (
+            EngagementStatus::Queued | EngagementStatus::Suspended,
+            Some(EngagementStage::Correction),
+        ) => QueuePriority::ExecutorContinuation,
+        (EngagementStatus::Queued | EngagementStatus::Suspended, _) => {
+            if current == QueuePriority::Reviewer {
+                QueuePriority::Reviewer
+            } else {
+                QueuePriority::DurableStage
+            }
+        }
+        _ => current,
+    }
+}
+
+fn sync_pending_stage_tx(
+    transaction: &Transaction<'_>,
+    engagement_id: &EngagementId,
+    status: EngagementStatus,
+    stage: Option<EngagementStage>,
+    priority: QueuePriority,
+    now: i64,
+) -> Result<(), EngagementError> {
+    if matches!(
+        status,
+        EngagementStatus::Queued | EngagementStatus::Suspended
+    ) {
+        let queue_class = match priority {
+            QueuePriority::ExecutorContinuation => "active_execution_continuation",
+            QueuePriority::Reviewer => "optional_reviewer",
+            QueuePriority::AdapterPrewarm => "adapter_prewarm",
+            QueuePriority::Background => "embedding_prewarm",
+            QueuePriority::Interactive | QueuePriority::DurableStage => "durable_pending_stage",
+        };
+        transaction.execute(
+            "INSERT INTO pending_stages(
+                engagement_id, queue_class, priority, status, stage,
+                available_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+             ON CONFLICT(engagement_id) DO UPDATE SET
+                queue_class=excluded.queue_class,
+                priority=excluded.priority,
+                status=excluded.status,
+                stage=excluded.stage,
+                available_at_ms=excluded.available_at_ms,
+                updated_at_ms=excluded.updated_at_ms",
+            params![
+                engagement_id.0,
+                queue_class,
+                priority as i64,
+                status.as_str(),
+                stage.map(EngagementStage::as_str),
+                now,
+            ],
+        )?;
+    } else {
+        transaction.execute(
+            "DELETE FROM pending_stages WHERE engagement_id=?1",
+            [engagement_id.0.as_str()],
+        )?;
+    }
+    Ok(())
+}
+
+fn hydrate_checkpoint_job_refs_tx(
+    transaction: &Transaction<'_>,
+    engagement_id: &EngagementId,
+    checkpoint: &mut EngagementCheckpoint,
+) -> Result<(), EngagementError> {
+    let mut statement = transaction.prepare(
+        "SELECT job_id, stdout_cursor, stderr_cursor, stdout_artifact, stderr_artifact,
+                status_artifact
+         FROM job_checkpoints
+         WHERE engagement_id=?1
+         ORDER BY updated_at_ms, job_id",
+    )?;
+    let rows = statement.query_map([engagement_id.0.as_str()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            as_u64(row.get(1)?),
+            as_u64(row.get(2)?),
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+        ))
+    })?;
+    checkpoint.background_jobs.clear();
+    checkpoint.artifact_refs.retain(|artifact| {
+        !artifact.artifact_id.starts_with("job-stdout:")
+            && !artifact.artifact_id.starts_with("job-stderr:")
+            && !artifact.artifact_id.starts_with("job-status:")
+    });
+    for row in rows {
+        let (
+            job_id,
+            stdout_cursor,
+            stderr_cursor,
+            stdout_artifact,
+            stderr_artifact,
+            status_artifact,
+        ) = row?;
+        checkpoint.background_jobs.push(BackgroundJobCursor {
+            job_id: job_id.clone(),
+            stdout_cursor,
+            stderr_cursor,
+        });
+        if let Some(path) = stdout_artifact {
+            checkpoint.artifact_refs.push(ArtifactReference {
+                artifact_id: format!("job-stdout:{job_id}:{path}"),
+                content_hash: None,
+                cursor: Some(stdout_cursor),
+            });
+        }
+        if let Some(path) = stderr_artifact {
+            checkpoint.artifact_refs.push(ArtifactReference {
+                artifact_id: format!("job-stderr:{job_id}:{path}"),
+                content_hash: None,
+                cursor: Some(stderr_cursor),
+            });
+        }
+        if let Some(path) = status_artifact {
+            checkpoint.artifact_refs.push(ArtifactReference {
+                artifact_id: format!("job-status:{job_id}:{path}"),
+                content_hash: None,
+                cursor: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn record_stage_and_tasks_tx(
+    transaction: &Transaction<'_>,
+    record: &EngagementRecord,
+    event_seq: u64,
+) -> Result<(), EngagementError> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO stages(
+            engagement_id, stage_seq, status, stage, plan_revision, task_id,
+            task_cursor, checkpoint_json, entered_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            record.engagement_id.0,
+            as_i64(event_seq),
+            record.status.as_str(),
+            record.stage.map(EngagementStage::as_str),
+            i64::from(record.checkpoint.plan_revision),
+            record.checkpoint.task_id,
+            i64::from(record.checkpoint.task_index),
+            serde_json::to_string(&record.checkpoint)?,
+            record.updated_at_ms,
+        ],
+    )?;
+    let Some(tasks) = record
+        .checkpoint
+        .plan
+        .as_ref()
+        .and_then(|plan| plan.get("tasks"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+    for (index, task) in tasks.iter().enumerate() {
+        let Some(task_id) = task
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|task_id| !task_id.is_empty())
+        else {
+            continue;
+        };
+        let task_index = u32::try_from(index).unwrap_or(u32::MAX);
+        let status = if task_index < record.checkpoint.task_index {
+            "completed"
+        } else if record.checkpoint.task_id.as_deref() == Some(task_id) {
+            "active"
+        } else {
+            "pending"
+        };
+        transaction.execute(
+            "INSERT INTO tasks(
+                engagement_id, plan_revision, task_id, task_index, status,
+                task_json, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(engagement_id, plan_revision, task_id) DO UPDATE SET
+                task_index=excluded.task_index,
+                status=excluded.status,
+                task_json=excluded.task_json,
+                updated_at_ms=excluded.updated_at_ms",
+            params![
+                record.engagement_id.0,
+                i64::from(record.checkpoint.plan_revision),
+                task_id,
+                i64::from(task_index),
+                status,
+                serde_json::to_string(task)?,
+                record.updated_at_ms,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct EventCoordinates {
+    task_id: Option<String>,
+    action_id: Option<String>,
+    evidence_id: Option<String>,
+    artifact_ref: Option<String>,
+}
+
+fn event_coordinates_tx(
+    transaction: &Transaction<'_>,
+    engagement_id: &EngagementId,
+    payload: &serde_json::Value,
+) -> Result<EventCoordinates, EngagementError> {
+    let string_at = |pointer: &str| {
+        payload
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+    };
+    let action_key = string_at("/action_key");
+    let action = action_key
+        .as_deref()
+        .map(|key| load_action_tx(transaction, key))
+        .transpose()?
+        .flatten();
+    let checkpoint = transaction
+        .query_row(
+            "SELECT checkpoint_json FROM engagements WHERE engagement_id=?1",
+            [engagement_id.0.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str::<EngagementCheckpoint>(&json))
+        .transpose()?;
+    let artifact_ref = string_at("/artifact_ref")
+        .or_else(|| string_at("/stdout_artifact"))
+        .or_else(|| string_at("/stderr_artifact"));
+    Ok(EventCoordinates {
+        task_id: string_at("/identity/task_id")
+            .or_else(|| string_at("/task_id"))
+            .or_else(|| {
+                action
+                    .as_ref()
+                    .map(|record| record.identity.task_id.clone())
+            })
+            .or_else(|| checkpoint.as_ref().and_then(|value| value.task_id.clone())),
+        action_id: string_at("/identity/action_id")
+            .or_else(|| string_at("/action_id"))
+            .or_else(|| {
+                action
+                    .as_ref()
+                    .map(|record| record.identity.action_id.clone())
+            }),
+        evidence_id: string_at("/evidence_id"),
+        artifact_ref,
+    })
+}
+
 fn append_event_tx(
     transaction: &Transaction<'_>,
     engagement_id: &EngagementId,
@@ -1102,6 +1838,7 @@ fn append_event_tx(
     payload: serde_json::Value,
 ) -> Result<EngagementEvent, EngagementError> {
     let payload = canonical_json(&payload);
+    let coordinates = event_coordinates_tx(transaction, engagement_id, &payload)?;
     let payload_json = serde_json::to_string(&payload)?;
     check_json_size(
         payload_json.as_bytes(),
@@ -1109,7 +1846,7 @@ fn append_event_tx(
         MAX_EVENT_PAYLOAD_BYTES,
     )?;
     let seq = transaction.query_row(
-        "SELECT COALESCE(MAX(seq), -1) + 1 FROM engagement_events WHERE engagement_id=?1",
+        "SELECT COALESCE(MAX(seq), -1) + 1 FROM events WHERE engagement_id=?1",
         [engagement_id.0.as_str()],
         |row| row.get::<_, i64>(0),
     )?;
@@ -1120,16 +1857,18 @@ fn append_event_tx(
         seq,
         lease_epoch,
         stage,
+        &coordinates,
         kind,
         &payload_json,
         created_at_ms,
     );
     let event_id = format!("evt_{}", &content_hash[..32]);
     transaction.execute(
-        "INSERT INTO engagement_events(
+        "INSERT INTO events(
             engagement_id, seq, event_id, kind, lease_epoch, stage,
+            task_id, action_id, evidence_id, artifact_ref,
             payload_json, content_hash, created_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             engagement_id.0,
             as_i64(seq),
@@ -1137,6 +1876,10 @@ fn append_event_tx(
             kind,
             as_i64(lease_epoch),
             stage.map(EngagementStage::as_str),
+            coordinates.task_id.as_deref(),
+            coordinates.action_id.as_deref(),
+            coordinates.evidence_id.as_deref(),
+            coordinates.artifact_ref.as_deref(),
             payload_json,
             content_hash,
             created_at_ms,
@@ -1149,6 +1892,10 @@ fn append_event_tx(
         kind: kind.to_string(),
         lease_epoch,
         stage,
+        task_id: coordinates.task_id,
+        action_id: coordinates.action_id,
+        evidence_id: coordinates.evidence_id,
+        artifact_ref: coordinates.artifact_ref,
         payload,
         content_hash,
         created_at_ms,
@@ -1162,13 +1909,13 @@ fn write_snapshot_tx(
 ) -> Result<(), EngagementError> {
     let now = now_ms();
     transaction.execute(
-        "INSERT INTO engagement_snapshots(engagement_id, event_seq, record_json, created_at_ms)
+        "INSERT INTO snapshots(engagement_id, event_seq, record_json, created_at_ms)
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(engagement_id) DO UPDATE SET
             event_seq=excluded.event_seq,
             record_json=excluded.record_json,
             created_at_ms=excluded.created_at_ms
-         WHERE excluded.event_seq >= engagement_snapshots.event_seq",
+         WHERE excluded.event_seq >= snapshots.event_seq",
         params![
             record.engagement_id.0,
             as_i64(event_seq),
@@ -1261,10 +2008,10 @@ fn load_action_tx(
     transaction
         .query_row(
             "SELECT stable_key, engagement_id, plan_revision, task_id, action_id,
-                    action_kind, command_hash, status, attempt_count, job_id,
-                    evidence_id, payload_json, result_json, prepared_at_ms,
+                    action_kind, command_hash, replay_policy, status, attempt_count,
+                    job_id, evidence_id, payload_json, result_json, prepared_at_ms,
                     dispatched_at_ms, updated_at_ms
-             FROM engagement_actions WHERE stable_key=?1",
+             FROM actions WHERE stable_key=?1",
             [action_key],
             decode_action_row,
         )
@@ -1278,10 +2025,10 @@ fn load_action_conn(
     connection
         .query_row(
             "SELECT stable_key, engagement_id, plan_revision, task_id, action_id,
-                    action_kind, command_hash, status, attempt_count, job_id,
-                    evidence_id, payload_json, result_json, prepared_at_ms,
+                    action_kind, command_hash, replay_policy, status, attempt_count,
+                    job_id, evidence_id, payload_json, result_json, prepared_at_ms,
                     dispatched_at_ms, updated_at_ms
-             FROM engagement_actions WHERE stable_key=?1",
+             FROM actions WHERE stable_key=?1",
             [action_key],
             decode_action_row,
         )
@@ -1289,8 +2036,8 @@ fn load_action_conn(
 }
 
 fn decode_action_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionRecord> {
-    let payload_json: Option<String> = row.get(11)?;
-    let result_json: Option<String> = row.get(12)?;
+    let payload_json: Option<String> = row.get(12)?;
+    let result_json: Option<String> = row.get(13)?;
     Ok(ActionRecord {
         stable_key: row.get(0)?,
         engagement_id: EngagementId(row.get(1)?),
@@ -1301,19 +2048,20 @@ fn decode_action_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionRecord> 
         },
         action_kind: row.get(5)?,
         command_hash: row.get(6)?,
-        status: parse_action_status(row.get(7)?)?,
-        attempt_count: u32::try_from(row.get::<_, i64>(8)?).unwrap_or(u32::MAX),
-        job_id: row.get(9)?,
-        evidence_id: row.get(10)?,
+        replay_policy: parse_action_replay_policy(row.get(7)?)?,
+        status: parse_action_status(row.get(8)?)?,
+        attempt_count: u32::try_from(row.get::<_, i64>(9)?).unwrap_or(u32::MAX),
+        job_id: row.get(10)?,
+        evidence_id: row.get(11)?,
         payload: payload_json
             .map(|json| serde_json::from_str(&json).map_err(sql_decode_error))
             .transpose()?,
         result: result_json
             .map(|json| serde_json::from_str(&json).map_err(sql_decode_error))
             .transpose()?,
-        prepared_at_ms: row.get(13)?,
-        dispatched_at_ms: row.get(14)?,
-        updated_at_ms: row.get(15)?,
+        prepared_at_ms: row.get(14)?,
+        dispatched_at_ms: row.get(15)?,
+        updated_at_ms: row.get(16)?,
     })
 }
 
@@ -1324,10 +2072,10 @@ fn load_job_tx(
     transaction
         .query_row(
             "SELECT job_id, engagement_id, action_key, kind, lifecycle, command_hash,
-                    pid, process_started_at_ms, process_group_id, stdout_artifact,
-                    stderr_artifact, stdout_cursor, stderr_cursor, last_activity_at_ms,
-                    exit_code, payload_json
-             FROM engagement_jobs WHERE job_id=?1",
+                    pid, process_start_identity, process_started_at_ms, process_group_id, stdout_artifact,
+                    stderr_artifact, status_artifact, stdout_cursor, stderr_cursor,
+                    last_activity_at_ms, exit_code, payload_json
+             FROM job_checkpoints WHERE job_id=?1",
             [job_id],
             decode_job_row,
         )
@@ -1338,10 +2086,10 @@ fn load_job_conn(connection: &Connection, job_id: &str) -> rusqlite::Result<Opti
     connection
         .query_row(
             "SELECT job_id, engagement_id, action_key, kind, lifecycle, command_hash,
-                    pid, process_started_at_ms, process_group_id, stdout_artifact,
-                    stderr_artifact, stdout_cursor, stderr_cursor, last_activity_at_ms,
-                    exit_code, payload_json
-             FROM engagement_jobs WHERE job_id=?1",
+                    pid, process_start_identity, process_started_at_ms, process_group_id, stdout_artifact,
+                    stderr_artifact, status_artifact, stdout_cursor, stderr_cursor,
+                    last_activity_at_ms, exit_code, payload_json
+             FROM job_checkpoints WHERE job_id=?1",
             [job_id],
             decode_job_row,
         )
@@ -1349,7 +2097,7 @@ fn load_job_conn(connection: &Connection, job_id: &str) -> rusqlite::Result<Opti
 }
 
 fn decode_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobCheckpoint> {
-    let payload_json: String = row.get(15)?;
+    let payload_json: String = row.get(17)?;
     Ok(JobCheckpoint {
         job_id: row.get(0)?,
         engagement_id: EngagementId(row.get(1)?),
@@ -1360,14 +2108,16 @@ fn decode_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobCheckpoint> {
         pid: row
             .get::<_, Option<i64>>(6)?
             .map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
-        process_started_at_ms: row.get(7)?,
-        process_group_id: row.get(8)?,
-        stdout_artifact: row.get::<_, Option<String>>(9)?.map(Into::into),
-        stderr_artifact: row.get::<_, Option<String>>(10)?.map(Into::into),
-        stdout_cursor: as_u64(row.get(11)?),
-        stderr_cursor: as_u64(row.get(12)?),
-        last_activity_at_ms: row.get(13)?,
-        exit_code: row.get(14)?,
+        process_start_identity: row.get(7)?,
+        process_started_at_ms: row.get(8)?,
+        process_group_id: row.get(9)?,
+        stdout_artifact: row.get::<_, Option<String>>(10)?.map(Into::into),
+        stderr_artifact: row.get::<_, Option<String>>(11)?.map(Into::into),
+        status_artifact: row.get::<_, Option<String>>(12)?.map(Into::into),
+        stdout_cursor: as_u64(row.get(13)?),
+        stderr_cursor: as_u64(row.get(14)?),
+        last_activity_at_ms: row.get(15)?,
+        exit_code: row.get(16)?,
         payload: serde_json::from_str(&payload_json).map_err(sql_decode_error)?,
     })
 }
@@ -1377,19 +2127,29 @@ fn decode_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EngagementEvent
         .get::<_, Option<String>>(5)?
         .map(parse_stage)
         .transpose()?;
-    let payload_json: String = row.get(6)?;
+    let task_id: Option<String> = row.get(6)?;
+    let action_id: Option<String> = row.get(7)?;
+    let evidence_id: Option<String> = row.get(8)?;
+    let artifact_ref: Option<String> = row.get(9)?;
+    let payload_json: String = row.get(10)?;
     let engagement_id = EngagementId(row.get(0)?);
     let seq = as_u64(row.get(1)?);
     let event_id: String = row.get(2)?;
     let kind: String = row.get(3)?;
     let lease_epoch = as_u64(row.get(4)?);
-    let content_hash: String = row.get(7)?;
-    let created_at_ms = row.get(8)?;
+    let content_hash: String = row.get(11)?;
+    let created_at_ms = row.get(12)?;
     let expected_hash = event_content_hash(
         &engagement_id,
         seq,
         lease_epoch,
         stage,
+        &EventCoordinates {
+            task_id: task_id.clone(),
+            action_id: action_id.clone(),
+            evidence_id: evidence_id.clone(),
+            artifact_ref: artifact_ref.clone(),
+        },
         &kind,
         &payload_json,
         created_at_ms,
@@ -1408,6 +2168,10 @@ fn decode_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EngagementEvent
         kind,
         lease_epoch,
         stage,
+        task_id,
+        action_id,
+        evidence_id,
+        artifact_ref,
         payload: serde_json::from_str(&payload_json).map_err(sql_decode_error)?,
         content_hash,
         created_at_ms,
@@ -1419,6 +2183,7 @@ fn event_content_hash(
     seq: u64,
     lease_epoch: u64,
     stage: Option<EngagementStage>,
+    coordinates: &EventCoordinates,
     kind: &str,
     payload_json: &str,
     created_at_ms: i64,
@@ -1432,6 +2197,26 @@ fn event_content_hash(
         seq_text.as_bytes(),
         lease_epoch_text.as_bytes(),
         stage.map_or(b"", |value| value.as_str().as_bytes()),
+        coordinates
+            .task_id
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+        coordinates
+            .action_id
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+        coordinates
+            .evidence_id
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+        coordinates
+            .artifact_ref
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
         kind.as_bytes(),
         payload_json.as_bytes(),
         created_at_text.as_bytes(),
@@ -1452,6 +2237,11 @@ fn parse_stage(value: String) -> rusqlite::Result<EngagementStage> {
 
 fn parse_action_status(value: String) -> rusqlite::Result<ActionStatus> {
     ActionStatus::parse(&value).ok_or_else(|| sql_invalid_value("action status", value))
+}
+
+fn parse_action_replay_policy(value: String) -> rusqlite::Result<ActionReplayPolicy> {
+    ActionReplayPolicy::parse(&value)
+        .ok_or_else(|| sql_invalid_value("action replay policy", value))
 }
 
 fn parse_job_kind(value: String) -> rusqlite::Result<JobKind> {

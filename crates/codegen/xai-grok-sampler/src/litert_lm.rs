@@ -15,6 +15,13 @@ use crate::types::RequestId;
 
 const LOCAL_GENERATION_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
+fn requires_durable_admission(runtime_stage: RuntimeStage, turn_index: Option<&str>) -> bool {
+    matches!(
+        runtime_stage,
+        RuntimeStage::Planner | RuntimeStage::Executor | RuntimeStage::Reviewer
+    ) || (runtime_stage == RuntimeStage::Direct && turn_index.is_some())
+}
+
 pub use xai_grok_runtime::litert_lm::{
     BoundedLocalText, ContextOverflowStrategy, LiteRtLmConfig, LocalInferenceResult,
     LoraAdapterConfig,
@@ -84,6 +91,8 @@ pub(crate) async fn run_local_request(
         RuntimeStage::Embedding => RuntimePriority::Background,
         RuntimeStage::Prewarm => RuntimePriority::Prewarm,
     };
+    let durable_admission_required =
+        requires_durable_admission(runtime_stage, request.x_grok_turn_idx.as_deref());
     let session_id = request
         .x_grok_session_id
         .clone()
@@ -110,6 +119,10 @@ pub(crate) async fn run_local_request(
     let event_bridge = tokio::spawn(async move {
         while let Some(event) = runtime_event_rx.recv().await {
             let event = match event {
+                // Requests carrying the durable admission hook use the
+                // dedicated acknowledged bridge below. This fallback is kept
+                // for direct runtime callers that do not install a barrier.
+                RuntimeEvent::Admitted { .. } => continue,
                 RuntimeEvent::StreamStarted {
                     request_id,
                     timestamp_ms,
@@ -153,6 +166,23 @@ pub(crate) async fn run_local_request(
             }
         }
     });
+    let (admission_hook, admission_bridge) = if durable_admission_required {
+        let (admission_hook, mut admission_rx) = xai_grok_runtime::runtime_admission_channel();
+        let admission_events = event_tx.clone();
+        let bridge = tokio::spawn(async move {
+            while let Some(admission) = admission_rx.recv().await {
+                if admission_events
+                    .send(SamplingEvent::RuntimeAdmitted { admission })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (Some(admission_hook), Some(bridge))
+    } else {
+        (None, None)
+    };
     let request = RuntimeRequest {
         request_id: request_id.as_str().to_string(),
         session_id,
@@ -167,10 +197,36 @@ pub(crate) async fn run_local_request(
         // optional review, 2 s mandatory work). Once generation starts it must
         // not inherit that queue timeout and be killed mid-token.
         deadline: Instant::now() + LOCAL_GENERATION_DEADLINE,
+        admission_hook,
     };
     let result = RuntimeManager::global()
         .generate(request, runtime_event_tx, cancel_token.clone())
         .await;
     let _ = event_bridge.await;
+    if let Some(admission_bridge) = admission_bridge {
+        let _ = admission_bridge.await;
+    }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_admission_is_required_only_for_turn_generation_stages() {
+        assert!(requires_durable_admission(RuntimeStage::Planner, None));
+        assert!(requires_durable_admission(RuntimeStage::Executor, None));
+        assert!(requires_durable_admission(RuntimeStage::Reviewer, None));
+        assert!(requires_durable_admission(RuntimeStage::Direct, Some("12")));
+        assert!(!requires_durable_admission(RuntimeStage::Direct, None));
+        assert!(!requires_durable_admission(
+            RuntimeStage::Embedding,
+            Some("12")
+        ));
+        assert!(!requires_durable_admission(
+            RuntimeStage::Prewarm,
+            Some("12")
+        ));
+    }
 }

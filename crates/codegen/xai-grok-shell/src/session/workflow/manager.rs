@@ -156,14 +156,20 @@ impl WorkflowManager {
                     .and_then(|p| self.session_dir.as_ref().map(|d| (d, p)))
                 {
                     Some((session_dir, relative)) => {
-                        let expected = format!("workflows/{run_id}/journal.jsonl");
-                        if relative != &expected {
+                        let legacy = format!("workflows/{run_id}/journal.jsonl");
+                        let sqlite = "workflows/workflow-state.sqlite";
+                        if relative != &legacy && relative != sqlite {
                             return Err(LaunchError::Journal(
                                 "persisted journal path does not match its workflow run".into(),
                             ));
                         }
-                        Journal::load(session_dir.join(relative))
-                            .map_err(|e| LaunchError::Journal(e.to_string()))?
+                        if relative == &legacy {
+                            Journal::load(session_dir.join(relative))
+                                .map_err(|e| LaunchError::Journal(e.to_string()))?
+                        } else {
+                            Journal::load_sqlite(session_dir.join(relative), run_id)
+                                .map_err(|e| LaunchError::Journal(e.to_string()))?
+                        }
                     }
                     None => Journal::new(None),
                 };
@@ -198,9 +204,14 @@ impl WorkflowManager {
                 self.store
                     .register(&run_id, &execution_script, &spec.args)
                     .map_err(|error| LaunchError::Store(error.to_string()))?;
-                let journal_rel = format!("workflows/{run_id}/journal.jsonl");
-                let journal_path = self.session_dir.as_ref().map(|d| d.join(&journal_rel));
-                let journal = Journal::new(journal_path);
+                let journal_rel = "workflows/workflow-state.sqlite".to_string();
+                let journal = match self.session_dir.as_ref() {
+                    Some(session_dir) => {
+                        Journal::load_sqlite(session_dir.join(&journal_rel), &run_id)
+                            .map_err(|error| LaunchError::Journal(error.to_string()))?
+                    }
+                    None => Journal::new(None),
+                };
                 let state = self.tracker.lock().start_run(
                     run_id.clone(),
                     resolved.meta.name,
@@ -987,15 +998,22 @@ mod tests {
             manager.tracker.lock().get(&run_id).unwrap().status,
             crate::session::workflow::tracker::WorkflowRunStatus::Failed
         );
-        let journal_path = dir
-            .path()
-            .join("workflows")
-            .join(&run_id)
-            .join("journal.jsonl");
-        assert!(
-            std::fs::read_to_string(&journal_path)
+        let journal_path = dir.path().join("workflows").join("workflow-state.sqlite");
+        let journal_contains = |needle: &str| {
+            let connection = rusqlite::Connection::open(&journal_path).unwrap();
+            connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM workflow_journal
+                        WHERE stream_id=?1 AND result_json LIKE ?2
+                     )",
+                    rusqlite::params![run_id, format!("%{needle}%")],
+                    |row| row.get::<_, bool>(0),
+                )
                 .unwrap()
-                .contains("__xai_workflow_host_error"),
+        };
+        assert!(
+            journal_contains("__xai_workflow_host_error"),
             "the uncaught host error must be journaled as a trailing sentinel"
         );
 
@@ -1027,9 +1045,7 @@ mod tests {
             crate::session::workflow::tracker::WorkflowRunStatus::Complete
         );
         assert!(
-            !std::fs::read_to_string(&journal_path)
-                .unwrap()
-                .contains("__xai_workflow_host_error"),
+            !journal_contains("__xai_workflow_host_error"),
             "the trailing sentinel must be pruned and replaced by the live result"
         );
     }

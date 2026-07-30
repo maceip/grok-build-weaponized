@@ -140,10 +140,10 @@ impl ExecutionSupervisor {
     /// Reconcile jobs that survived in SQLite but lost their in-process child
     /// owner during a crash or restart.
     ///
-    /// The recorded PID is retained for diagnostics, never signalled or
-    /// reattached without an OS-backed birth identity. This is the safe side
-    /// of the PID-reuse boundary: recovered jobs become explicit `Lost`
-    /// tombstones while their spool artifacts and cursors remain available.
+    /// A job is reattached only when its PID, OS-backed birth identity, process
+    /// group, stable job ID, and command fingerprint still agree with the
+    /// durable checkpoint. Jobs that cannot prove that identity become
+    /// explicit `Lost` tombstones; PID-only recovery is never attempted.
     pub async fn recover_jobs(&self, lease: &EngagementLease) -> Result<usize, String> {
         let jobs = lease
             .recoverable_jobs()
@@ -151,20 +151,43 @@ impl ExecutionSupervisor {
             .map_err(|error| error.to_string())?;
         let mut recovered = 0;
         for mut checkpoint in jobs {
-            checkpoint.lifecycle = JobLifecycle::Lost;
-            checkpoint.last_activity_at_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
-                .unwrap_or(0);
-            let previous_payload = std::mem::take(&mut checkpoint.payload);
-            checkpoint.payload = serde_json::json!({
+            let recovery = serde_json::json!({
                 "recovery": "supervisor_restarted",
-                "reason": "process birth identity unavailable; refusing PID-only reattachment",
                 "recorded_pid": checkpoint.pid,
+                "process_start_identity": checkpoint.process_start_identity,
+                "command_hash": checkpoint.command_hash,
                 "stdout_cursor": checkpoint.stdout_cursor,
                 "stderr_cursor": checkpoint.stderr_cursor,
-                "previous_payload": previous_payload,
             });
+            if let (Some(payload), Some(recovery)) =
+                (checkpoint.payload.as_object_mut(), recovery.as_object())
+            {
+                payload.extend(recovery.clone());
+            } else {
+                checkpoint.payload = recovery;
+            }
+            match self
+                .jobs()
+                .restore_running(checkpoint.clone(), lease.clone())
+            {
+                Ok(job) => {
+                    checkpoint.last_activity_at_ms = now_ms();
+                    checkpoint.payload["recovery"] = serde_json::json!("reattached");
+                    lease
+                        .checkpoint_job(checkpoint)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    job.start_recovered_monitor();
+                    recovered += 1;
+                    continue;
+                }
+                Err(recovery_error) => {
+                    checkpoint.payload["recovery_error"] = serde_json::json!(recovery_error);
+                }
+            }
+            checkpoint.lifecycle = JobLifecycle::Lost;
+            checkpoint.last_activity_at_ms = now_ms();
+            checkpoint.payload["recovery"] = serde_json::json!("lost");
             lease
                 .checkpoint_job(checkpoint.clone())
                 .await
@@ -207,6 +230,13 @@ impl ExecutionSupervisor {
         drop(clock_task);
         self.maintenance_tx.subscribe()
     }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -274,10 +304,12 @@ mod tests {
                 lifecycle: JobLifecycle::Running,
                 command_hash: "hash".to_string(),
                 pid: Some(777),
+                process_start_identity: Some("test-process-birth".to_string()),
                 process_started_at_ms: Some(1),
                 process_group_id: Some(777),
                 stdout_artifact: Some(artifact.clone()),
                 stderr_artifact: None,
+                status_artifact: None,
                 stdout_cursor: 123,
                 stderr_cursor: 4,
                 last_activity_at_ms: 1,

@@ -23,7 +23,10 @@ pub use context::{
     AdmissionError, ContextAllocation, ContextBudgetBroker, ContextComponent, ContextComponentKind,
     ContextPlan, DroppedContext, StageBudget,
 };
-pub use events::{RuntimeChannel, RuntimeEvent};
+pub use events::{
+    RuntimeAdmission, RuntimeAdmissionHook, RuntimeAdmissionReceipt, RuntimeAdmissionReceiver,
+    RuntimeChannel, RuntimeEvent, runtime_admission_channel,
+};
 pub use evidence::{
     ArtifactRef, EvidenceBlackboard, EvidenceError, EvidenceId, EvidenceRecord, EvidenceSource,
 };

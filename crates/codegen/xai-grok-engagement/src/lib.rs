@@ -10,15 +10,17 @@ mod store;
 mod types;
 
 pub use coordinator::{
-    EngagementCoordinator, EngagementLease, EngagementSubscription, SubscriptionError,
+    CursorGap, EngagementCoordinator, EngagementLease, EngagementSubscription, SubscriptionError,
+    SubscriptionItem,
 };
 pub use store::{
     AcceptOutcome, EngagementError, EngagementMutation, EngagementStore, RecoveryReport,
 };
 pub use types::{
-    ActionIdentity, ActionRecord, ActionResolution, ActionSpec, ActionStatus, EngagementCheckpoint,
-    EngagementEvent, EngagementId, EngagementRecord, EngagementSnapshot, EngagementStage,
-    EngagementStatus, JobCheckpoint, JobKind, JobLifecycle, NewEngagement, QueuePriority,
+    ActionIdentity, ActionRecord, ActionReplayPolicy, ActionResolution, ActionSpec, ActionStatus,
+    ArtifactReference, BackgroundJobCursor, EngagementCheckpoint, EngagementEvent, EngagementId,
+    EngagementRecord, EngagementSnapshot, EngagementStage, EngagementStatus, JobCheckpoint,
+    JobKind, JobLifecycle, NewEngagement, QueuePriority, RuntimeAdmissionRecord,
 };
 
 #[cfg(test)]

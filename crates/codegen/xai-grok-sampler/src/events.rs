@@ -26,6 +26,12 @@ pub enum SamplingChannel {
 /// session translates these into ACP notifications.
 #[derive(Debug, Clone)]
 pub enum SamplingEvent {
+    /// A local request passed exact context admission and acquired its durable
+    /// model/adapter/context identity before generation started.
+    RuntimeAdmitted {
+        admission: xai_grok_runtime::RuntimeAdmissionReceipt,
+    },
+
     /// HTTP stream established, headers read. Emitted before any content.
     StreamStarted {
         request_id: RequestId,

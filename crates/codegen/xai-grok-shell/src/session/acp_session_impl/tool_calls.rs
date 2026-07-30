@@ -2886,6 +2886,34 @@ impl SessionActor {
     ) {
         use xai_grok_sampler::{SamplingChannel, SamplingEvent};
         match event {
+            SamplingEvent::RuntimeAdmitted { admission } => {
+                let prompt_id = self
+                    .current_prompt_id
+                    .lock()
+                    .expect("current_prompt_id mutex poisoned")
+                    .clone();
+                let record = admission.admission();
+                let persisted = if let Some(prompt_id) = prompt_id {
+                    crate::agent::engagement::record_runtime_admission(
+                        self.session_info.id.0.as_ref(),
+                        &prompt_id,
+                        record.request_id.clone(),
+                        record.model_id.clone(),
+                        record.adapter_id.clone(),
+                        record.context_plan_hash.clone(),
+                    )
+                    .await
+                } else {
+                    Err("local runtime admission arrived without an active prompt".to_string())
+                };
+                if let Err(error) = &persisted {
+                    tracing::error!(
+                        %error,
+                        "failed to durably record local runtime admission"
+                    );
+                }
+                admission.acknowledge(persisted);
+            }
             SamplingEvent::StreamStarted { timestamp_ms, .. } => {
                 {
                     let prompt_id = self

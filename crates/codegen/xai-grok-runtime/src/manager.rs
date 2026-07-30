@@ -13,7 +13,7 @@ use crate::adapter::{
     AdapterBinding, AdapterDescriptor, AdapterError, AdapterManager, hash_artifact,
 };
 use crate::context::{ContextBudgetBroker, ContextComponent, ContextComponentKind, StageBudget};
-use crate::events::RuntimeEvent;
+use crate::events::{RuntimeAdmission, RuntimeAdmissionHook, RuntimeEvent};
 use crate::litert_lm::{
     LiteRtLmConfig, LocalInferenceResult, LoraAdapterConfig, PreparedConversation,
     drop_inactive_sessions, drop_session, measure_prepared, prewarm, prewarm_adapter,
@@ -108,6 +108,17 @@ impl RuntimePriority {
 }
 
 impl RuntimeStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Planner => "planner",
+            Self::Executor => "executor",
+            Self::Reviewer => "reviewer",
+            Self::Embedding => "embedding",
+            Self::Prewarm => "prewarm",
+        }
+    }
+
     fn completion_reserve(self, requested: u32, context_window: Option<u32>) -> u32 {
         match self {
             Self::Planner => 768,
@@ -146,6 +157,9 @@ pub struct RuntimeRequest {
     pub completion_reserve: u32,
     pub priority: RuntimePriority,
     pub deadline: Instant,
+    /// Optional durable barrier invoked after exact context admission and
+    /// before any native generation work starts.
+    pub admission_hook: Option<RuntimeAdmissionHook>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1110,6 +1124,42 @@ impl RuntimeManager {
             broker.finalize_exact(plan, measured).map_err(|error| {
                 runtime_error("local_runtime_context_admission", error.to_string())
             })?;
+        }
+
+        let context_plan_hash = {
+            let mut hasher = blake3::Hasher::new();
+            let rendered_context = serde_json::to_vec(&request.conversation).map_err(|error| {
+                runtime_error(
+                    "local_runtime_context_admission",
+                    format!("failed to hash admitted context: {error}"),
+                )
+            })?;
+            for part in [
+                request.model_id.as_bytes(),
+                request.stage.as_str().as_bytes(),
+                rendered_context.as_slice(),
+            ] {
+                hasher.update(&(part.len() as u64).to_le_bytes());
+                hasher.update(part);
+            }
+            hasher.finalize().to_hex().to_string()
+        };
+        let admission = RuntimeAdmission {
+            request_id: request.request_id.clone(),
+            model_id: request.model_id.clone(),
+            adapter_id: request.adapter.as_ref().map(AdapterBinding::immutable_id),
+            context_plan_hash,
+        };
+        if let Some(hook) = request.admission_hook.as_ref() {
+            hook.persist(admission, request.deadline, &cancel_token)
+                .await?;
+        } else {
+            let _ = event_tx.send(RuntimeEvent::Admitted {
+                request_id: admission.request_id,
+                model_id: admission.model_id,
+                adapter_id: admission.adapter_id,
+                context_plan_hash: admission.context_plan_hash,
+            });
         }
 
         let result = match self.inner.mode {
@@ -2109,12 +2159,15 @@ impl Drop for SchedulerPermit {
     }
 }
 
+type SchedulerWaiter = oneshot::Sender<Result<(), ()>>;
+type SessionWaiters = HashMap<String, VecDeque<SchedulerWaiter>>;
+
 struct SchedulerState {
     max_active: usize,
     max_pending: usize,
     active: usize,
     pending: usize,
-    queues: Vec<HashMap<String, VecDeque<oneshot::Sender<Result<(), ()>>>>>,
+    queues: Vec<SessionWaiters>,
     sessions: Vec<VecDeque<String>>,
     weighted_priorities: Vec<usize>,
     priority_cursor: usize,

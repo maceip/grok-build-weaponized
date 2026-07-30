@@ -157,6 +157,29 @@ pub(crate) async fn heartbeat(session_id: &str, prompt_id: &str) -> Result<(), S
     }
 }
 
+pub(crate) async fn record_runtime_admission(
+    session_id: &str,
+    prompt_id: &str,
+    request_id: String,
+    model_id: String,
+    adapter_id: Option<String>,
+    context_plan_hash: String,
+) -> Result<(), String> {
+    let lease = lease_for(session_id, prompt_id).ok_or_else(|| {
+        format!("no active durable engagement lease for runtime admission {session_id}/{prompt_id}")
+    })?;
+    lease
+        .record_runtime_admission(xai_grok_engagement::RuntimeAdmissionRecord {
+            request_id,
+            model_id,
+            adapter_id,
+            context_plan_hash,
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 pub(crate) async fn complete(
     session_id: &str,
     prompt_id: &str,
@@ -257,6 +280,11 @@ pub(crate) async fn prepare_action(
             },
             action_kind: tool_name.to_string(),
             command_hash,
+            replay_policy: if is_read_only {
+                xai_grok_engagement::ActionReplayPolicy::ReadOnly
+            } else {
+                xai_grok_engagement::ActionReplayPolicy::NonIdempotent
+            },
             payload: Some(serde_json::json!({
                 "tool_name": tool_name,
                 "arguments": canonical_arguments,

@@ -335,6 +335,9 @@ pub fn format_monitor_events(
 pub(crate) fn task_owned_by_session(task: &TaskSnapshot, my_owner: Option<&str>) -> bool {
     match (my_owner, task.owner_session_id.as_deref()) {
         (Some(me), Some(owner)) => me == owner,
+        // An owner-less consumer must not inherit explicitly owned jobs
+        // recovered into the process-wide registry.
+        (None, Some(_)) => false,
         _ => true,
     }
 }
@@ -1302,6 +1305,16 @@ mod tests {
             !joined.contains("parent-task"),
             "another session's task must NOT leak into this session: {joined}"
         );
+    }
+
+    #[test]
+    fn ownerless_consumer_never_claims_an_owned_task() {
+        let owned = TaskSnapshot {
+            owner_session_id: Some("another-session".into()),
+            ..make_completed("owned-task")
+        };
+        assert!(!task_owned_by_session(&owned, None));
+        assert!(task_owned_by_session(&make_completed("legacy-task"), None));
     }
     #[tokio::test]
     async fn suppressed_after_kill_task() {

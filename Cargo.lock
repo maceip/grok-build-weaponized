@@ -15643,6 +15643,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rhai",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -15651,6 +15652,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "xai-sqlite-journal",
 ]
 
 [[package]]

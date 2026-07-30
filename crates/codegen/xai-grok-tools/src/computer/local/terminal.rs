@@ -24,7 +24,9 @@ use crate::computer::types::{
     TerminalRunRequest, TerminalRunResult,
 };
 use crate::native::execution_supervisor::ExecutionSupervisor;
-use crate::native::job_registry::{ExecutionJobHandle, ExecutionJobKind};
+use crate::native::job_registry::{
+    ExecutionJobHandle, ExecutionJobKind, ExecutionJobLifecycle, ExecutionJobSnapshot,
+};
 use crate::notification::types::{BashNotificationBase, BashOutputChunk, ToolNotificationHandle};
 
 use super::SearchShadowConfig;
@@ -37,6 +39,65 @@ struct SpawnResult {
     process_group: crate::util::ProcessGroup,
     /// Handle for reading the state dump from fd 4 (persistent shell only).
     state_dump_handle: Option<tokio::task::JoinHandle<std::io::Result<String>>>,
+}
+
+#[derive(Clone, Debug)]
+struct ProcessSpoolArtifacts {
+    stdout: PathBuf,
+    stderr: PathBuf,
+    status: PathBuf,
+}
+
+impl ProcessSpoolArtifacts {
+    fn for_output(output_file: &Path, job_id: &str) -> Self {
+        let name = output_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("command-output");
+        let parent = output_file.parent().unwrap_or_else(|| Path::new("."));
+        Self {
+            stdout: parent.join(format!(".{name}.{job_id}.stdout")),
+            stderr: parent.join(format!(".{name}.{job_id}.stderr")),
+            status: parent.join(format!(".{name}.{job_id}.status.json")),
+        }
+    }
+
+    async fn prepare(output_file: &Path, job_id: &str) -> std::io::Result<Self> {
+        if let Some(parent) = output_file.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let artifacts = Self::for_output(output_file, job_id);
+        for path in [&artifacts.stdout, &artifacts.stderr] {
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .await?;
+        }
+        match tokio::fs::remove_file(&artifacts.status).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Ok(artifacts)
+    }
+
+    fn stdout_stdio(&self) -> std::io::Result<Stdio> {
+        append_stdio(&self.stdout)
+    }
+
+    fn stderr_stdio(&self) -> std::io::Result<Stdio> {
+        append_stdio(&self.stderr)
+    }
+}
+
+fn append_stdio(path: &Path) -> std::io::Result<Stdio> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map(Stdio::from)
 }
 
 const READ_BUFFER_SIZE: usize = 8192;
@@ -203,6 +264,79 @@ fn spawn_process_readers(
             sequence,
             output_tx.clone(),
         );
+    }
+}
+
+fn spawn_spool_readers(
+    stream_id: &str,
+    artifacts: &ProcessSpoolArtifacts,
+    output_tx: &mpsc::Sender<ProcessOutputEvent>,
+    cancel: CancellationToken,
+) {
+    let sequence = std::sync::Arc::new(AtomicU64::new(0));
+    for (stream, path) in [
+        (OutputStream::Stdout, artifacts.stdout.clone()),
+        (OutputStream::Stderr, artifacts.stderr.clone()),
+    ] {
+        let stream_id = stream_id.to_owned();
+        let output_tx = output_tx.clone();
+        let sequence = std::sync::Arc::clone(&sequence);
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut file = match File::open(&path).await {
+                Ok(file) => file,
+                Err(error) => {
+                    let _ = output_tx
+                        .send(ProcessOutputEvent::ReadError {
+                            stream_id,
+                            stream,
+                            message: error.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            let mut buffer = vec![0_u8; READ_BUFFER_SIZE];
+            loop {
+                match file.read(&mut buffer).await {
+                    Ok(0) => {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        tokio::select! {
+                            _ = cancel.cancelled() => {}
+                            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                        }
+                    }
+                    Ok(read) => {
+                        let event = ProcessOutputEvent::Chunk {
+                            stream_id: stream_id.clone(),
+                            sequence: sequence.fetch_add(1, Ordering::Relaxed),
+                            chunk: StreamChunk {
+                                stream,
+                                bytes: buffer[..read].to_vec(),
+                            },
+                        };
+                        if output_tx.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = output_tx
+                            .send(ProcessOutputEvent::ReadError {
+                                stream_id: stream_id.clone(),
+                                stream,
+                                message: error.to_string(),
+                            })
+                            .await;
+                        break;
+                    }
+                }
+            }
+            let _ = output_tx
+                .send(ProcessOutputEvent::Closed { stream_id, stream })
+                .await;
+        });
     }
 }
 
@@ -404,6 +538,10 @@ struct ProcessState {
     stderr_closed: bool,
     stdout_bytes: u64,
     stderr_bytes: u64,
+    /// Stops child-owned spool tailers after the actor observes process exit.
+    /// The child writes the files directly; cancellation only stops this
+    /// process's live consumer and never truncates the durable artifacts.
+    spool_tailer_cancel: Option<CancellationToken>,
     pending_exit_status: Option<ExitStatus>,
     pending_exit_at: Option<Instant>,
     /// Exit status once process completes
@@ -481,6 +619,12 @@ impl ProcessState {
             "stderr_bytes": self.stderr_bytes,
             "total_bytes": self.total_bytes,
             "output_file": self.output_file.clone(),
+            "command": self.command,
+            "display_command": self.display_command,
+            "cwd": self.cwd,
+            "kind": self.kind,
+            "owner_session_id": self.owner_session_id,
+            "description": self.description,
             "completed": self.exit_status.is_some(),
         })
     }
@@ -690,6 +834,108 @@ async fn read_bounded_file_preview(path: &Path, max_bytes: usize) -> std::io::Re
     ))
 }
 
+async fn recovered_terminal_task(task_id: &str) -> Option<TaskSnapshot> {
+    let job = ExecutionSupervisor::global().jobs().get(task_id)?;
+    Some(execution_snapshot_to_task(job.snapshot()).await)
+}
+
+async fn execution_snapshot_to_task(snapshot: ExecutionJobSnapshot) -> TaskSnapshot {
+    const RECOVERED_PREVIEW_BYTES: usize = 64 * 1024;
+    let mut previews = Vec::new();
+    for (label, path) in [
+        ("stdout", snapshot.stdout_artifact.as_deref()),
+        ("stderr", snapshot.stderr_artifact.as_deref()),
+    ] {
+        if let Some(path) = path
+            && let Ok(preview) = read_bounded_file_preview(path, RECOVERED_PREVIEW_BYTES / 2).await
+            && !preview.is_empty()
+        {
+            previews.push(format!("[{label}]\n{preview}"));
+        }
+    }
+    let output_file = snapshot
+        .payload
+        .get("output_file")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<PathBuf>(value).ok())
+        .or_else(|| snapshot.artifact.clone())
+        .or_else(|| snapshot.stdout_artifact.clone())
+        .unwrap_or_default();
+    let command = snapshot
+        .payload
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            snapshot
+                .command_hash
+                .as_deref()
+                .map(|hash| format!("<recovered command {hash}>"))
+                .unwrap_or_else(|| "<recovered command>".to_string())
+        });
+    let completed = snapshot.lifecycle != ExecutionJobLifecycle::Running;
+    TaskSnapshot {
+        task_id: snapshot.job_id,
+        command,
+        display_command: snapshot
+            .payload
+            .get("display_command")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+        cwd: snapshot
+            .payload
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        start_time: snapshot.started_at,
+        end_time: completed.then(std::time::SystemTime::now),
+        output: previews.join("\n\n"),
+        output_file,
+        truncated: snapshot
+            .stdout_cursor
+            .saturating_add(snapshot.stderr_cursor)
+            > RECOVERED_PREVIEW_BYTES as u64,
+        exit_code: snapshot
+            .payload
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok()),
+        signal: snapshot
+            .payload
+            .get("signal")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or(snapshot.error),
+        completed,
+        kind: snapshot
+            .payload
+            .get("kind")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
+        block_waited: false,
+        explicitly_killed: snapshot.lifecycle == ExecutionJobLifecycle::Cancelled,
+        owner_session_id: snapshot.owner_session_id.clone().or_else(|| {
+            snapshot
+                .payload
+                .get("owner_session_id")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+        }),
+        description: snapshot
+            .payload
+            .get("description")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+        is_backgrounded: snapshot
+            .payload
+            .get("is_backgrounded")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+    }
+}
+
 // ============================================================================
 // Actor
 // ============================================================================
@@ -843,16 +1089,25 @@ impl LocalTerminalActor {
         command: &str,
         cwd: &std::path::Path,
         env: &HashMap<String, String>,
+        artifacts: Option<&ProcessSpoolArtifacts>,
     ) -> Result<SpawnResult, ComputerError> {
         #[cfg(unix)]
+        let guarded_command = artifacts.map(|_| command_with_status_guardian(command));
+        #[cfg(unix)]
+        let command = guarded_command.as_deref().unwrap_or(command);
+        #[cfg(unix)]
         if self.persistent_shell {
-            return self.spawn_persistent_command(command, cwd, env).await;
+            return self
+                .spawn_persistent_command(command, cwd, env, artifacts)
+                .await;
         }
 
         #[cfg(unix)]
         if self.login_shell_capture && login_env_capture_enabled() {
             self.ensure_static_shell_initialized(cwd).await;
-            return self.spawn_static_command(command, cwd, env).await;
+            return self
+                .spawn_static_command(command, cwd, env, artifacts)
+                .await;
         }
 
         #[cfg(unix)]
@@ -872,6 +1127,7 @@ impl LocalTerminalActor {
             login_env,
             self.search_shadows,
             self.shell_env_policy.as_ref(),
+            artifacts,
         )?;
         Ok(SpawnResult {
             child,
@@ -915,6 +1171,7 @@ impl LocalTerminalActor {
         command: &str,
         cwd: &std::path::Path,
         env: &HashMap<String, String>,
+        artifacts: Option<&ProcessSpoolArtifacts>,
     ) -> Result<SpawnResult, ComputerError> {
         use command_fds::CommandFdExt;
 
@@ -927,9 +1184,14 @@ impl LocalTerminalActor {
         cmd.args(&prep.args)
             .current_dir(cwd)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(artifacts) = artifacts {
+            cmd.stdout(artifacts.stdout_stdio()?)
+                .stderr(artifacts.stderr_stdio()?)
+                .env("GROK_PROCESS_STATUS_PATH", &artifacts.status);
+        } else {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
 
         apply_child_env(
             &mut cmd,
@@ -1006,6 +1268,7 @@ impl LocalTerminalActor {
         command: &str,
         cwd: &std::path::Path,
         env: &HashMap<String, String>,
+        artifacts: Option<&ProcessSpoolArtifacts>,
     ) -> Result<SpawnResult, ComputerError> {
         use command_fds::CommandFdExt;
 
@@ -1050,9 +1313,14 @@ impl LocalTerminalActor {
         cmd.args(&prep.args)
             .current_dir(&prep.cwd)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(artifacts) = artifacts {
+            cmd.stdout(artifacts.stdout_stdio()?)
+                .stderr(artifacts.stderr_stdio()?)
+                .env("GROK_PROCESS_STATUS_PATH", &artifacts.status);
+        } else {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
 
         // The persistent backend restores login state from its snapshot, so no
         // login-env layering here.
@@ -1168,12 +1436,20 @@ impl LocalTerminalActor {
             TerminalCommand::GetTask { task_id, reply } => {
                 let snapshot = match self.processes.get(&task_id) {
                     Some(p) => Some(p.to_task_snapshot(&task_id).await),
-                    None => self.completed_task_snapshots.get(&task_id).cloned(),
+                    None => match self.completed_task_snapshots.get(&task_id).cloned() {
+                        Some(snapshot) => Some(snapshot),
+                        None => recovered_terminal_task(&task_id).await,
+                    },
                 };
                 let _ = reply.send(snapshot);
             }
             TerminalCommand::Kill { task_id, reply } => {
-                let outcome = self.handle_kill(&task_id).await;
+                let mut outcome = self.handle_kill(&task_id).await;
+                if outcome == KillOutcome::NotFound
+                    && ExecutionSupervisor::global().jobs().cancel(&task_id)
+                {
+                    outcome = KillOutcome::Killed;
+                }
                 let _ = reply.send(outcome);
             }
             TerminalCommand::WaitForCompletion {
@@ -1192,6 +1468,32 @@ impl LocalTerminalActor {
                 }
                 for snap in self.completed_task_snapshots.values() {
                     snapshots.push(snap.clone());
+                }
+                let known = snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.task_id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                let mut cursor = Some(0_usize);
+                while let Some(page_cursor) = cursor {
+                    let (durable, next) = ExecutionSupervisor::global().jobs().list(
+                        Some(ExecutionJobKind::Terminal),
+                        page_cursor,
+                        100,
+                    );
+                    for snapshot in durable {
+                        // Live jobs are owned by another terminal actor unless
+                        // they already appear in this actor's process maps.
+                        // Only recovered entries are process-global fallbacks.
+                        // Without this boundary, one backend can surface
+                        // completion reminders for another backend's jobs.
+                        if snapshot.restored_from_checkpoint
+                            && snapshot.owner_session_id.is_some()
+                            && !known.contains(&snapshot.job_id)
+                        {
+                            snapshots.push(execution_snapshot_to_task(snapshot).await);
+                        }
+                    }
+                    cursor = next;
                 }
                 let _ = reply.send(snapshots);
             }
@@ -1315,7 +1617,12 @@ impl LocalTerminalActor {
             process_group,
             state_dump_handle,
         } = match self
-            .spawn_command(&request.command, &request.working_directory, &request.env)
+            .spawn_command(
+                &request.command,
+                &request.working_directory,
+                &request.env,
+                None,
+            )
             .await
         {
             Ok(r) => r,
@@ -1338,6 +1645,17 @@ impl LocalTerminalActor {
             ))));
             return;
         }
+        execution_job.update(serde_json::json!({
+            "command": request.command,
+            "display_command": request.display_command,
+            "cwd": request.working_directory,
+            "output_file": request.output_file,
+            "kind": request.kind,
+            "owner_session_id": request.owner_session_id,
+            "description": request.description,
+            "is_backgrounded": false,
+            "completed": false,
+        }));
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdout_closed = stdout.is_none();
@@ -1366,6 +1684,7 @@ impl LocalTerminalActor {
             stderr_closed,
             stdout_bytes: 0,
             stderr_bytes: 0,
+            spool_tailer_cancel: None,
             pending_exit_status: None,
             pending_exit_at: None,
             exit_status: None,
@@ -1461,11 +1780,19 @@ impl LocalTerminalActor {
     ) {
         // Generate task_id — the actor owns the identity.
         let task_id = uuid::Uuid::now_v7().to_string();
+        let spool_artifacts =
+            match ProcessSpoolArtifacts::prepare(&request.output_file, &task_id).await {
+                Ok(artifacts) => artifacts,
+                Err(error) => {
+                    let _ = reply.send(Err(ComputerError::from(error)));
+                    return;
+                }
+            };
         let execution_job = match ExecutionSupervisor::global().register_job(
             task_id.clone(),
             ExecutionJobKind::Terminal,
             request.owner_session_id.clone(),
-            Some(request.output_file.clone()),
+            Some(spool_artifacts.stdout.clone()),
             Some(&request.tool_call_id),
             execution_command_hash(&request),
         ) {
@@ -1475,6 +1802,11 @@ impl LocalTerminalActor {
                 return;
             }
         };
+        execution_job.configure_durable_artifacts(
+            Some(spool_artifacts.stdout.clone()),
+            Some(spool_artifacts.stderr.clone()),
+            Some(spool_artifacts.status.clone()),
+        );
         if let Err(error) = execution_job.persist_spawn_intent().await {
             execution_job.fail(error.clone());
             let _ = reply.send(Err(ComputerError::io(format!(
@@ -1497,7 +1829,12 @@ impl LocalTerminalActor {
             process_group,
             state_dump_handle,
         } = match self
-            .spawn_command(&request.command, &request.working_directory, &request.env)
+            .spawn_command(
+                &request.command,
+                &request.working_directory,
+                &request.env,
+                Some(&spool_artifacts),
+            )
             .await
         {
             Ok(r) => r,
@@ -1520,10 +1857,23 @@ impl LocalTerminalActor {
             ))));
             return;
         }
+        execution_job.update(serde_json::json!({
+            "command": request.command,
+            "display_command": request.display_command,
+            "cwd": request.working_directory,
+            "output_file": request.output_file,
+            "kind": request.kind,
+            "owner_session_id": request.owner_session_id,
+            "description": request.description,
+            "is_backgrounded": true,
+            "completed": false,
+        }));
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let stdout_closed = stdout.is_none();
-        let stderr_closed = stderr.is_none();
+        debug_assert!(stdout.is_none() && stderr.is_none());
+        let stdout_closed = false;
+        let stderr_closed = false;
+        let spool_tailer_cancel = CancellationToken::new();
 
         // Move the child process into the memory-limited cgroup (best-effort).
         if let Some(pid) = child.id()
@@ -1548,6 +1898,7 @@ impl LocalTerminalActor {
             stderr_closed,
             stdout_bytes: 0,
             stderr_bytes: 0,
+            spool_tailer_cancel: Some(spool_tailer_cancel.clone()),
             pending_exit_status: None,
             pending_exit_at: None,
             exit_status: None,
@@ -1598,7 +1949,12 @@ impl LocalTerminalActor {
         let pid = process_state.child.id();
         self.processes.insert(task_id.clone(), process_state);
         self.stream_routes.insert(task_id.clone(), task_id.clone());
-        spawn_process_readers(&task_id, stdout, stderr, &self.output_tx);
+        spawn_spool_readers(
+            &task_id,
+            &spool_artifacts,
+            &self.output_tx,
+            spool_tailer_cancel,
+        );
 
         // Reply immediately
         let _ = reply.send(Ok(BackgroundHandle {
@@ -1630,6 +1986,23 @@ impl LocalTerminalActor {
                 s.block_waited = true;
                 s
             });
+            if snapshot.is_none()
+                && let Some(job) = ExecutionSupervisor::global().jobs().get(&task_id)
+            {
+                tokio::spawn(async move {
+                    let deadline = Instant::now() + timeout.unwrap_or(Duration::from_secs(30));
+                    loop {
+                        let snapshot = job.snapshot();
+                        let completed = snapshot.lifecycle != ExecutionJobLifecycle::Running;
+                        if completed || Instant::now() >= deadline {
+                            let _ = reply.send(Some(execution_snapshot_to_task(snapshot).await));
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                });
+                return;
+            }
             let found = snapshot.is_some();
             let delivered = reply.send(snapshot).is_ok();
             if found
@@ -1914,6 +2287,8 @@ impl LocalTerminalActor {
         for process in self.processes.values() {
             if process.exit_status.is_some() {
                 process.finish_execution_job();
+            } else {
+                process.execution_job.refresh_liveness();
             }
         }
 
@@ -2174,11 +2549,13 @@ impl LocalTerminalActor {
                 }
                 Ok(Some(_)) => {
                     // Process finally exited — drain any remaining output
+                    stop_spool_tailers(process);
                     drain_remaining_output(process).await;
                     process.flush_and_truncate_output_file().await;
                     process.drained = true;
                 }
                 Err(_) => {
+                    stop_spool_tailers(process);
                     drain_remaining_output(process).await;
                     process.flush_and_truncate_output_file().await;
                     process.drained = true;
@@ -2258,11 +2635,13 @@ impl LocalTerminalActor {
         if process.pending_exit_status.is_none() {
             match process.child.try_wait() {
                 Ok(Some(status)) => {
+                    stop_spool_tailers(process);
                     process.pending_exit_status = Some(extract_exit_status(status));
                     process.pending_exit_at = Some(Instant::now());
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    stop_spool_tailers(process);
                     process.pending_exit_status = Some(ExitStatus {
                         exit_code: None,
                         signal: Some(format!("error: {error}")),
@@ -2288,6 +2667,7 @@ impl LocalTerminalActor {
     async fn shutdown_all(&mut self) {
         for (_, process) in self.processes.iter_mut() {
             send_sigkill_to_group(process);
+            stop_spool_tailers(process);
             process.execution_job.cancel();
             // Abort the state dump reader so its spawn_blocking thread
             // doesn't outlive the actor.
@@ -2362,6 +2742,7 @@ impl LocalTerminalActor {
                 let _ =
                     tokio::time::timeout(std::time::Duration::from_secs(5), process.child.wait())
                         .await;
+                stop_spool_tailers(process);
 
                 // Abort the state dump reader task so its `spawn_blocking`
                 // thread doesn't leak. Without this, a grandchild that
@@ -2413,6 +2794,7 @@ impl LocalTerminalActor {
                 let _ =
                     tokio::time::timeout(std::time::Duration::from_secs(5), process.child.wait())
                         .await;
+                stop_spool_tailers(process);
                 if let Some(handle) = process.state_dump_handle.take() {
                     handle.abort();
                 }
@@ -3094,6 +3476,12 @@ fn send_sigkill_to_group(process: &mut ProcessState) {
     let _ = process.child.start_kill();
 }
 
+fn stop_spool_tailers(process: &ProcessState) {
+    if let Some(cancel) = process.spool_tailer_cancel.as_ref() {
+        cancel.cancel();
+    }
+}
+
 /// Drain remaining stdout/stderr into the output buffer and file.
 /// Bounded by `DRAIN_TIMEOUT` so a backgrounded child holding the
 /// pipe open cannot block the actor loop indefinitely.
@@ -3247,6 +3635,7 @@ async fn finalize_process(process: &mut ProcessState, status: Option<std::proces
         return;
     }
 
+    stop_spool_tailers(process);
     process.exit_status = Some(match status {
         Some(s) => extract_exit_status(s),
         None => ExitStatus {
@@ -3493,6 +3882,24 @@ fn apply_child_env(
     crate::util::apply_grok_agent_marker(cmd);
 }
 
+/// Run the requested command in a child shell and let the outer shell publish
+/// its exit result atomically. The user command cannot replace the outer
+/// shell's variables or completion write because it runs in a subshell.
+#[cfg(unix)]
+fn command_with_status_guardian(command: &str) -> String {
+    format!(
+        "grok_status_path=$GROK_PROCESS_STATUS_PATH\n\
+         unset GROK_PROCESS_STATUS_PATH\n\
+         (\n{command}\n)\n\
+         grok_exit_code=$?\n\
+         grok_status_tmp=\"${{grok_status_path}}.tmp.$$\"\n\
+         ( umask 077; printf '{{\"exit_code\":%s,\"signal\":null}}\\n' \
+             \"$grok_exit_code\" > \"$grok_status_tmp\" ) && \
+             mv -f \"$grok_status_tmp\" \"$grok_status_path\"\n\
+         exit \"$grok_exit_code\""
+    )
+}
+
 /// Spawn the shell command and attach the child to a [`ProcessGroup`] for
 /// grandchild teardown (`killpg` on Unix, `TerminateJobObject` on Windows).
 fn spawn_shell_command(
@@ -3502,6 +3909,7 @@ fn spawn_shell_command(
     login_env: Option<&HashMap<String, String>>,
     search_shadows: SearchShadowConfig,
     shell_env_policy: Option<&crate::util::ShellEnvironmentPolicy>,
+    artifacts: Option<&ProcessSpoolArtifacts>,
 ) -> std::io::Result<(tokio::process::Child, crate::util::ProcessGroup)> {
     // `login_env` and `search_shadows` are only consumed by the `#[cfg(unix)]`
     // shell wrapper below; keep them live on Windows to avoid unused-arg warnings.
@@ -3527,13 +3935,18 @@ fn spawn_shell_command(
             .arg(&wrapped_command)
             .current_dir(cwd)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             // NOTE: do NOT set .process_group(0) here — std runs setpgid()
             // BEFORE pre_exec hooks, which would make the child a process
             // group leader and cause setsid() to fail with EPERM.
             // detach_from_tty() handles both session and process group creation.
             .kill_on_drop(true);
+        if let Some(artifacts) = artifacts {
+            cmd.stdout(artifacts.stdout_stdio()?)
+                .stderr(artifacts.stderr_stdio()?)
+                .env("GROK_PROCESS_STATUS_PATH", &artifacts.status);
+        } else {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
 
         apply_child_env(&mut cmd, shell_env_policy, login_env, env);
 
@@ -3569,6 +3982,7 @@ fn spawn_shell_command(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        let _ = artifacts;
 
         // Policy base first (cleared + rebuilt only when a policy is active), then
         // the shell-invocation env, the filtered request env, pager vars, and the
@@ -4333,6 +4747,7 @@ mod tests {
         let request = make_request("printf registry-ok");
         let output_file = request.output_file.clone();
         let handle = backend.run_background(request).await.unwrap();
+        let spool_artifacts = ProcessSpoolArtifacts::for_output(&output_file, &handle.task_id);
         let registry_job = ExecutionSupervisor::global()
             .jobs()
             .get(&handle.task_id)
@@ -4352,14 +4767,84 @@ mod tests {
         );
         assert_eq!(
             registry_snapshot.artifact.as_deref(),
-            Some(output_file.as_path())
+            Some(spool_artifacts.stdout.as_path())
         );
         assert_eq!(registry_snapshot.payload["exit_code"].as_i64(), Some(0));
         assert_eq!(
             tokio::fs::read_to_string(&output_file).await.unwrap(),
             "registry-ok"
         );
+        assert_eq!(
+            tokio::fs::read_to_string(&spool_artifacts.stdout)
+                .await
+                .unwrap(),
+            "registry-ok"
+        );
+        let guardian: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&spool_artifacts.status).await.unwrap())
+                .unwrap();
+        assert_eq!(guardian["exit_code"].as_i64(), Some(0));
         let _ = tokio::fs::remove_file(output_file).await;
+        let _ = tokio::fs::remove_file(spool_artifacts.stdout).await;
+        let _ = tokio::fs::remove_file(spool_artifacts.stderr).await;
+        let _ = tokio::fs::remove_file(spool_artifacts.status).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_queries_fall_back_to_recovered_registry_jobs() {
+        let backend = LocalTerminalBackend::new();
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("recovered.stdout");
+        tokio::fs::write(&artifact, b"recovered output")
+            .await
+            .unwrap();
+        let job_id = format!("recovered-terminal-{}", uuid::Uuid::now_v7());
+        ExecutionSupervisor::global()
+            .jobs()
+            .restore_lost(xai_grok_engagement::JobCheckpoint {
+                job_id: job_id.clone(),
+                engagement_id: xai_grok_engagement::EngagementId("engagement-test".to_string()),
+                action_key: None,
+                kind: xai_grok_engagement::JobKind::Terminal,
+                lifecycle: xai_grok_engagement::JobLifecycle::Lost,
+                command_hash: "command-hash".to_string(),
+                pid: Some(999_999),
+                process_start_identity: Some("gone".to_string()),
+                process_started_at_ms: None,
+                process_group_id: None,
+                stdout_artifact: Some(artifact.clone()),
+                stderr_artifact: None,
+                status_artifact: None,
+                stdout_cursor: 16,
+                stderr_cursor: 0,
+                last_activity_at_ms: 0,
+                exit_code: None,
+                payload: serde_json::json!({
+                    "command": "long-running fixture",
+                    "cwd": "/tmp",
+                    "kind": "bash",
+                    "owner_session_id": "recovered-session",
+                    "is_backgrounded": true,
+                }),
+            })
+            .unwrap();
+
+        let snapshot = backend
+            .get_task(&job_id)
+            .await
+            .expect("recovered registry job must remain queryable");
+        assert!(snapshot.completed);
+        assert_eq!(snapshot.command, "long-running fixture");
+        assert!(snapshot.output.contains("recovered output"));
+        assert_eq!(snapshot.output_file, artifact);
+        assert!(
+            backend
+                .list_tasks()
+                .await
+                .iter()
+                .any(|task| task.task_id == job_id),
+            "recovered jobs must remain visible in task listings"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

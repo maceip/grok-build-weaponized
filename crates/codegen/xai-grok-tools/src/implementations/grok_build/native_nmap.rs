@@ -3,7 +3,8 @@
 use crate::native::execution_supervisor::ExecutionSupervisor;
 use crate::native::job_registry::{ExecutionJobHandle, ExecutionJobKind, ExecutionJobLifecycle};
 use crate::native::nmap::{
-    NativeNmapDriver, NmapHost, NmapScanEvent, NmapScanReport, NmapScanRequest, ScanScope,
+    NativeNmapDriver, NmapHost, NmapScanArtifacts, NmapScanEvent, NmapScanReport, NmapScanRequest,
+    ScanScope, parse_nmap_xml,
 };
 use crate::types::output::{DynamicOutput, ToolOutput};
 use crate::types::requirements::Expr;
@@ -70,8 +71,16 @@ fn nmap_job_response(
     let limit = limit.clamp(1, 100);
     match snapshot.lifecycle {
         ExecutionJobLifecycle::Running => {
-            let hosts =
-                serde_json::from_value::<Vec<NmapHost>>(snapshot.payload).unwrap_or_default();
+            let hosts = report_from_snapshot_artifact(&snapshot)
+                .map(|report| report.hosts)
+                .or_else(|| {
+                    snapshot
+                        .payload
+                        .get("hosts")
+                        .cloned()
+                        .and_then(|hosts| serde_json::from_value(hosts).ok())
+                })
+                .unwrap_or_default();
             let total_hosts = hosts.len();
             let page = hosts
                 .into_iter()
@@ -89,8 +98,11 @@ fn nmap_job_response(
             })
         }
         ExecutionJobLifecycle::Completed => {
-            let mut report = serde_json::from_value::<NmapScanReport>(snapshot.payload)
-                .map_err(|error| error.to_string())?;
+            let mut report = report_from_snapshot_artifact(&snapshot)
+                .or_else(|| serde_json::from_value::<NmapScanReport>(snapshot.payload).ok())
+                .ok_or_else(|| {
+                    "completed Nmap job has neither a valid XML artifact nor a report".to_string()
+                })?;
             let total_hosts = report.hosts.len();
             report.hosts = report.hosts.into_iter().skip(cursor).take(limit).collect();
             let next_cursor = (cursor.saturating_add(report.hosts.len()) < total_hosts)
@@ -122,6 +134,36 @@ fn nmap_job_response(
             }),
         }),
     }
+}
+
+fn report_from_snapshot_artifact(
+    snapshot: &crate::native::job_registry::ExecutionJobSnapshot,
+) -> Option<NmapScanReport> {
+    let request: NmapScanRequest =
+        serde_json::from_value(snapshot.payload.get("scan")?.clone()).ok()?;
+    let path = snapshot
+        .stdout_artifact
+        .as_deref()
+        .or(snapshot.artifact.as_deref())?;
+    let xml = std::fs::read(path).ok()?;
+    parse_nmap_xml(&request.target, request.profile, &xml).ok()
+}
+
+fn nmap_job_artifacts(job_id: &str) -> std::io::Result<NmapScanArtifacts> {
+    let root = std::env::var_os("GROK_JOB_ARTIFACT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("grok-build")
+                .join("job-artifacts")
+        })
+        .join("nmap");
+    std::fs::create_dir_all(&root)?;
+    Ok(NmapScanArtifacts {
+        xml: root.join(format!("{job_id}.xml")),
+        stderr: root.join(format!("{job_id}.stderr")),
+        status: root.join(format!("{job_id}.status.json")),
+    })
 }
 
 #[derive(Debug, Default)]
@@ -352,31 +394,53 @@ impl xai_tool_runtime::Tool for NativeNmapJobTool {
                     ));
                 }
                 let job_id = uuid::Uuid::now_v7().simple().to_string();
-                let command_hash = blake3::hash(
-                    &serde_json::to_vec(&scan).unwrap_or_else(|_| scan.target.as_bytes().to_vec()),
-                )
-                .to_hex()
-                .to_string();
+                let artifacts = nmap_job_artifacts(&job_id).map_err(|error| {
+                    xai_tool_runtime::ToolError::custom(
+                        "native_nmap_job",
+                        format!("failed to prepare Nmap artifacts: {error}"),
+                    )
+                })?;
+                let command_hash = {
+                    let mut hasher = blake3::Hasher::new();
+                    let scan_bytes = serde_json::to_vec(&scan)
+                        .unwrap_or_else(|_| scan.target.as_bytes().to_vec());
+                    for part in [
+                        driver.binary().as_os_str().as_encoded_bytes(),
+                        scan_bytes.as_slice(),
+                    ] {
+                        hasher.update(&(part.len() as u64).to_le_bytes());
+                        hasher.update(part);
+                    }
+                    hasher.finalize().to_hex().to_string()
+                };
                 let job = ExecutionSupervisor::global()
                     .register_job(
                         job_id.clone(),
                         ExecutionJobKind::Nmap,
                         owner_session_id,
-                        None,
+                        Some(artifacts.xml.clone()),
                         Some(ctx.call_id.as_str()),
                         command_hash,
                     )
                     .map_err(|error| {
                         xai_tool_runtime::ToolError::custom("native_nmap_job", error)
                     })?;
+                job.configure_durable_artifacts(
+                    Some(artifacts.xml.clone()),
+                    Some(artifacts.stderr.clone()),
+                    Some(artifacts.status.clone()),
+                );
                 job.persist_spawn_intent().await.map_err(|error| {
                     xai_tool_runtime::ToolError::custom(
                         "native_nmap_job",
                         format!("failed to persist Nmap spawn intent: {error}"),
                     )
                 })?;
-                job.update(serde_json::json!([]));
-                tokio::spawn(run_background_nmap_job(driver, scope, scan, job));
+                job.update(serde_json::json!({
+                    "scan": scan.clone(),
+                    "hosts": [],
+                }));
+                tokio::spawn(run_background_nmap_job(driver, scope, scan, artifacts, job));
                 Ok(NativeNmapJobResponse::Started { job_id })
             }
             NativeNmapJobRequest::Status { job_id } => {
@@ -428,14 +492,21 @@ async fn run_background_nmap_job(
     driver: NativeNmapDriver,
     scope: ScanScope,
     request: NmapScanRequest,
+    artifacts: NmapScanArtifacts,
     job: ExecutionJobHandle,
 ) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
-    let scan = driver.scan_with_events(&scope, request, Some(event_tx));
+    #[cfg(unix)]
+    let scan =
+        driver.scan_with_events_to_artifacts(&scope, request.clone(), artifacts, Some(event_tx));
+    #[cfg(not(unix))]
+    let scan = driver.scan_with_events(&scope, request.clone(), Some(event_tx));
     tokio::pin!(scan);
 
     let mut hosts = Vec::new();
     let cancellation = job.cancellation();
+    let mut liveness = tokio::time::interval(std::time::Duration::from_secs(5));
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             biased;
@@ -453,14 +524,29 @@ async fn run_background_nmap_job(
                 break;
             }
             event = event_rx.recv() => {
-                if let Some(NmapScanEvent::HostDiscovered { host, .. }) = event
-                {
-                    hosts.push(host);
-                    job.update(
-                        serde_json::to_value(&hosts).unwrap_or(serde_json::Value::Null)
-                    );
+                match event {
+                    Some(NmapScanEvent::Started { pid, .. }) => {
+                        if let Err(error) = job
+                            .attach_process(Some(pid), Some(i64::from(pid)))
+                            .await
+                        {
+                            job.fail(format!(
+                                "failed to persist Nmap process identity: {error}"
+                            ));
+                            break;
+                        }
+                    }
+                    Some(NmapScanEvent::HostDiscovered { host, .. }) => {
+                        hosts.push(host);
+                        job.update(serde_json::json!({
+                            "scan": request.clone(),
+                            "hosts": &hosts,
+                        }));
+                    }
+                    Some(NmapScanEvent::Finished { .. }) | None => {}
                 }
             }
+            _ = liveness.tick() => job.refresh_liveness(),
         }
     }
 }
@@ -500,9 +586,13 @@ mod tests {
         std::fs::write(
             &scanner,
             "#!/bin/sh\n\
-             printf '%s\\n' '<?xml version=\"1.0\"?><nmaprun scanner=\"nmap\" version=\"fixture\"><host><status state=\"up\"/><address addr=\"127.0.0.1\" addrtype=\"ipv4\"/></host>'\n\
+             output='-'\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+               if [ \"$1\" = '-oX' ]; then output=$2; shift 2; else shift; fi\n\
+             done\n\
+             printf '%s\\n' '<?xml version=\"1.0\"?><nmaprun scanner=\"nmap\" version=\"fixture\"><host><status state=\"up\"/><address addr=\"127.0.0.1\" addrtype=\"ipv4\"/></host>' > \"$output\"\n\
              sleep 1\n\
-             printf '%s\\n' '<runstats><finished elapsed=\"1\"/><hosts up=\"1\" down=\"0\" total=\"1\"/></runstats></nmaprun>'\n",
+             printf '%s\\n' '<runstats><finished elapsed=\"1\"/><hosts up=\"1\" down=\"0\" total=\"1\"/></runstats></nmaprun>' >> \"$output\"\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&scanner).unwrap().permissions();
@@ -514,7 +604,20 @@ mod tests {
             .jobs()
             .register(job_id, ExecutionJobKind::Nmap, None, None)
             .unwrap();
-        job.update(serde_json::json!([]));
+        let artifacts = NmapScanArtifacts {
+            xml: directory.path().join("scan.xml"),
+            stderr: directory.path().join("scan.stderr"),
+            status: directory.path().join("scan.status.json"),
+        };
+        job.update(serde_json::json!({
+            "scan": {
+                "target": "127.0.0.1",
+                "profile": "tcp_connect",
+                "ports": [1],
+                "timeout_secs": 5
+            },
+            "hosts": [],
+        }));
         let task = tokio::spawn(run_background_nmap_job(
             NativeNmapDriver::with_binary(scanner).unwrap(),
             ScanScope::new(["127.0.0.1".to_owned()]).unwrap(),
@@ -524,14 +627,19 @@ mod tests {
                 ports: vec![1],
                 timeout_secs: Some(5),
             },
+            artifacts.clone(),
             job.clone(),
         ));
 
         tokio::time::timeout(std::time::Duration::from_millis(750), async {
             loop {
                 let snapshot = job.snapshot();
-                let hosts =
-                    serde_json::from_value::<Vec<NmapHost>>(snapshot.payload).unwrap_or_default();
+                let hosts = snapshot
+                    .payload
+                    .get("hosts")
+                    .cloned()
+                    .and_then(|hosts| serde_json::from_value::<Vec<NmapHost>>(hosts).ok())
+                    .unwrap_or_default();
                 let has_host =
                     snapshot.lifecycle == ExecutionJobLifecycle::Running && hosts.len() == 1;
                 if has_host {
@@ -548,5 +656,11 @@ mod tests {
         assert_eq!(snapshot.lifecycle, ExecutionJobLifecycle::Completed);
         let report = serde_json::from_value::<NmapScanReport>(snapshot.payload).unwrap();
         assert_eq!(report.hosts_total, 1);
+        assert!(artifacts.xml.exists());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(artifacts.status).unwrap())
+                .unwrap()["exit_code"],
+            0
+        );
     }
 }

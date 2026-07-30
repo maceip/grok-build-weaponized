@@ -31,6 +31,7 @@ pub enum QueuePriority {
     AdapterPrewarm = 10,
     Reviewer = 20,
     Interactive = 30,
+    DurableStage = 35,
     #[default]
     ExecutorContinuation = 40,
 }
@@ -42,6 +43,8 @@ impl QueuePriority {
             10 => Self::AdapterPrewarm,
             20 => Self::Reviewer,
             30 => Self::Interactive,
+            35 => Self::DurableStage,
+            40 => Self::ExecutorContinuation,
             _ => Self::ExecutorContinuation,
         }
     }
@@ -220,6 +223,8 @@ pub struct EngagementCheckpoint {
     pub completion_tests: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_refs: Vec<ArtifactReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,9 +234,37 @@ pub struct EngagementCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_request_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_jobs: Vec<BackgroundJobCursor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactReference {
+    pub artifact_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundJobCursor {
+    pub job_id: String,
+    pub stdout_cursor: u64,
+    pub stderr_cursor: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeAdmissionRecord {
+    pub request_id: String,
+    pub model_id: String,
+    pub adapter_id: Option<String>,
+    pub context_plan_hash: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -272,6 +305,10 @@ pub struct EngagementEvent {
     pub kind: String,
     pub lease_epoch: u64,
     pub stage: Option<EngagementStage>,
+    pub task_id: Option<String>,
+    pub action_id: Option<String>,
+    pub evidence_id: Option<String>,
+    pub artifact_ref: Option<String>,
     pub payload: serde_json::Value,
     pub content_hash: String,
     pub created_at_ms: i64,
@@ -358,11 +395,45 @@ impl ActionStatus {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionReplayPolicy {
+    ReadOnly,
+    Idempotent,
+    #[default]
+    NonIdempotent,
+}
+
+impl ActionReplayPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Idempotent => "idempotent",
+            Self::NonIdempotent => "non_idempotent",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "read_only" => Self::ReadOnly,
+            "idempotent" => Self::Idempotent,
+            "non_idempotent" => Self::NonIdempotent,
+            _ => return None,
+        })
+    }
+
+    pub fn is_replayable(&self) -> bool {
+        matches!(self, Self::ReadOnly | Self::Idempotent)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActionSpec {
     pub identity: ActionIdentity,
     pub action_kind: String,
     pub command_hash: String,
+    #[serde(default)]
+    pub replay_policy: ActionReplayPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
 }
@@ -374,6 +445,7 @@ pub struct ActionRecord {
     pub identity: ActionIdentity,
     pub action_kind: String,
     pub command_hash: String,
+    pub replay_policy: ActionReplayPolicy,
     pub status: ActionStatus,
     pub attempt_count: u32,
     pub job_id: Option<String>,
@@ -473,10 +545,20 @@ pub struct JobCheckpoint {
     pub lifecycle: JobLifecycle,
     pub command_hash: String,
     pub pid: Option<u32>,
+    /// OS-backed process birth identity. Unlike a wall-clock timestamp taken
+    /// by the parent, this value must be read from the operating system after
+    /// spawn and compared again before any recovered process is observed or
+    /// signalled.
+    pub process_start_identity: Option<String>,
     pub process_started_at_ms: Option<i64>,
     pub process_group_id: Option<i64>,
     pub stdout_artifact: Option<PathBuf>,
     pub stderr_artifact: Option<PathBuf>,
+    /// Atomically-written terminal status produced by the process guardian.
+    /// This lets a restarted supervisor distinguish a clean exit from an
+    /// unresolved disappearance even though it is no longer the OS parent.
+    #[serde(default)]
+    pub status_artifact: Option<PathBuf>,
     pub stdout_cursor: u64,
     pub stderr_cursor: u64,
     pub last_activity_at_ms: i64,

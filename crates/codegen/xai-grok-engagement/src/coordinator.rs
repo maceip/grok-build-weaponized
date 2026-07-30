@@ -11,7 +11,7 @@ use crate::store::{
 use crate::types::{
     ActionRecord, ActionResolution, ActionSpec, ActionStatus, EngagementCheckpoint,
     EngagementEvent, EngagementId, EngagementRecord, EngagementSnapshot, EngagementStage,
-    EngagementStatus, JobCheckpoint, NewEngagement,
+    EngagementStatus, JobCheckpoint, NewEngagement, RuntimeAdmissionRecord,
 };
 
 const DEFAULT_EVENT_CAPACITY: usize = 1_024;
@@ -238,6 +238,7 @@ impl EngagementCoordinator {
             cursor: after_seq,
             receiver: self.inner.events_tx.subscribe(),
             pending: VecDeque::new(),
+            gap: None,
             initial_catch_up: true,
         }
     }
@@ -349,6 +350,22 @@ impl EngagementLease {
                     checkpoint,
                     detail,
                 )
+            })
+            .await?;
+        self.coordinator.publish(&mutation);
+        Ok(mutation.value)
+    }
+
+    pub async fn record_runtime_admission(
+        &self,
+        admission: RuntimeAdmissionRecord,
+    ) -> Result<EngagementRecord, EngagementError> {
+        let engagement_id = self.engagement_id.clone();
+        let lease_epoch = self.lease_epoch;
+        let mutation = self
+            .coordinator
+            .call(move |store| {
+                store.record_runtime_admission(&engagement_id, lease_epoch, admission)
             })
             .await?;
         self.coordinator.publish(&mutation);
@@ -493,7 +510,22 @@ pub struct EngagementSubscription {
     cursor: Option<u64>,
     receiver: broadcast::Receiver<EngagementEvent>,
     pending: VecDeque<EngagementEvent>,
+    gap: Option<CursorGap>,
     initial_catch_up: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorGap {
+    pub expected_seq: u64,
+    pub observed_seq: Option<u64>,
+    pub dropped_hint: u64,
+    pub durable_through: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SubscriptionItem {
+    CursorGap(CursorGap),
+    Event(Box<EngagementEvent>),
 }
 
 impl EngagementSubscription {
@@ -503,13 +535,24 @@ impl EngagementSubscription {
 
     pub async fn next(&mut self) -> Result<EngagementEvent, SubscriptionError> {
         loop {
+            if let SubscriptionItem::Event(event) = self.next_item().await? {
+                return Ok(*event);
+            }
+        }
+    }
+
+    pub async fn next_item(&mut self) -> Result<SubscriptionItem, SubscriptionError> {
+        loop {
             if self.initial_catch_up {
                 self.initial_catch_up = false;
                 self.catch_up().await?;
             }
+            if let Some(gap) = self.gap.take() {
+                return Ok(SubscriptionItem::CursorGap(gap));
+            }
             if let Some(event) = self.pending.pop_front() {
                 self.cursor = Some(event.seq);
-                return Ok(event);
+                return Ok(SubscriptionItem::Event(Box::new(event)));
             }
             match self.receiver.recv().await {
                 Ok(event) if event.engagement_id != self.engagement_id => continue,
@@ -517,11 +560,29 @@ impl EngagementSubscription {
                     let expected = self.cursor.map_or(0, |cursor| cursor.saturating_add(1));
                     if event.seq == expected {
                         self.cursor = Some(event.seq);
-                        return Ok(event);
+                        return Ok(SubscriptionItem::Event(Box::new(event)));
+                    }
+                    if event.seq < expected {
+                        continue;
                     }
                     self.catch_up().await?;
+                    self.gap = Some(CursorGap {
+                        expected_seq: expected,
+                        observed_seq: Some(event.seq),
+                        dropped_hint: event.seq.saturating_sub(expected),
+                        durable_through: self.pending.back().map(|event| event.seq),
+                    });
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => self.catch_up().await?,
+                Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                    let expected = self.cursor.map_or(0, |cursor| cursor.saturating_add(1));
+                    self.catch_up().await?;
+                    self.gap = Some(CursorGap {
+                        expected_seq: expected,
+                        observed_seq: None,
+                        dropped_hint: dropped,
+                        durable_through: self.pending.back().map(|event| event.seq),
+                    });
+                }
                 Err(broadcast::error::RecvError::Closed) => {
                     self.catch_up().await?;
                     if self.pending.is_empty() {
