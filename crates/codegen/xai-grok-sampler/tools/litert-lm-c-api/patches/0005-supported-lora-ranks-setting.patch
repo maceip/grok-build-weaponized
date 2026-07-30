@@ -1,0 +1,83 @@
+diff --git a/c/engine.cc b/c/engine.cc
+index d03ae27..bb52ebb 100644
+--- a/c/engine.cc
++++ b/c/engine.cc
+@@ -415,6 +415,55 @@ void litert_lm_engine_settings_set_max_num_tokens(
+         max_num_tokens);
+   }
+ }
++int grok_litert_engine_settings_set_supported_lora_ranks(
++    LiteRtLmEngineSettings* settings, const uint32_t* ranks, size_t num_ranks,
++    const char** error_message) {
++  g_grok_last_error.clear();
++  if (error_message != nullptr) {
++    *error_message = nullptr;
++  }
++  if (settings == nullptr || settings->settings == nullptr ||
++      (num_ranks > 0 && ranks == nullptr)) {
++    g_grok_last_error = "invalid supported LoRA rank arguments";
++  } else {
++    std::vector<uint32_t> supported_ranks;
++    supported_ranks.reserve(num_ranks);
++    for (size_t index = 0; index < num_ranks; ++index) {
++      if (ranks[index] == 0) {
++        g_grok_last_error = "supported LoRA ranks must be non-zero";
++        break;
++      }
++      supported_ranks.push_back(ranks[index]);
++    }
++    if (g_grok_last_error.empty()) {
++      auto& executor_settings =
++          settings->settings->GetMutableMainExecutorSettings();
++      auto artisan_config =
++          executor_settings.GetBackendConfig<litert::lm::GpuArtisanConfig>();
++      if (artisan_config.ok()) {
++        auto status = executor_settings.SetSupportedLoraRanks(supported_ranks);
++        if (status.ok()) {
++          return 0;
++        }
++        SetGrokLastError(status);
++      } else if (executor_settings
++                     .GetBackendConfig<litert::lm::GpuConfig>()
++                     .ok()) {
++        // The compiled-model GPU executor discovers LoRA inputs directly from
++        // the model. Rust enforces this declared set before load; native
++        // materialization and probe generation validate the actual tensors.
++        return 0;
++      } else {
++        g_grok_last_error =
++            "supported LoRA ranks require a LiteRT GPU backend";
++      }
++    }
++  }
++  if (error_message != nullptr) {
++    *error_message = g_grok_last_error.c_str();
++  }
++  return 1;
++}
+ void litert_lm_engine_settings_set_parallel_file_section_loading(
+     LiteRtLmEngineSettings* settings, bool parallel_file_section_loading) {
+   if (settings && settings->settings) {
+diff --git a/c/engine.h b/c/engine.h
+index ba805b1..05569de 100644
+--- a/c/engine.h
++++ b/c/engine.h
+@@ -252,6 +252,18 @@ LITERT_LM_C_API_EXPORT
+ void litert_lm_engine_settings_set_max_num_tokens(
+     LiteRtLmEngineSettings* settings, int max_num_tokens);
+
++// Declares the LoRA ranks that the GPU engine must materialize.
++//
++// @param settings The engine settings.
++// @param ranks A contiguous array of non-zero ranks.
++// @param num_ranks The number of entries in `ranks`.
++// @param error_message Optional thread-local error detail.
++// @return Zero on success, non-zero on invalid input or backend rejection.
++LITERT_LM_C_API_EXPORT
++int grok_litert_engine_settings_set_supported_lora_ranks(
++    LiteRtLmEngineSettings* settings, const uint32_t* ranks, size_t num_ranks,
++    const char** error_message);
++
+ // Sets whether the engine should load different sections of the litertlm file
+ // in parallel. Defaults to true.
+ //

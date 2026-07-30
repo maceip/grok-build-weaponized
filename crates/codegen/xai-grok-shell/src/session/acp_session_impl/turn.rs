@@ -312,6 +312,15 @@ impl SessionActor {
                 .handle_direct_bash_command(prompt_id, bash_command, &prompt_blocks)
                 .await;
         }
+        let cooperation =
+            crate::agent::turn_coordinator::TurnCooperation::from_blocks(&prompt_blocks);
+        let _cooperation_guard = cooperation.clone().map(|turn| {
+            crate::agent::turn_coordinator::register(
+                self.session_info.id.0.as_ref(),
+                prompt_id,
+                turn,
+            )
+        });
         let slash_skills = self
             .agent
             .borrow()
@@ -824,6 +833,59 @@ impl SessionActor {
                 }
             } else {
                 self.chat_state_handle.push_user_message(user_chat);
+            }
+        }
+        if let Some(turn) = cooperation.as_ref().filter(|turn| turn.mode.plans()) {
+            match self
+                .prepare_cooperation_plan(prompt_id, &prompt_text_for_hook, turn)
+                .await
+            {
+                Ok(plan) => {
+                    let first_task = plan.tasks[0].clone();
+                    let task_count = plan.tasks.len();
+                    let task_evidence = self
+                        .cooperation_memory_evidence(
+                            &format!(
+                                "evidence for execution task {} required {}",
+                                first_task.objective,
+                                first_task.required_evidence.join("; ")
+                            ),
+                            4,
+                        )
+                        .await;
+                    let task_packet = serde_json::json!({
+                        "objective": plan.objective.clone(),
+                        "task_index": 0,
+                        "task_count": task_count,
+                        "task": first_task,
+                        "task_evidence": task_evidence,
+                        "working_evidence":
+                            crate::agent::turn_coordinator::recent_evidence(turn, 8),
+                        "required_evidence": plan.required_evidence.clone(),
+                        "completion_tests": plan.completion_tests.clone(),
+                    });
+                    crate::agent::turn_coordinator::set_plan(
+                        self.session_info.id.0.as_ref(),
+                        prompt_id,
+                        plan,
+                    );
+                    self.push_system_reminder(&format!(
+                        "<cooperation_task>{task_packet}</cooperation_task>\n\
+                         Execute only this task against real tools. Return a concise typed \
+                         evidence report when this task's completion tests have been evaluated."
+                    ));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        prompt_id,
+                        %error,
+                        "cooperation planner failed; degrading this turn to direct execution"
+                    );
+                    crate::agent::turn_coordinator::degrade_to_direct(
+                        self.session_info.id.0.as_ref(),
+                        prompt_id,
+                    );
+                }
             }
         }
         self.dispatch_hook(
@@ -1956,6 +2018,7 @@ impl SessionActor {
             });
         }
         self.record_turn_model().await;
+        self.tool_context.tool_output_turn_budget.reset_turn();
         let mut metrics_drop_guard = TurnMetrics::new();
         let mut turn_tools_called: Vec<String> = Vec::new();
         let mut tool_turn_count: usize = 1;
@@ -1966,6 +2029,7 @@ impl SessionActor {
         let mut turn_span_totals = TurnSpanTotals::default();
         let mut model_fingerprint: Option<String> = None;
         let mut structured_output_retries: u32 = 0;
+        let mut cooperation_corrections: u8 = 0;
         let structured_output_validator = json_schema.as_ref().map(|schema| {
             jsonschema::validator_for(schema).map_err(|e| format!("invalid output schema: {e}"))
         });
@@ -2038,7 +2102,13 @@ impl SessionActor {
             self.drain_pending_interjections().await;
             self.flush_pending_skill_reminders().await;
             self.inject_pending_monitor_events().await;
-            let memory_reminder = self.first_turn_memory_reminder().await;
+            let cooperation =
+                crate::agent::turn_coordinator::get(self.session_info.id.0.as_ref(), req_id);
+            let memory_reminder = if cooperation.as_ref().is_some_and(|turn| turn.mode.plans()) {
+                None
+            } else {
+                self.first_turn_memory_reminder().await
+            };
             if memory_reminder.is_some() {
                 self.memory
                     .injection_count
@@ -2078,11 +2148,23 @@ impl SessionActor {
                 backend_search_active,
                 "backend_search: turn tool resolution"
             );
+            let active_tool_definitions = cooperation
+                .as_ref()
+                .and_then(|turn| turn.current_task())
+                .map_or_else(
+                    || tool_definitions.clone(),
+                    |task| {
+                        crate::agent::turn_coordinator::select_tools_for_task(
+                            tool_definitions.clone(),
+                            task,
+                        )
+                    },
+                );
             let mut effective_tools: Vec<ToolSpec> =
                 if let Some(ref override_tools) = self.forked_tool_override {
                     override_tools.clone()
                 } else {
-                    self.turn_base_tool_specs(&tool_definitions)
+                    self.turn_base_tool_specs(&active_tool_definitions)
                 };
             if structured_output_tool && let Some(schema) = json_schema.clone() {
                 effective_tools.push(ToolSpec {
@@ -2124,6 +2206,12 @@ impl SessionActor {
                 })),
             );
             let mut request = request;
+            let suppress_executor_stream = cooperation
+                .as_ref()
+                .is_some_and(|turn| turn.mode.reviews() || turn.has_more_tasks());
+            if cooperation.as_ref().is_some_and(|turn| turn.mode.plans()) {
+                request.x_grok_req_id = Some(format!("grok-stage-executor:{req_id}:{loop_index}"));
+            }
             request.x_grok_session_id = Some(self.session_info.id.to_string());
             request.x_grok_turn_idx =
                 Some(self.chat_state_handle.get_prompt_index().await.to_string());
@@ -2141,6 +2229,37 @@ impl SessionActor {
                 .tool_context
                 .clamp_task_model_request(request.max_output_tokens)
                 .map_err(|message| acp::Error::internal_error().data(message))?;
+            if let Some(turn) = cooperation
+                .as_ref()
+                .filter(|turn| turn.mode.reviews() && !turn.has_more_tasks())
+                && crate::agent::turn_coordinator::begin_reviewer_memory_prefetch(
+                    self.session_info.id.0.as_ref(),
+                    req_id,
+                )
+            {
+                let query = turn
+                    .plan
+                    .as_ref()
+                    .map(|plan| {
+                        format!(
+                            "completion criteria contradictory evidence for objective {} tests {}",
+                            plan.objective,
+                            plan.completion_tests.join("; ")
+                        )
+                    })
+                    .unwrap_or_else(|| "completion criteria contradictory evidence".to_string());
+                let actor = Arc::clone(self);
+                let session_id = self.session_info.id.0.to_string();
+                let prompt_id = req_id.to_string();
+                tokio::task::spawn_local(async move {
+                    let evidence = actor.cooperation_memory_evidence(&query, 6).await;
+                    crate::agent::turn_coordinator::set_reviewer_memory(
+                        &session_id,
+                        &prompt_id,
+                        evidence,
+                    );
+                });
+            }
             self.emit_event(crate::session::events::Event::PhaseChanged {
                 phase: crate::session::events::Phase::WaitingForModel,
             });
@@ -2160,7 +2279,10 @@ impl SessionActor {
                 })),
             );
             let model_timer = std::time::Instant::now();
-            let (response, latency) = match self.run_turn_via_sampler(request.clone()).await {
+            let (response, latency) = match self
+                .run_turn_via_sampler(request.clone(), suppress_executor_stream)
+                .await
+            {
                 Ok(SamplerTurnOutcome::Response(r, latency)) => (r, latency),
                 Err(error) => {
                     self.tool_context.fail_task_output_usage_closed();
@@ -2333,7 +2455,9 @@ impl SessionActor {
                     }
                 }
             }
-            if let Some(text) = fallback_text {
+            if let Some(text) = fallback_text
+                && !suppress_executor_stream
+            {
                 tracing::warn!(
                     text_len = text.len(),
                     "emitting fallback AgentMessageChunk — no text chunks were streamed"
@@ -2367,6 +2491,141 @@ impl SessionActor {
                 .await;
             }
             if tool_calls.is_empty() {
+                if let Some(cooperation) = cooperation.as_ref().filter(|turn| turn.mode.plans()) {
+                    self.append_cooperation_turn_evidence(cooperation).await;
+                }
+                if !turn_refused
+                    && cooperation.as_ref().is_some_and(|turn| turn.mode.plans())
+                    && let Some((task, task_index, task_count)) =
+                        crate::agent::turn_coordinator::advance_task(
+                            self.session_info.id.0.as_ref(),
+                            req_id,
+                        )
+                {
+                    let task_evidence = self
+                        .cooperation_memory_evidence(
+                            &format!(
+                                "evidence for execution task {} required {}",
+                                task.objective,
+                                task.required_evidence.join("; ")
+                            ),
+                            4,
+                        )
+                        .await;
+                    let task_packet = serde_json::json!({
+                        "task_index": task_index,
+                        "task_count": task_count,
+                        "task": task,
+                        "task_evidence": task_evidence,
+                        "working_evidence": cooperation
+                            .as_ref()
+                            .map(|turn| {
+                                crate::agent::turn_coordinator::recent_evidence(turn, 8)
+                            })
+                            .unwrap_or_default(),
+                    });
+                    self.push_system_reminder(&format!(
+                        "<cooperation_task>{task_packet}</cooperation_task>\n\
+                         Execute only this next task. Use prior tool results as immutable evidence; \
+                         do not repeat completed tool actions. Return a concise typed evidence \
+                         report when this task's completion tests have been evaluated."
+                    ));
+                    continue;
+                }
+                if suppress_executor_stream
+                    && !turn_refused
+                    && let Some(cooperation) = cooperation.as_ref()
+                {
+                    let executor_response = response_text_for_cooperation(
+                        &self.chat_state_handle.get_conversation().await,
+                    );
+                    match self
+                        .run_cooperation_review(req_id, cooperation, &executor_response)
+                        .await
+                    {
+                        Ok(crate::agent::turn_coordinator::ReviewDecision::Accept {
+                            final_response,
+                            unresolved,
+                        }) if !final_response.trim().is_empty() => {
+                            let final_response = if unresolved.is_empty() {
+                                final_response
+                            } else {
+                                format!(
+                                    "{final_response}\n\nUnresolved items:\n- {}",
+                                    unresolved.join("\n- ")
+                                )
+                            };
+                            self.publish_cooperation_final(
+                                &cooperation.reviewer_model,
+                                final_response,
+                            )
+                            .await;
+                        }
+                        Ok(crate::agent::turn_coordinator::ReviewDecision::Correct { tasks })
+                            if cooperation_corrections == 0 && !tasks.is_empty() =>
+                        {
+                            cooperation_corrections = 1;
+                            if let Some((task, task_count)) =
+                                crate::agent::turn_coordinator::begin_correction(
+                                    self.session_info.id.0.as_ref(),
+                                    req_id,
+                                    tasks,
+                                )
+                            {
+                                let task_evidence = self
+                                    .cooperation_memory_evidence(
+                                        &format!(
+                                            "evidence for correction task {} required {}",
+                                            task.objective,
+                                            task.required_evidence.join("; ")
+                                        ),
+                                        4,
+                                    )
+                                    .await;
+                                let correction = serde_json::json!({
+                                    "task_index": 0,
+                                    "task_count": task_count,
+                                    "task": task,
+                                    "task_evidence": task_evidence,
+                                    "working_evidence":
+                                        crate::agent::turn_coordinator::recent_evidence(
+                                            cooperation,
+                                            8,
+                                        ),
+                                });
+                                self.push_system_reminder(&format!(
+                                    "<cooperation_correction>{correction}</cooperation_correction>\n\
+                                     Perform only this correction task using existing evidence. \
+                                     Never repeat a completed tool action."
+                                ));
+                                continue;
+                            }
+                        }
+                        Ok(crate::agent::turn_coordinator::ReviewDecision::Correct { tasks }) => {
+                            let unresolved = tasks
+                                .iter()
+                                .map(|task| task.objective.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n- ");
+                            self.publish_cooperation_final(
+                                &cooperation.reviewer_model,
+                                format!(
+                                    "{executor_response}\n\nUnresolved after one correction cycle:\n- \
+                                     {unresolved}"
+                                ),
+                            )
+                            .await;
+                        }
+                        Ok(crate::agent::turn_coordinator::ReviewDecision::Accept { .. })
+                        | Err(_) => {
+                            self.publish_cooperation_final(
+                                &cooperation.executor_model,
+                                executor_response,
+                            )
+                            .await;
+                        }
+                    }
+                }
                 if !schema_ok
                     && !turn_refused
                     && let Some(gate_cfg) = self.todo_gate_policy()
@@ -2643,6 +2902,20 @@ fn hash_step_signature(signature: &str) -> u64 {
 fn command_is_true(cmd: &str) -> bool {
     cmd.trim().eq_ignore_ascii_case("true")
 }
+
+fn response_text_for_cooperation(conversation: &[ConversationItem]) -> String {
+    conversation
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            ConversationItem::Assistant(assistant) if !assistant.content.is_empty() => {
+                Some(assistant.content.to_string())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Default)]
 struct IdenticalToolCallRun {
     last_signature_hash: Option<u64>,

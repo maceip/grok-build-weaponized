@@ -1,0 +1,153 @@
+diff --git a/c/engine.h b/c/engine.h
+--- a/c/engine.h
++++ b/c/engine.h
+@@ -138,5 +138,14 @@ void litert_lm_session_config_set_sampler_params(
+     LiteRtLmSessionConfig* config, const LiteRtLmSamplerParams* sampler_params);
+
++// Binds an immutable LoRA revision to this session config.
++// Returns zero on success and a non-zero status on validation/open failure.
++// `error_message`, when non-null, points to thread-local storage owned by the
++// bridge and remains valid until the next bridge call on the same thread.
++LITERT_LM_C_API_EXPORT
++int grok_litert_session_config_set_lora_file(
++    LiteRtLmSessionConfig* config, const char* path, const char* identity,
++    const char** error_message);
++
+ // Destroys a LiteRT LM Session Config.
+ // @param config The config to destroy.
+ LITERT_LM_C_API_EXPORT
+@@ -601,6 +610,16 @@ LiteRtLmConversation* litert_lm_conversation_create(
+ LITERT_LM_C_API_EXPORT
+ void litert_lm_conversation_delete(LiteRtLmConversation* conversation);
+
++// Renders `message_json` through the exact conversation template and counts
++// the resulting native tokenizer IDs without mutating a live conversation.
++// Returns zero on success. The caller owns neither returned error storage nor
++// any runtime object created internally.
++LITERT_LM_C_API_EXPORT
++int grok_litert_conversation_measure_prompt(
++    LiteRtLmEngine* engine, LiteRtLmConversationConfig* config,
++    const char* message_json, size_t* token_count,
++    const char** error_message);
++
+ // Sends a message to the conversation and returns the response.
+ // This is a blocking call.
+ //
+diff --git a/c/engine.cc b/c/engine.cc
+--- a/c/engine.cc
++++ b/c/engine.cc
+@@ -35,6 +35,7 @@
+ #include "runtime/proto/llm_metadata.pb.h"
+ #include "runtime/proto/sampler_params.pb.h"
+ #include "runtime/proto/token.pb.h"
++#include "runtime/util/scoped_file.h"
+ #include "runtime/util/logging.h"
+
+ namespace {
+@@ -257,6 +258,37 @@ void litert_lm_session_config_set_sampler_params(
+   }
+ }
+
++int grok_litert_session_config_set_lora_file(
++    LiteRtLmSessionConfig* config, const char* path, const char* identity,
++    const char** error_message) {
++  if (error_message != nullptr) {
++    *error_message = nullptr;
++  }
++  if (config == nullptr || config->config == nullptr || path == nullptr ||
++      path[0] == '\0' || identity == nullptr || identity[0] == '\0') {
++    g_grok_last_error =
++        "invalid session config or empty LoRA path/identity";
++    if (error_message != nullptr) {
++      *error_message = g_grok_last_error.c_str();
++    }
++    return 1;
++  }
++
++  auto scoped_file = litert::lm::ScopedFile::Open(path);
++  if (!scoped_file.ok()) {
++    SetGrokLastError(scoped_file.status());
++    if (error_message != nullptr) {
++      *error_message = g_grok_last_error.c_str();
++    }
++    return 2;
++  }
++  config->config->SetScopedLoraFile(
++      std::make_shared<litert::lm::ScopedFile>(
++          std::move(scoped_file).value()));
++  config->config->SetLoraIdentity(identity);
++  return 0;
++}
++
+ void litert_lm_session_config_delete(LiteRtLmSessionConfig* config) {
+   delete config;
+ }
+@@ -835,6 +867,68 @@ void litert_lm_conversation_delete(LiteRtLmConversation* conversation) {
+   delete conversation;
+ }
+
++int grok_litert_conversation_measure_prompt(
++    LiteRtLmEngine* engine, LiteRtLmConversationConfig* config,
++    const char* message_json, size_t* token_count,
++    const char** error_message) {
++  g_grok_last_error.clear();
++  if (error_message != nullptr) {
++    *error_message = nullptr;
++  }
++  if (engine == nullptr || engine->engine == nullptr || config == nullptr ||
++      message_json == nullptr || token_count == nullptr) {
++    g_grok_last_error = "invalid prompt measurement arguments";
++    if (error_message != nullptr) {
++      *error_message = g_grok_last_error.c_str();
++    }
++    return 1;
++  }
++
++  std::unique_ptr<LiteRtLmConversation,
++                  decltype(&litert_lm_conversation_delete)>
++      conversation(litert_lm_conversation_create(engine, config),
++                   &litert_lm_conversation_delete);
++  if (conversation == nullptr || conversation->conversation == nullptr) {
++    if (g_grok_last_error.empty()) {
++      g_grok_last_error = "failed to create measurement conversation";
++    }
++    if (error_message != nullptr) {
++      *error_message = g_grok_last_error.c_str();
++    }
++    return 2;
++  }
++
++  nlohmann::json message = nlohmann::json::parse(
++      message_json, /*cb=*/nullptr, /*allow_exceptions=*/false);
++  if (message.is_discarded()) {
++    g_grok_last_error = "failed to parse measurement message JSON";
++    if (error_message != nullptr) {
++      *error_message = g_grok_last_error.c_str();
++    }
++    return 3;
++  }
++  auto rendered =
++      conversation->conversation->RenderMessageIntoString(message, {});
++  if (!rendered.ok()) {
++    SetGrokLastError(rendered.status());
++    if (error_message != nullptr) {
++      *error_message = g_grok_last_error.c_str();
++    }
++    return 4;
++  }
++  auto tokens = const_cast<litert::lm::Tokenizer&>(
++      engine->engine->GetTokenizer()).TextToTokenIds(*rendered);
++  if (!tokens.ok()) {
++    SetGrokLastError(tokens.status());
++    if (error_message != nullptr) {
++      *error_message = g_grok_last_error.c_str();
++    }
++    return 5;
++  }
++  *token_count = tokens->size();
++  return 0;
++}
++
+ LiteRtLmJsonResponse* litert_lm_conversation_send_message(
+     LiteRtLmConversation* conversation, const char* message_json,
+     const char* extra_context) {

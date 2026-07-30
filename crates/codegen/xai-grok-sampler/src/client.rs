@@ -338,6 +338,16 @@ impl std::fmt::Debug for SamplingClient {
     }
 }
 
+impl SamplingClient {
+    /// Whether this client is backed by the in-process LiteRT-LM transport.
+    ///
+    /// Callers use this to avoid auxiliary workflows that rely on HTTP-only
+    /// capabilities such as server-enforced named tool choice.
+    pub fn is_local_inference(&self) -> bool {
+        self.base_url.starts_with("litert-lm://")
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct ClientDefaults {
     model: String,

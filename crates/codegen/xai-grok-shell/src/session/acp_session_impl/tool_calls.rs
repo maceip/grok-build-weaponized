@@ -278,7 +278,283 @@ fn resume_action_for(outcome: PlanApprovalOutcome, feedback: Option<String>) -> 
         PlanApprovalOutcome::Abandoned => ResumeAction::LeaveOnly,
     }
 }
+
+async fn exact_text_usage(
+    sampler: &crate::sampling::SamplerConfig,
+    text: &str,
+    limit: u32,
+) -> Result<(bool, u32), crate::sampling::SamplingError> {
+    if let Some(bounded) =
+        xai_grok_sampler::litert_lm::bound_text_for_sampler(sampler, text, limit).await?
+    {
+        return Ok((!bounded.truncated, bounded.original_tokens));
+    }
+    let tokens = xai_token_estimation::estimate_tokens(text)
+        .try_into()
+        .unwrap_or(u32::MAX);
+    Ok((tokens <= limit, tokens))
+}
+
+async fn bound_atomic_tool_envelope(
+    sampler: &crate::sampling::SamplerConfig,
+    wrapped: &xai_grok_tools::util::output_filter::WrappedToolResultEnvelope,
+    limit: u32,
+) -> Result<Option<xai_grok_sampler::litert_lm::BoundedLocalText>, crate::sampling::SamplingError> {
+    let full = wrapped.render(usize::MAX, true);
+    let (full_fits, original_tokens) = exact_text_usage(sampler, &full, limit).await?;
+    if full_fits {
+        return Ok(Some(xai_grok_sampler::litert_lm::BoundedLocalText {
+            text: full,
+            original_tokens,
+            retained_tokens: original_tokens,
+            truncated: false,
+        }));
+    }
+
+    let mut variants = vec![(wrapped.clone(), true), (wrapped.clone(), false)];
+    let mut without_suffix = wrapped.clone();
+    without_suffix.suffix.clear();
+    variants.push((without_suffix, false));
+
+    for (variant, retain_finding_detail) in variants {
+        let minimum = variant.render(0, retain_finding_detail);
+        let (minimum_fits, minimum_tokens) = exact_text_usage(sampler, &minimum, limit).await?;
+        if !minimum_fits {
+            continue;
+        }
+
+        let mut low = 0usize;
+        let mut high = variant.envelope.preview.chars().count();
+        let mut best = (minimum, minimum_tokens);
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            let candidate = variant.render(mid, retain_finding_detail);
+            let (fits, tokens) = exact_text_usage(sampler, &candidate, limit).await?;
+            if fits {
+                best = (candidate, tokens);
+                low = mid.saturating_add(1);
+            } else if mid == 0 {
+                break;
+            } else {
+                high = mid - 1;
+            }
+        }
+
+        return Ok(Some(xai_grok_sampler::litert_lm::BoundedLocalText {
+            text: best.0,
+            original_tokens,
+            retained_tokens: best.1,
+            truncated: true,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn estimated_text_tokens(text: &str) -> u32 {
+    xai_token_estimation::estimate_tokens(text)
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+fn bound_atomic_tool_envelope_estimated(
+    wrapped: &xai_grok_tools::util::output_filter::WrappedToolResultEnvelope,
+    limit: u32,
+) -> Option<xai_grok_sampler::litert_lm::BoundedLocalText> {
+    let full = wrapped.render(usize::MAX, true);
+    let original_tokens = estimated_text_tokens(&full);
+    if original_tokens <= limit {
+        return Some(xai_grok_sampler::litert_lm::BoundedLocalText {
+            text: full,
+            original_tokens,
+            retained_tokens: original_tokens,
+            truncated: false,
+        });
+    }
+
+    let mut variants = vec![(wrapped.clone(), true), (wrapped.clone(), false)];
+    let mut without_suffix = wrapped.clone();
+    without_suffix.suffix.clear();
+    variants.push((without_suffix, false));
+
+    for (variant, retain_finding_detail) in variants {
+        let minimum = variant.render(0, retain_finding_detail);
+        let minimum_tokens = estimated_text_tokens(&minimum);
+        if minimum_tokens > limit {
+            continue;
+        }
+
+        let mut low = 0usize;
+        let mut high = variant.envelope.preview.chars().count();
+        let mut best = (minimum, minimum_tokens);
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            let candidate = variant.render(mid, retain_finding_detail);
+            let tokens = estimated_text_tokens(&candidate);
+            if tokens <= limit {
+                best = (candidate, tokens);
+                low = mid.saturating_add(1);
+            } else if mid == 0 {
+                break;
+            } else {
+                high = mid - 1;
+            }
+        }
+        return Some(xai_grok_sampler::litert_lm::BoundedLocalText {
+            text: best.0,
+            original_tokens,
+            retained_tokens: best.1,
+            truncated: true,
+        });
+    }
+    None
+}
+
 impl SessionActor {
+    async fn budget_tool_result_for_history(&self, tool_name: &str, prompt_text: String) -> String {
+        let sampler = self.reconstruct_full_config().await;
+        let live_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
+        let context_window = sampler.context_window.min(u64::from(u32::MAX)) as u32;
+        let completion_reserve = sampler
+            .max_completion_tokens
+            .unwrap_or_else(|| (context_window / 8).max(1));
+        let safety_margin = (context_window.saturating_add(99) / 100).max(32);
+        let available_tokens = context_window
+            .saturating_sub(live_tokens.min(u64::from(u32::MAX)) as u32)
+            .saturating_sub(completion_reserve)
+            .saturating_sub(safety_margin);
+        let Some(claim) = self
+            .tool_context
+            .tool_output_turn_budget
+            .claim_next_result_with_cap(available_tokens)
+        else {
+            return prompt_text;
+        };
+        let limit = claim.limit();
+        if limit == 0 {
+            tracing::info!(
+                tool = tool_name,
+                "omitting tool result after cumulative turn-output budget exhaustion"
+            );
+            claim.finish(0);
+            return String::new();
+        }
+
+        if let Some(wrapped) =
+            xai_grok_tools::util::output_filter::WrappedToolResultEnvelope::parse(&prompt_text)
+        {
+            match bound_atomic_tool_envelope(&sampler, &wrapped, limit).await {
+                Ok(Some(bounded)) => {
+                    claim.finish(bounded.retained_tokens);
+                    if bounded.truncated {
+                        tracing::info!(
+                            tool = tool_name,
+                            original_tokens = bounded.original_tokens,
+                            retained_tokens = bounded.retained_tokens,
+                            limit,
+                            "compacted typed tool envelope without splitting serialized JSON"
+                        );
+                    }
+                    return bounded.text;
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        tool = tool_name,
+                        limit,
+                        "mandatory tool status envelope cannot fit the live result allowance"
+                    );
+                    claim.finish(0);
+                    return String::new();
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        tool = tool_name,
+                        %error,
+                        "exact typed-envelope measurement failed; using atomic estimated compaction"
+                    );
+                    let Some(bounded) = bound_atomic_tool_envelope_estimated(&wrapped, limit)
+                    else {
+                        claim.finish(0);
+                        return String::new();
+                    };
+                    claim.finish(bounded.retained_tokens);
+                    return bounded.text;
+                }
+            }
+        }
+
+        let structurally_filtered = if prompt_text.starts_with("[output structure:") {
+            prompt_text
+        } else {
+            let mut analysis = xai_grok_tools::util::output_filter::OutputAnalysis::default();
+            analysis.push(prompt_text.as_bytes());
+            analysis.render(&prompt_text, false, usize::MAX).text
+        };
+        let bounded = match xai_grok_sampler::litert_lm::bound_text_for_sampler(
+            &sampler,
+            &structurally_filtered,
+            limit,
+        )
+        .await
+        {
+            Ok(Some(bounded)) => bounded,
+            Ok(None) => {
+                let char_budget = xai_grok_tools::util::truncate::estimate_chars(u64::from(limit))
+                    .try_into()
+                    .unwrap_or(usize::MAX);
+                let bounded = xai_grok_tools::util::output_filter::OutputAnalysis::default()
+                    .render(&structurally_filtered, false, char_budget);
+                let retained_tokens = xai_token_estimation::estimate_tokens(&bounded.text)
+                    .try_into()
+                    .unwrap_or(u32::MAX)
+                    .min(limit);
+                xai_grok_sampler::litert_lm::BoundedLocalText {
+                    text: bounded.text,
+                    original_tokens: xai_token_estimation::estimate_tokens(&structurally_filtered)
+                        .try_into()
+                        .unwrap_or(u32::MAX),
+                    retained_tokens,
+                    truncated: bounded.truncated,
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tool = tool_name,
+                    %error,
+                    "exact local tool-output tokenization failed; using bounded estimator"
+                );
+                let char_budget = xai_grok_tools::util::truncate::estimate_chars(u64::from(limit))
+                    .try_into()
+                    .unwrap_or(usize::MAX);
+                let bounded = xai_grok_tools::util::output_filter::OutputAnalysis::default()
+                    .render(&structurally_filtered, false, char_budget);
+                let retained_tokens = xai_token_estimation::estimate_tokens(&bounded.text)
+                    .try_into()
+                    .unwrap_or(u32::MAX)
+                    .min(limit);
+                xai_grok_sampler::litert_lm::BoundedLocalText {
+                    text: bounded.text,
+                    original_tokens: xai_token_estimation::estimate_tokens(&structurally_filtered)
+                        .try_into()
+                        .unwrap_or(u32::MAX),
+                    retained_tokens,
+                    truncated: bounded.truncated,
+                }
+            }
+        };
+        claim.finish(bounded.retained_tokens);
+        if bounded.truncated {
+            tracing::info!(
+                tool = tool_name,
+                original_tokens = bounded.original_tokens,
+                retained_tokens = bounded.retained_tokens,
+                limit,
+                "bounded tool result before model-history insertion"
+            );
+        }
+        bounded.text
+    }
+
     /// Merge the canonical `x.ai/tool` identity envelope into a tool-call
     /// event's `_meta`, resolving the tool from the live toolset by wire name.
     pub(super) fn stamp_tool_meta(
@@ -2336,6 +2612,9 @@ impl SessionActor {
                 pdf.total_pages,
             );
         }
+        prompt_text = self
+            .budget_tool_result_for_history(effective_tool_name, prompt_text)
+            .await;
         let tool_chat = if inline_images.is_empty() {
             ConversationItem::tool_result(call_id.to_string(), prompt_text)
         } else {
@@ -2493,56 +2772,62 @@ impl SessionActor {
                 self.emit_event(crate::session::events::Event::FirstToken);
             }
             SamplingEvent::ChannelToken {
+                request_id,
                 channel,
                 text,
                 chunk_index,
                 ..
-            } => match channel {
-                SamplingChannel::Text => {
-                    {
-                        let mut cap = self.streaming_turn_capture.lock();
-                        if cap.prompt_id.is_none() {
-                            let prompt_id = self
-                                .current_prompt_id
-                                .lock()
-                                .expect("current_prompt_id mutex poisoned")
-                                .clone();
-                            cap.begin_turn(prompt_id, self.current_turn_number.get());
-                            cap.attempt_count += 1;
-                        }
-                        cap.append(false, &text);
-                    }
-                    self.emit_event(crate::session::events::Event::PhaseChanged {
-                        phase: crate::session::events::Phase::StreamingText,
-                    });
-                    self.send_update(
-                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                            acp::ContentBlock::Text(acp::TextContent::new(text)),
-                        )),
-                        Some(chunk_index),
-                    )
-                    .await;
+            } => {
+                if super::cooperation::sampling_is_suppressed(request_id.as_str()) {
+                    return;
                 }
-                SamplingChannel::Reasoning => {
-                    {
-                        let mut cap = self.streaming_turn_capture.lock();
-                        if cap.prompt_id.is_none() {
-                            let prompt_id = self
-                                .current_prompt_id
-                                .lock()
-                                .expect("current_prompt_id mutex poisoned")
-                                .clone();
-                            cap.begin_turn(prompt_id, self.current_turn_number.get());
-                            cap.attempt_count += 1;
+                match channel {
+                    SamplingChannel::Text => {
+                        {
+                            let mut cap = self.streaming_turn_capture.lock();
+                            if cap.prompt_id.is_none() {
+                                let prompt_id = self
+                                    .current_prompt_id
+                                    .lock()
+                                    .expect("current_prompt_id mutex poisoned")
+                                    .clone();
+                                cap.begin_turn(prompt_id, self.current_turn_number.get());
+                                cap.attempt_count += 1;
+                            }
+                            cap.append(false, &text);
                         }
-                        cap.append(true, &text);
+                        self.emit_event(crate::session::events::Event::PhaseChanged {
+                            phase: crate::session::events::Phase::StreamingText,
+                        });
+                        self.send_update(
+                            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                                acp::ContentBlock::Text(acp::TextContent::new(text)),
+                            )),
+                            Some(chunk_index),
+                        )
+                        .await;
                     }
-                    self.emit_event(crate::session::events::Event::PhaseChanged {
-                        phase: crate::session::events::Phase::StreamingReasoning,
-                    });
-                    self.send_thought_chunk(text, chunk_index).await;
+                    SamplingChannel::Reasoning => {
+                        {
+                            let mut cap = self.streaming_turn_capture.lock();
+                            if cap.prompt_id.is_none() {
+                                let prompt_id = self
+                                    .current_prompt_id
+                                    .lock()
+                                    .expect("current_prompt_id mutex poisoned")
+                                    .clone();
+                                cap.begin_turn(prompt_id, self.current_turn_number.get());
+                                cap.attempt_count += 1;
+                            }
+                            cap.append(true, &text);
+                        }
+                        self.emit_event(crate::session::events::Event::PhaseChanged {
+                            phase: crate::session::events::Phase::StreamingReasoning,
+                        });
+                        self.send_thought_chunk(text, chunk_index).await;
+                    }
                 }
-            },
+            }
             SamplingEvent::ToolCallDelta {
                 tool_index,
                 id,
@@ -3257,5 +3542,57 @@ mod wait_interrupt_tests {
         );
         drop(new);
         assert_eq!(depth.depth(), 0);
+    }
+}
+
+#[cfg(test)]
+mod atomic_tool_envelope_budget_tests {
+    use super::bound_atomic_tool_envelope_estimated;
+    use xai_grok_tools::util::output_filter::{
+        OutputArtifactRef, OutputCursor, OutputStructure, ToolResultEnvelope,
+        WrappedToolResultEnvelope,
+    };
+
+    fn large_envelope() -> WrappedToolResultEnvelope {
+        WrappedToolResultEnvelope {
+            prefix: "exit: 0\n".to_string(),
+            envelope: ToolResultEnvelope {
+                status: "completed".to_string(),
+                exit_code: Some(0),
+                signal: None,
+                structure: OutputStructure {
+                    line_count: 50_000,
+                    open_port_count: 2,
+                    match_count: 2,
+                    findings: vec!["22/tcp open ssh".to_string()],
+                    ..OutputStructure::default()
+                },
+                findings: vec!["22/tcp open ssh".to_string()],
+                preview: "complete raw output line\n".repeat(20_000),
+                artifact: OutputArtifactRef {
+                    path: "/tmp/full-output.log".to_string(),
+                    total_bytes: 1_000_000,
+                },
+                cursor: OutputCursor {
+                    next_byte: 1_000_000,
+                    complete: true,
+                },
+                truncated: false,
+            },
+            suffix: String::new(),
+        }
+    }
+
+    #[test]
+    fn estimated_budget_compacts_preview_but_keeps_one_valid_json_object() {
+        let bounded = bound_atomic_tool_envelope_estimated(&large_envelope(), 400).unwrap();
+        assert!(bounded.truncated);
+        assert!(bounded.retained_tokens <= 400);
+
+        let reparsed = WrappedToolResultEnvelope::parse(&bounded.text).unwrap();
+        assert_eq!(reparsed.envelope.status, "completed");
+        assert_eq!(reparsed.envelope.structure.line_count, 50_000);
+        assert_eq!(reparsed.envelope.artifact.total_bytes, 1_000_000);
+        assert_eq!(reparsed.envelope.cursor.next_byte, 1_000_000);
     }
 }

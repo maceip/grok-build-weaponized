@@ -709,6 +709,8 @@ impl ToolRegistryBuilder {
                 grok_build::ask_user_question::AskUserQuestionParams,
             >();
         b.register::<grok_build::MonitorTool>();
+        b.register::<grok_build::NativeNmapTool>();
+        b.register::<grok_build::NativeNmapJobTool>();
         b.register::<grok_build::SchedulerCreateTool>();
         b.register::<grok_build::SchedulerDeleteTool>();
         b.register::<grok_build::SchedulerListTool>();

@@ -405,7 +405,19 @@ impl acp::Agent for MvpAgent {
             has_auth_provider_command: has_auth_provider,
             preferred_method,
         });
-        let auth_methods = built.methods;
+        let local_inference_default = self
+            .models_manager
+            .sampling_config()
+            .base_url
+            .starts_with("litert-lm://");
+        let mut auth_methods = built.methods;
+        let mut default_auth_method_id = built.default_auth_method_id;
+        if local_inference_default {
+            auth_methods.insert(0, auth_method::local_inference_auth_method());
+            default_auth_method_id = Some(acp::AuthMethodId::new(
+                auth_method::LOCAL_INFERENCE_METHOD_ID,
+            ));
+        }
         xai_grok_telemetry::unified_log::info(
             "auth: initialize() built auth_methods for ACP response",
             None,
@@ -421,12 +433,14 @@ impl acp::Agent for MvpAgent {
                 "init_is_expired": init_is_expired,
                 "auth_mode": self.auth_manager.current().map(|a| format!("{:?}", a.auth_mode)),
                 "methods": auth_methods.iter().map(|m| m.id().0.as_ref()).collect::<Vec<_>>(),
-                "default_auth_method_id": built.default_auth_method_id.as_ref().map(|id| id.0.as_ref()),
+                "default_auth_method_id": default_auth_method_id.as_ref().map(|id| id.0.as_ref()),
+                "local_inference_default": local_inference_default,
             }),
             ),
         );
         debug_assert!(
-            !has_external_api_key
+            local_inference_default
+                || !has_external_api_key
                 || matches!(
                     auth_methods
                         .first()
@@ -437,11 +451,10 @@ impl acp::Agent for MvpAgent {
              when has_external_api_key is true; got {:?}",
             auth_methods.first().map(|m| m.id()),
         );
-        let default_auth_method_id_wire: Option<String> = built
-            .default_auth_method_id
+        let default_auth_method_id_wire: Option<String> = default_auth_method_id
             .as_ref()
             .map(|id| id.0.to_string());
-        if let Some(default_id) = built.default_auth_method_id {
+        if let Some(default_id) = default_auth_method_id {
             xai_grok_telemetry::unified_log::info(
                 "auth method selection",
                 None,
@@ -560,9 +573,12 @@ impl acp::Agent for MvpAgent {
         );
         if let Some(preferred) = self.cfg.borrow().grok_com_config.preferred_method {
             let kind = auth_method::AuthMethodKind::from_id(&arguments.method_id);
-            let allowed = match preferred {
-                crate::auth::PreferredAuthMethod::ApiKey => kind.is_api_key(),
-                crate::auth::PreferredAuthMethod::Oidc => kind.is_session_based(),
+            let allowed = match kind {
+                auth_method::AuthMethodKind::LocalInference => true,
+                _ => match preferred {
+                    crate::auth::PreferredAuthMethod::ApiKey => kind.is_api_key(),
+                    crate::auth::PreferredAuthMethod::Oidc => kind.is_session_based(),
+                },
             };
             if !allowed {
                 let msg = match preferred {
@@ -583,6 +599,21 @@ impl acp::Agent for MvpAgent {
             }
         }
         match arguments.method_id.0.as_ref() {
+            auth_method::LOCAL_INFERENCE_METHOD_ID => {
+                let config = self.models_manager.sampling_config();
+                if !config.base_url.starts_with("litert-lm://") {
+                    return Err(acp::Error::auth_required().data(
+                        "local.inference is only valid when the default model uses litert-lm://",
+                    ));
+                }
+                self.set_auth_method(arguments.method_id.clone());
+                xai_grok_telemetry::unified_log::info(
+                    "auth: local inference requires no credentials",
+                    None,
+                    Some(serde_json::json!({"model": config.model})),
+                );
+                Ok(Default::default())
+            }
             auth_method::XAI_API_KEY_METHOD_ID => {
                 if self.cfg.borrow().grok_com_config.api_key_auth_disabled() {
                     emit_login_span(false, "api_key", None, Some("disabled_by_admin"));
@@ -2281,6 +2312,8 @@ impl acp::Agent for MvpAgent {
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
             }
         }
+        self.apply_contextual_model_route(&mut arguments, &handle)
+            .await?;
         let dispatch_lock = self.dispatch_lock(&arguments.session_id);
         let dispatch_guard = dispatch_lock.lock().await;
         let meta_prompt_mode = arguments

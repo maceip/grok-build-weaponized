@@ -315,9 +315,12 @@ fn memory_config_defaults_are_correct() {
         let mem = MemoryConfig::resolve(false, false, &config, None);
         assert_eq!(mem.index.max_chunk_chars, 1600);
         assert_eq!(mem.index.chunk_overlap_chars, 320);
-        assert_eq!(mem.embedding.provider, "api");
-        assert_eq!(mem.embedding.model, None);
-        assert_eq!(mem.embedding.dimensions, 1024);
+        assert_eq!(mem.embedding.provider, "local");
+        assert_eq!(
+            mem.embedding.model.as_deref(),
+            Some("embeddinggemma-300m-q4")
+        );
+        assert_eq!(mem.embedding.dimensions, 768);
         assert_eq!(mem.search.max_results, 6);
         assert!((mem.search.min_score - 0.35).abs() < f32::EPSILON);
         assert!((mem.search.vector_weight - 0.7).abs() < f32::EPSILON);
@@ -467,7 +470,7 @@ max_chunk_chars = 3200
         assert!(mem.enabled);
         assert_eq!(mem.index.max_chunk_chars, 3200);
         assert_eq!(mem.index.chunk_overlap_chars, 320);
-        assert_eq!(mem.embedding.dimensions, 1024);
+        assert_eq!(mem.embedding.dimensions, 768);
         assert_eq!(mem.search.max_results, 6);
         assert!(mem.flush.enabled);
         assert!(mem.pruning.enabled);

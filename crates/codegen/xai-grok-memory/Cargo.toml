@@ -8,15 +8,21 @@ edition.workspace = true
 # Exposes `#[cfg(test)]`-only helpers (`MemoryStorage::with_paths`,
 # `MockEmbeddingProvider`) to downstream crates' test targets.
 test-support = []
+high-recall-embeddings = ["dep:candle-core", "fastembed/qwen3", "fastembed/metal"]
 
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
+candle-core = { version = "0.11", optional = true }
 chrono = { workspace = true }
 dunce = { workspace = true }
 flate2 = { workspace = true }
+fastembed = { version = "=5.17.3", default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-download-binaries-rustls-tls",
+] }
 git2 = { version = "0.20", default-features = false, features = [
     "vendored-libgit2",
 ] }
@@ -34,6 +40,7 @@ tracing = { workspace = true }
 xai-grok-auth = { workspace = true }
 xai-grok-config-types = { workspace = true }
 xai-grok-http = { workspace = true }
+xai-grok-runtime = { workspace = true }
 xai-grok-telemetry = { workspace = true }
 xai-grok-tools = { workspace = true }
 xai-grok-version = { workspace = true }

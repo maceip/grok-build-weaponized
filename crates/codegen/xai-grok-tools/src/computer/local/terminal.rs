@@ -5,13 +5,14 @@
 //! - `LocalTerminalActor` runs in a spawned task and owns all mutable state
 //! - No mutex locks are needed - all state access is through message passing
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -22,6 +23,8 @@ use crate::computer::types::{
     BackgroundHandle, ComputerError, KillOutcome, TaskSnapshot, TerminalBackend,
     TerminalRunRequest, TerminalRunResult,
 };
+use crate::native::execution_supervisor::ExecutionSupervisor;
+use crate::native::job_registry::{ExecutionJobHandle, ExecutionJobKind};
 use crate::notification::types::{BashNotificationBase, BashOutputChunk, ToolNotificationHandle};
 
 use super::SearchShadowConfig;
@@ -37,7 +40,7 @@ struct SpawnResult {
 }
 
 const READ_BUFFER_SIZE: usize = 8192;
-const DEFAULT_NOTIFICATION_INTERVAL_MS: u64 = 100;
+const OUTPUT_FILE_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 const COMMAND_CHANNEL_SIZE: usize = 32;
 /// How long to keep completed background tasks in memory before eviction.
 /// The output file on disk persists for the session lifetime.
@@ -67,6 +70,9 @@ fn foreground_block_budget_from_env() -> Duration {
 /// (`yes`, a runaway log) from filling the disk. Env override:
 /// `GROK_MAX_OUTPUT_FILE_BYTES`.
 const MAX_OUTPUT_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
+const MAX_SESSION_OUTPUT_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
+const MAX_GLOBAL_OUTPUT_BYTES: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB
+static PROCESS_SPOOL_BYTES: AtomicU64 = AtomicU64::new(0);
 
 fn output_file_cap_from_env() -> u64 {
     std::env::var("GROK_MAX_OUTPUT_FILE_BYTES")
@@ -74,19 +80,98 @@ fn output_file_cap_from_env() -> u64 {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(MAX_OUTPUT_FILE_BYTES)
 }
+
+fn session_output_cap_from_env() -> u64 {
+    std::env::var("GROK_MAX_SESSION_OUTPUT_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(MAX_SESSION_OUTPUT_BYTES)
+}
+
+fn global_output_cap_from_env() -> u64 {
+    std::env::var("GROK_MAX_GLOBAL_OUTPUT_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(MAX_GLOBAL_OUTPUT_BYTES)
+}
 /// Max time to drain stdout/stderr after process exit. Prevents `cmd &`
 /// (inherited pipe, no redirect) from blocking the actor loop forever.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-/// Max bytes retained in the output file after process exit. Truncated
-/// so `to_task_snapshot` / `read_file` don't materialize huge strings.
-const MAX_RETAINED_OUTPUT_FILE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 /// Maximum number of completed-task tombstones to keep. When exceeded,
 /// the oldest entries are evicted. Each tombstone is lightweight (metadata
 /// only, no output), so 100 entries is ~10 KB.
 const MAX_COMPLETED_TASK_SNAPSHOTS: usize = 100;
 
-fn notification_interval() -> Duration {
-    Duration::from_millis(DEFAULT_NOTIFICATION_INTERVAL_MS)
+fn spawn_stream_reader<R>(
+    stream_id: String,
+    stream: OutputStream,
+    mut reader: R,
+    sequence: std::sync::Arc<AtomicU64>,
+    output_tx: mpsc::Sender<ProcessOutputEvent>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buffer = vec![0_u8; READ_BUFFER_SIZE];
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => {
+                    let event = ProcessOutputEvent::Chunk {
+                        stream_id: stream_id.clone(),
+                        sequence: sequence.fetch_add(1, Ordering::Relaxed),
+                        chunk: StreamChunk {
+                            stream,
+                            bytes: buffer[..read].to_vec(),
+                        },
+                    };
+                    if output_tx.send(event).await.is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = output_tx
+                        .send(ProcessOutputEvent::ReadError {
+                            stream_id: stream_id.clone(),
+                            stream,
+                            message: error.to_string(),
+                        })
+                        .await;
+                    break;
+                }
+            }
+        }
+        let _ = output_tx
+            .send(ProcessOutputEvent::Closed { stream_id, stream })
+            .await;
+    });
+}
+
+fn spawn_process_readers(
+    stream_id: &str,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    output_tx: &mpsc::Sender<ProcessOutputEvent>,
+) {
+    let sequence = std::sync::Arc::new(AtomicU64::new(0));
+    if let Some(stdout) = stdout {
+        spawn_stream_reader(
+            stream_id.to_owned(),
+            OutputStream::Stdout,
+            stdout,
+            std::sync::Arc::clone(&sequence),
+            output_tx.clone(),
+        );
+    }
+    if let Some(stderr) = stderr {
+        spawn_stream_reader(
+            stream_id.to_owned(),
+            OutputStream::Stderr,
+            stderr,
+            sequence,
+            output_tx.clone(),
+        );
+    }
 }
 
 /// Exit status of a terminal process
@@ -180,6 +265,34 @@ enum TerminalCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+struct StreamChunk {
+    stream: OutputStream,
+    bytes: Vec<u8>,
+}
+
+enum ProcessOutputEvent {
+    Chunk {
+        stream_id: String,
+        sequence: u64,
+        chunk: StreamChunk,
+    },
+    Closed {
+        stream_id: String,
+        stream: OutputStream,
+    },
+    ReadError {
+        stream_id: String,
+        stream: OutputStream,
+        message: String,
+    },
+}
+
 // ============================================================================
 // Per-process state (for each running command)
 // ============================================================================
@@ -217,6 +330,12 @@ impl BackgroundReason {
 
 /// State for a single running process
 struct ProcessState {
+    /// Stable identity used by stdout/stderr reader tasks. The process map key
+    /// can change when a foreground command is backgrounded.
+    stream_id: String,
+    /// Shared lifecycle/cancellation record used by terminal, Nmap, and future
+    /// native execution drivers.
+    execution_job: ExecutionJobHandle,
     /// The child process
     child: tokio::process::Child,
     /// Process-tree teardown handle, shared (`Arc`) with the process-global
@@ -243,6 +362,18 @@ struct ProcessState {
     truncated: bool,
     /// Total bytes written to file (before truncation)
     total_bytes: usize,
+    /// Structural analysis of the complete stdout/stderr stream. Unlike the
+    /// preview buffers, this sees bytes before middle truncation.
+    output_analysis: crate::util::output_filter::OutputAnalysis,
+    /// Out-of-order chunks awaiting the next global per-process sequence.
+    pending_stream_chunks: BTreeMap<u64, StreamChunk>,
+    next_stream_sequence: u64,
+    stdout_closed: bool,
+    stderr_closed: bool,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+    pending_exit_status: Option<ExitStatus>,
+    pending_exit_at: Option<Instant>,
     /// Exit status once process completes
     exit_status: Option<ExitStatus>,
     /// Whether process was backgrounded and how
@@ -259,6 +390,9 @@ struct ProcessState {
     output_file: PathBuf,
     /// Open file handle for incremental writes
     file_handle: Option<File>,
+    /// File visibility is batched independently from the 100 ms output poll so
+    /// hot writers do not force a flush syscall on every supervisor tick.
+    last_file_flush: Instant,
     /// The command that was executed (may be isolation-wrapped)
     command: String,
     /// Original user command before isolation wrapping (for display)
@@ -307,8 +441,43 @@ struct ProcessState {
 }
 
 impl ProcessState {
+    fn execution_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "exit_code": self.exit_status.as_ref().and_then(|status| status.exit_code),
+            "signal": self.exit_status.as_ref().and_then(|status| status.signal.clone()),
+            "stdout_bytes": self.stdout_bytes,
+            "stderr_bytes": self.stderr_bytes,
+            "total_bytes": self.total_bytes,
+            "output_file": self.output_file.clone(),
+            "completed": self.exit_status.is_some(),
+        })
+    }
+
+    fn finish_execution_job(&self) {
+        let payload = self.execution_payload();
+        let signal = self
+            .exit_status
+            .as_ref()
+            .and_then(|status| status.signal.as_deref());
+        if self.explicitly_killed || signal == Some("killed") {
+            self.execution_job.cancel_with_payload(payload);
+        } else if let Some(
+            signal @ ("timeout"
+            | "max_runtime"
+            | "output_limit"
+            | "session_output_limit"
+            | "global_output_limit"
+            | "oom"),
+        ) = signal
+        {
+            self.execution_job.fail_with_payload(signal, payload);
+        } else {
+            self.execution_job.complete(payload);
+        }
+    }
+
     fn to_result(&self) -> TerminalRunResult {
-        let combined_output = if let Some(ref front) = self.front_buffer {
+        let raw_preview = if let Some(ref front) = self.front_buffer {
             let front_str = String::from_utf8_lossy(front);
             let back_str = String::from_utf8_lossy(&self.output_buffer);
             format!(
@@ -319,10 +488,13 @@ impl ProcessState {
         } else {
             String::from_utf8_lossy(&self.output_buffer).into_owned()
         };
+        let filtered =
+            self.output_analysis
+                .render(&raw_preview, self.truncated, self.output_byte_limit);
         TerminalRunResult {
-            combined_output,
+            combined_output: filtered.text,
             exit_code: self.exit_status.as_ref().and_then(|s| s.exit_code),
-            truncated: self.truncated,
+            truncated: filtered.truncated,
             signal: match self.bg_status {
                 BackgroundStatus::Backgrounded { reason } => Some(reason.as_signal().to_string()),
                 _ => self.exit_status.as_ref().and_then(|s| s.signal.clone()),
@@ -334,6 +506,7 @@ impl ProcessState {
                 .unwrap_or(false),
             output_file: self.output_file.clone(),
             total_bytes: self.total_bytes,
+            structure: filtered.structure,
             pid: self.child.id(),
         }
     }
@@ -380,15 +553,13 @@ impl ProcessState {
         self.truncated = true;
     }
 
-    /// Flush and truncate the output file to [`MAX_RETAINED_OUTPUT_FILE_BYTES`].
+    /// Flush the complete output artifact. Model-facing snapshots are bounded
+    /// while reading; the spool itself remains complete up to the configured
+    /// process output cap.
     async fn flush_and_truncate_output_file(&mut self) {
         if let Some(ref mut file) = self.file_handle {
             let _ = file.flush().await;
-            if self.total_bytes as u64 > MAX_RETAINED_OUTPUT_FILE_BYTES {
-                let _ = file.set_len(MAX_RETAINED_OUTPUT_FILE_BYTES).await;
-                // Seek to new end so post-exit drain appends correctly.
-                let _ = file.seek(std::io::SeekFrom::End(0)).await;
-            }
+            self.last_file_flush = Instant::now();
         }
     }
 
@@ -400,9 +571,10 @@ impl ProcessState {
     /// Uses async I/O to read output from disk for completed background tasks.
     async fn to_task_snapshot(&self, task_id: &str) -> TaskSnapshot {
         // For completed background tasks, the in-memory buffer is cleared to free
-        // memory. Fall back to reading from the output file (non-blocking).
-        let output = if self.output_buffer.is_empty() && self.exit_status.is_some() {
-            tokio::fs::read_to_string(&self.output_file)
+        // memory. Read only a bounded head/tail preview; the complete spool
+        // remains available through `output_file`.
+        let raw_preview = if self.output_buffer.is_empty() && self.exit_status.is_some() {
+            read_bounded_file_preview(&self.output_file, self.output_byte_limit)
                 .await
                 .unwrap_or_default()
         } else if let Some(ref front) = self.front_buffer {
@@ -416,6 +588,9 @@ impl ProcessState {
         } else {
             String::from_utf8_lossy(&self.output_buffer).into_owned()
         };
+        let filtered =
+            self.output_analysis
+                .render(&raw_preview, self.truncated, self.output_byte_limit);
 
         TaskSnapshot {
             task_id: task_id.to_string(),
@@ -433,9 +608,9 @@ impl ProcessState {
             } else {
                 None
             },
-            output,
+            output: filtered.text,
             output_file: self.output_file.clone(),
-            truncated: self.truncated,
+            truncated: filtered.truncated,
             exit_code: self.exit_status.as_ref().and_then(|s| s.exit_code),
             signal: self.exit_status.as_ref().and_then(|s| s.signal.clone()),
             completed: self.exit_status.is_some(),
@@ -447,6 +622,40 @@ impl ProcessState {
             is_backgrounded: self.bg_status.is_backgrounded(),
         }
     }
+}
+
+async fn read_bounded_file_preview(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+    if max_bytes == 0 {
+        return Ok(String::new());
+    }
+    let mut file = File::open(path).await?;
+    let length = file.metadata().await?.len();
+    let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if length <= max_bytes_u64 {
+        let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(max_bytes));
+        file.read_to_end(&mut bytes).await?;
+        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+    }
+
+    let head_bytes = max_bytes / 2;
+    let tail_bytes = max_bytes.saturating_sub(head_bytes);
+    let mut head = Vec::with_capacity(head_bytes);
+    (&mut file)
+        .take(u64::try_from(head_bytes).unwrap_or(u64::MAX))
+        .read_to_end(&mut head)
+        .await?;
+    let tail_start = length.saturating_sub(u64::try_from(tail_bytes).unwrap_or(u64::MAX));
+    file.seek(std::io::SeekFrom::Start(tail_start)).await?;
+    let mut tail = Vec::with_capacity(tail_bytes);
+    (&mut file)
+        .take(u64::try_from(tail_bytes).unwrap_or(u64::MAX))
+        .read_to_end(&mut tail)
+        .await?;
+    Ok(format!(
+        "{}\n\n... (output file middle omitted; total_bytes={length}) ...\n\n{}",
+        String::from_utf8_lossy(&head).trim_end(),
+        String::from_utf8_lossy(&tail).trim_start(),
+    ))
 }
 
 // ============================================================================
@@ -465,6 +674,11 @@ struct CompletionWaiter {
 struct LocalTerminalActor {
     /// Command receiver
     cmd_rx: mpsc::Receiver<TerminalCommand>,
+    output_tx: mpsc::Sender<ProcessOutputEvent>,
+    output_rx: mpsc::Receiver<ProcessOutputEvent>,
+    /// Stable stream identity to current process-map key. Foreground commands
+    /// retain this identity when re-keyed as background tasks.
+    stream_routes: HashMap<String, String>,
 
     /// Cancellation token for graceful shutdown
     cancel_token: CancellationToken,
@@ -500,6 +714,10 @@ struct LocalTerminalActor {
     /// Per-command output-file size cap (on the actor so tests can shrink it).
     /// See [`MAX_OUTPUT_FILE_BYTES`].
     output_file_cap: u64,
+    session_output_cap: u64,
+    global_output_cap: u64,
+    total_spool_bytes: u64,
+    owner_spool_bytes: HashMap<String, u64>,
 
     /// Cgroup guard — owns the child cgroup's lifecycle.  Spawned processes
     /// are moved into this cgroup so their memory is bounded.
@@ -551,8 +769,12 @@ impl LocalTerminalActor {
         scope: crate::util::ProcessScope,
         shell_env_policy: Option<crate::util::ShellEnvironmentPolicy>,
     ) -> Self {
+        let (output_tx, output_rx) = mpsc::channel(1024);
         Self {
             cmd_rx,
+            output_tx,
+            output_rx,
+            stream_routes: HashMap::new(),
             cancel_token,
             scope,
             shell_env_policy,
@@ -562,6 +784,10 @@ impl LocalTerminalActor {
             completed_task_ttl,
             foreground_block_budget,
             output_file_cap,
+            session_output_cap: session_output_cap_from_env(),
+            global_output_cap: global_output_cap_from_env(),
+            total_spool_bytes: 0,
+            owner_spool_bytes: HashMap::new(),
             _cgroup_guard: cgroup_guard,
             memory_monitor,
             persistent_shell,
@@ -856,14 +1082,13 @@ impl LocalTerminalActor {
 
     /// Main actor loop
     async fn run(mut self) {
-        let mut ticker = tokio::time::interval(notification_interval());
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut supervisor_ticks = ExecutionSupervisor::global().subscribe();
 
         loop {
             tokio::select! {
                 // Bias towards commands (cancel, kill) over periodic ticking
                 // so that kill_foreground_commands is handled promptly even
-                // when poll_all_processes was slow (e.g. drain timeouts).
+                // when process lifecycle maintenance was slow (e.g. drain timeouts).
                 biased;
 
                 // Check for cancellation
@@ -884,15 +1109,17 @@ impl LocalTerminalActor {
                     }
                 }
 
-                // Periodic maintenance: check timeouts, read output, etc.
-                // Gated on live processes: the actor exists for the whole
-                // session lifetime, and an idle session must not wake 10x/sec
-                // to poll an empty map (one actor per open session/tab adds
-                // up). With the arm disabled the interval isn't polled, so no
-                // timer is registered at all; the first command that spawns a
-                // process re-enables it on the next loop iteration.
-                _ = ticker.tick(), if !self.processes.is_empty() => {
-                    self.poll_all_processes().await;
+                output = self.output_rx.recv() => {
+                    if let Some(output) = output {
+                        self.handle_output_event(output).await;
+                    }
+                }
+
+                // The process-wide ExecutionSupervisor owns the sole lifecycle
+                // clock. Idle actors do not poll this receiver; a newly active
+                // actor immediately consumes the latest bounded tick.
+                _ = supervisor_ticks.recv(), if !self.processes.is_empty() => {
+                    self.service_processes().await;
                 }
             }
         }
@@ -1021,9 +1248,29 @@ impl LocalTerminalActor {
         // Generate an internal ID — foreground callers never see this; the reply
         // goes back on the oneshot channel.
         let internal_id = uuid::Uuid::now_v7().to_string();
+        let execution_job = match ExecutionSupervisor::global().jobs().register(
+            internal_id.clone(),
+            ExecutionJobKind::Terminal,
+            request.owner_session_id.clone(),
+            Some(request.output_file.clone()),
+        ) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = reply.send(Err(ComputerError::io(error)));
+                return;
+            }
+        };
+        let file_handle = match open_output_file(&request.output_file).await {
+            Ok(file) => Some(file),
+            Err(error) => {
+                execution_job.fail(error.to_string());
+                let _ = reply.send(Err(ComputerError::from(error)));
+                return;
+            }
+        };
 
         let SpawnResult {
-            child,
+            mut child,
             process_group,
             state_dump_handle,
         } = match self
@@ -1032,10 +1279,15 @@ impl LocalTerminalActor {
         {
             Ok(r) => r,
             Err(e) => {
+                execution_job.fail(e.to_string());
                 let _ = reply.send(Err(e));
                 return;
             }
         };
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdout_closed = stdout.is_none();
+        let stderr_closed = stderr.is_none();
 
         // Move the child process into the memory-limited cgroup (best-effort).
         if let Some(pid) = child.id()
@@ -1044,26 +1296,24 @@ impl LocalTerminalActor {
             tracing::debug!("Failed to add pid {pid} to cgroup (non-fatal): {e}");
         }
 
-        // Open output file for writing (create parent dirs if needed)
-        let file_handle = match open_output_file(&request.output_file).await {
-            Ok(file) => Some(file),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to open output file {}: {}",
-                    request.output_file.display(),
-                    e
-                );
-                None
-            }
-        };
-
         let process_state = ProcessState {
+            stream_id: internal_id.clone(),
+            execution_job,
             child,
             process_group: Some(self.enroll_spawned(process_group)),
             output_buffer: Vec::new(),
             front_buffer: None,
             truncated: false,
             total_bytes: 0,
+            output_analysis: crate::util::output_filter::OutputAnalysis::default(),
+            pending_stream_chunks: BTreeMap::new(),
+            next_stream_sequence: 0,
+            stdout_closed,
+            stderr_closed,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            pending_exit_status: None,
+            pending_exit_at: None,
             exit_status: None,
             bg_status: BackgroundStatus::Foreground {
                 auto_bg_on_timeout: request.auto_background_on_timeout,
@@ -1077,6 +1327,7 @@ impl LocalTerminalActor {
             start_time: Instant::now(),
             output_file: request.output_file,
             file_handle,
+            last_file_flush: Instant::now(),
             command: request.command.clone(),
             display_command: request.display_command.clone(),
             cwd: request.working_directory.display().to_string(),
@@ -1110,7 +1361,10 @@ impl LocalTerminalActor {
                 },
             });
 
-        self.processes.insert(internal_id, process_state);
+        self.processes.insert(internal_id.clone(), process_state);
+        self.stream_routes
+            .insert(internal_id.clone(), internal_id.clone());
+        spawn_process_readers(&internal_id, stdout, stderr, &self.output_tx);
     }
 
     async fn handle_kill(&mut self, terminal_id: &str) -> KillOutcome {
@@ -1128,6 +1382,7 @@ impl LocalTerminalActor {
 
         // Kill the process and finalize its state in one shot.
         let outcome = kill_and_finalize(process).await;
+        process.finish_execution_job();
 
         // Resolve completion waiters immediately, so callers blocked on wait_for_completion() unblock right away.
         if let Some(waiters) = self.completion_waiters.remove(terminal_id) {
@@ -1150,9 +1405,32 @@ impl LocalTerminalActor {
         request: TerminalRunRequest,
         reply: oneshot::Sender<Result<BackgroundHandle, ComputerError>>,
     ) {
+        // Generate task_id — the actor owns the identity.
+        let task_id = uuid::Uuid::now_v7().to_string();
+        let execution_job = match ExecutionSupervisor::global().jobs().register(
+            task_id.clone(),
+            ExecutionJobKind::Terminal,
+            request.owner_session_id.clone(),
+            Some(request.output_file.clone()),
+        ) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = reply.send(Err(ComputerError::io(error)));
+                return;
+            }
+        };
+        let file_handle = match open_output_file(&request.output_file).await {
+            Ok(file) => Some(file),
+            Err(error) => {
+                execution_job.fail(error.to_string());
+                let _ = reply.send(Err(ComputerError::from(error)));
+                return;
+            }
+        };
+
         // Background commands fork the current shell state but don't update it on exit.
         let SpawnResult {
-            child,
+            mut child,
             process_group,
             state_dump_handle,
         } = match self
@@ -1161,10 +1439,15 @@ impl LocalTerminalActor {
         {
             Ok(r) => r,
             Err(e) => {
+                execution_job.fail(e.to_string());
                 let _ = reply.send(Err(e));
                 return;
             }
         };
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdout_closed = stdout.is_none();
+        let stderr_closed = stderr.is_none();
 
         // Move the child process into the memory-limited cgroup (best-effort).
         if let Some(pid) = child.id()
@@ -1173,29 +1456,24 @@ impl LocalTerminalActor {
             tracing::debug!("Failed to add pid {pid} to cgroup (non-fatal): {e}");
         }
 
-        // Open output file for writing (create parent dirs if needed)
-        let file_handle = match open_output_file(&request.output_file).await {
-            Ok(file) => Some(file),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to open output file {}: {}",
-                    request.output_file.display(),
-                    e
-                );
-                None
-            }
-        };
-
-        // Generate task_id — the actor owns the identity
-        let task_id = uuid::Uuid::now_v7().to_string();
-
         let process_state = ProcessState {
+            stream_id: task_id.clone(),
+            execution_job,
             child,
             process_group: Some(self.enroll_spawned(process_group)),
             output_buffer: Vec::new(),
             front_buffer: None,
             truncated: false,
             total_bytes: 0,
+            output_analysis: crate::util::output_filter::OutputAnalysis::default(),
+            pending_stream_chunks: BTreeMap::new(),
+            next_stream_sequence: 0,
+            stdout_closed,
+            stderr_closed,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            pending_exit_status: None,
+            pending_exit_at: None,
             exit_status: None,
             bg_status: BackgroundStatus::Backgrounded {
                 reason: BackgroundReason::Explicit,
@@ -1210,6 +1488,7 @@ impl LocalTerminalActor {
             start_time: Instant::now(),
             output_file: request.output_file.clone(),
             file_handle,
+            last_file_flush: Instant::now(),
             command: request.command.clone(),
             display_command: request.display_command.clone(),
             cwd: request.working_directory.display().to_string(),
@@ -1242,6 +1521,8 @@ impl LocalTerminalActor {
         // Store under task_id — this is the key that get_task/kill_task will use
         let pid = process_state.child.id();
         self.processes.insert(task_id.clone(), process_state);
+        self.stream_routes.insert(task_id.clone(), task_id.clone());
+        spawn_process_readers(&task_id, stdout, stderr, &self.output_tx);
 
         // Reply immediately
         let _ = reply.send(Ok(BackgroundHandle {
@@ -1286,7 +1567,7 @@ impl LocalTerminalActor {
 
         // Mark so the notification bridge skips auto-wake for this task.
         // If the waiter is cancelled before receiving the result, this flag
-        // is cleared again (timeout expiry in `poll_all_processes` step 2,
+        // is cleared again (timeout expiry in `service_processes` step 2,
         // or undelivered completion in step 1) so auto-wake still fires.
         let prev_block_waited = process.block_waited;
         process.block_waited = true;
@@ -1315,8 +1596,136 @@ impl LocalTerminalActor {
         // Return immediately — actor loop resumes processing other commands.
     }
 
-    /// Poll all processes for output and completion
-    async fn poll_all_processes(&mut self) {
+    async fn handle_output_event(&mut self, event: ProcessOutputEvent) {
+        let (stream_id, closed_stream, read_error, sequenced_chunk) = match event {
+            ProcessOutputEvent::Chunk {
+                stream_id,
+                sequence,
+                chunk,
+            } => (stream_id, None, None, Some((sequence, chunk))),
+            ProcessOutputEvent::Closed { stream_id, stream } => {
+                (stream_id, Some(stream), None, None)
+            }
+            ProcessOutputEvent::ReadError {
+                stream_id,
+                stream,
+                message,
+            } => (stream_id, Some(stream), Some(message), None),
+        };
+        let Some(process_key) = self.stream_routes.get(&stream_id).cloned() else {
+            return;
+        };
+        let (bytes_added, owner, task_total) = {
+            let mut bytes_added = 0_u64;
+            let Some(process) = self.processes.get_mut(&process_key) else {
+                return;
+            };
+            if let Some(stream) = closed_stream {
+                match stream {
+                    OutputStream::Stdout => process.stdout_closed = true,
+                    OutputStream::Stderr => process.stderr_closed = true,
+                }
+            }
+            if let Some(message) = read_error {
+                tracing::debug!(
+                    task_id = process_key,
+                    stream = ?closed_stream,
+                    %message,
+                    "terminal stream reader stopped"
+                );
+            }
+            if let Some((sequence, chunk)) = sequenced_chunk {
+                process.pending_stream_chunks.insert(sequence, chunk);
+                while let Some(chunk) = process
+                    .pending_stream_chunks
+                    .remove(&process.next_stream_sequence)
+                {
+                    process.next_stream_sequence = process.next_stream_sequence.saturating_add(1);
+                    let length = u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX);
+                    match chunk.stream {
+                        OutputStream::Stdout => {
+                            process.stdout_bytes = process.stdout_bytes.saturating_add(length)
+                        }
+                        OutputStream::Stderr => {
+                            process.stderr_bytes = process.stderr_bytes.saturating_add(length)
+                        }
+                    }
+                    process.output_analysis.push(&chunk.bytes);
+                    process.output_buffer.extend_from_slice(&chunk.bytes);
+                    process.total_bytes = process.total_bytes.saturating_add(chunk.bytes.len());
+                    if let Some(file) = process.file_handle.as_mut() {
+                        let _ = file.write_all(&chunk.bytes).await;
+                        if process.last_file_flush.elapsed() >= OUTPUT_FILE_FLUSH_INTERVAL {
+                            let _ = file.flush().await;
+                            process.last_file_flush = Instant::now();
+                        }
+                    }
+                    bytes_added = bytes_added.saturating_add(length);
+                }
+                process.maybe_truncate();
+            }
+            if process.stdout_closed
+                && process.stderr_closed
+                && let Some(file) = process.file_handle.as_mut()
+            {
+                let _ = file.flush().await;
+                process.last_file_flush = Instant::now();
+            }
+            (
+                bytes_added,
+                process.owner_session_id.clone(),
+                u64::try_from(process.total_bytes).unwrap_or(u64::MAX),
+            )
+        };
+        if bytes_added == 0 {
+            return;
+        }
+
+        self.total_spool_bytes = self.total_spool_bytes.saturating_add(bytes_added);
+        let owner_key = owner.unwrap_or_else(|| "<unowned>".to_string());
+        let owner_total = self.owner_spool_bytes.entry(owner_key).or_default();
+        *owner_total = owner_total.saturating_add(bytes_added);
+        let owner_total = *owner_total;
+        let global_total = PROCESS_SPOOL_BYTES
+            .fetch_add(bytes_added, Ordering::AcqRel)
+            .saturating_add(bytes_added);
+
+        let signal = if task_total > self.output_file_cap {
+            Some("output_limit")
+        } else if owner_total > self.session_output_cap {
+            Some("session_output_limit")
+        } else if global_total > self.global_output_cap {
+            Some("global_output_limit")
+        } else {
+            None
+        };
+        if let Some(signal) = signal
+            && let Some(process) = self.processes.get_mut(&process_key)
+            && process.exit_status.is_none()
+        {
+            tracing::warn!(
+                task_id = process_key,
+                task_total,
+                owner_total,
+                global_total,
+                signal,
+                "terminal spool limit exceeded; terminating process"
+            );
+            send_sigterm_to_group(process);
+            process.exit_status = Some(ExitStatus {
+                exit_code: None,
+                signal: Some(signal.to_string()),
+            });
+            process.end_wall_time = Some(std::time::SystemTime::now());
+            process.flush_and_truncate_output_file().await;
+            let result = Ok(process.to_result());
+            process.notify_waiters(result);
+        }
+    }
+
+    /// Poll all processes for deadlines, exit status, and task lifecycle.
+    /// stdout/stderr are consumed independently by persistent reader tasks.
+    async fn service_processes(&mut self) {
         // 0a. Check if the memory monitor detected a memory.high breach.
         //     If so, kill the *newest* running foreground process (kill the
         //     most recent command first).
@@ -1416,6 +1825,11 @@ impl LocalTerminalActor {
 
         for task_id in &task_ids {
             self.poll_process(task_id).await;
+        }
+        for process in self.processes.values() {
+            if process.exit_status.is_some() {
+                process.finish_execution_job();
+            }
         }
 
         // Once a child is reaped (`child.id()` is `None`), drop the actor's
@@ -1622,7 +2036,9 @@ impl LocalTerminalActor {
                 };
                 self.completed_task_snapshots.insert(id.clone(), snapshot);
             }
-            self.processes.remove(id);
+            if let Some(process) = self.processes.remove(id) {
+                self.stream_routes.remove(&process.stream_id);
+            }
         }
         // Cap the tombstone map by evicting the oldest entries.
         while self.completed_task_snapshots.len() > MAX_COMPLETED_TASK_SNAPSHOTS {
@@ -1643,6 +2059,20 @@ impl LocalTerminalActor {
         let Some(process) = self.processes.get_mut(terminal_id) else {
             return;
         };
+
+        if process.execution_job.is_cancelled() && process.exit_status.is_none() {
+            process.explicitly_killed = true;
+            send_sigterm_to_group(process);
+            process.exit_status = Some(ExitStatus {
+                exit_code: None,
+                signal: Some("killed".to_owned()),
+            });
+            process.end_wall_time = Some(std::time::SystemTime::now());
+            process.flush_and_truncate_output_file().await;
+            let result = Ok(process.to_result());
+            process.notify_waiters(result);
+            return;
+        }
 
         // If exit_status is already set (e.g., by timeout handler or external signal),
         // the process may still be running. Escalate to SIGKILL if needed, and drain
@@ -1671,77 +2101,6 @@ impl LocalTerminalActor {
             }
             return;
         }
-
-        // ── Non-blocking reads ──────────────────────────────────────────
-        //
-        // Read all *currently available* bytes from stdout and stderr using
-        // non-blocking `poll_read`.  This avoids the old 10 ms timeout-per-
-        // stream approach which cost 20 ms per process even when idle —
-        // with N processes that compounded to N×20 ms per tick, easily
-        // exceeding the 100 ms tick interval and delaying file writes.
-        //
-        // Data from both streams is collected into `new_bytes`, then written
-        // to the output file in a single batch + flush at the end.
-
-        let mut new_bytes: Vec<u8> = Vec::new();
-
-        // Read all available stdout (non-blocking)
-        let mut stdout_eof = false;
-        if let Some(stdout) = process.child.stdout.as_mut() {
-            loop {
-                let mut buf = [0u8; READ_BUFFER_SIZE];
-                match try_read_nonblocking(stdout, &mut buf) {
-                    Some(Ok(0)) => {
-                        stdout_eof = true;
-                        break;
-                    }
-                    Some(Ok(n)) => {
-                        new_bytes.extend_from_slice(&buf[..n]);
-                    }
-                    Some(Err(_)) => {
-                        stdout_eof = true;
-                        break;
-                    }
-                    None => break, // No data available right now — move on
-                }
-            }
-        }
-
-        // Read all available stderr (non-blocking)
-        let mut stderr_eof = false;
-        if let Some(stderr) = process.child.stderr.as_mut() {
-            loop {
-                let mut buf = [0u8; READ_BUFFER_SIZE];
-                match try_read_nonblocking(stderr, &mut buf) {
-                    Some(Ok(0)) => {
-                        stderr_eof = true;
-                        break;
-                    }
-                    Some(Ok(n)) => {
-                        new_bytes.extend_from_slice(&buf[..n]);
-                    }
-                    Some(Err(_)) => {
-                        stderr_eof = true;
-                        break;
-                    }
-                    None => break, // No data available right now — move on
-                }
-            }
-        }
-
-        // Batch write to file + flush so the output is visible to readers
-        // (e.g. `read_file` on the output_file from get_task_output).
-        if !new_bytes.is_empty() {
-            process.output_buffer.extend_from_slice(&new_bytes);
-            process.total_bytes += new_bytes.len();
-            if let Some(ref mut file) = process.file_handle {
-                let _ = file.write_all(&new_bytes).await;
-                let _ = file.flush().await;
-            }
-        }
-
-        // Truncate in-memory buffer if needed (file has full output)
-        process.maybe_truncate();
 
         // Send output chunk notification if there's new output since last tick.
         // This happens every ~100ms (the actor's tick interval).
@@ -1811,44 +2170,40 @@ impl LocalTerminalActor {
             return;
         }
 
-        // Check if process exited (both streams at EOF or process exited)
-        let process_done = stdout_eof && stderr_eof;
-        match process.child.try_wait() {
-            Ok(Some(status)) => {
-                // Process exited — drain any remaining stdout/stderr that arrived
-                // after the timeout-based reads above. This fixes a race where fast
-                // commands (e.g. `python3 -c "print('x')"`) exit before their pipe
-                // buffers are read, resulting in empty output.
-                drain_remaining_output(process).await;
-
-                process.exit_status = Some(extract_exit_status(status));
-                process.end_wall_time = Some(std::time::SystemTime::now());
-                process.flush_and_truncate_output_file().await;
-                let result = Ok(process.to_result());
-                process.notify_waiters(result);
+        if process.pending_exit_status.is_none() {
+            match process.child.try_wait() {
+                Ok(Some(status)) => {
+                    process.pending_exit_status = Some(extract_exit_status(status));
+                    process.pending_exit_at = Some(Instant::now());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    process.pending_exit_status = Some(ExitStatus {
+                        exit_code: None,
+                        signal: Some(format!("error: {error}")),
+                    });
+                    process.pending_exit_at = Some(Instant::now());
+                }
             }
-            Ok(None) if process_done => {
-                // Streams closed but process hasn't exited yet - wait a bit
-            }
-            Ok(None) => {
-                // Still running
-            }
-            Err(e) => {
-                process.exit_status = Some(ExitStatus {
-                    exit_code: None,
-                    signal: Some(format!("error: {}", e)),
-                });
-                process.end_wall_time = Some(std::time::SystemTime::now());
-                process.flush_and_truncate_output_file().await;
-                let result = Ok(process.to_result());
-                process.notify_waiters(result);
-            }
+        }
+        let streams_closed = process.stdout_closed && process.stderr_closed;
+        let drain_deadline_reached = process
+            .pending_exit_at
+            .is_some_and(|observed| observed.elapsed() >= DRAIN_TIMEOUT);
+        if process.pending_exit_status.is_some() && (streams_closed || drain_deadline_reached) {
+            process.exit_status = process.pending_exit_status.take();
+            process.end_wall_time = Some(std::time::SystemTime::now());
+            process.flush_and_truncate_output_file().await;
+            process.drained = streams_closed;
+            let result = Ok(process.to_result());
+            process.notify_waiters(result);
         }
     }
 
     async fn shutdown_all(&mut self) {
         for (_, process) in self.processes.iter_mut() {
             send_sigkill_to_group(process);
+            process.execution_job.cancel();
             // Abort the state dump reader so its spawn_blocking thread
             // doesn't outlive the actor.
             if let Some(handle) = process.state_dump_handle.take() {
@@ -1856,6 +2211,7 @@ impl LocalTerminalActor {
             }
         }
         self.processes.clear();
+        self.stream_routes.clear();
     }
 
     /// Transition a foreground process to background (shared by auto-timeout
@@ -1869,13 +2225,15 @@ impl LocalTerminalActor {
         let result = Ok(process.to_result());
         process.notify_waiters(result);
         let tool_call_id = process.tool_call_id.clone();
+        let stream_id = process.stream_id.clone();
 
         tracing::info!(
             tool_call_id = %tool_call_id,
             ?reason,
             "Foreground command transitioned to background"
         );
-        self.processes.insert(tool_call_id, process);
+        self.processes.insert(tool_call_id.clone(), process);
+        self.stream_routes.insert(stream_id, tool_call_id);
         true
     }
 
@@ -1944,7 +2302,9 @@ impl LocalTerminalActor {
 
         // Remove dead foreground entries
         for id in &fg_ids {
-            self.processes.remove(id);
+            if let Some(process) = self.processes.remove(id) {
+                self.stream_routes.remove(&process.stream_id);
+            }
         }
     }
 
@@ -1983,7 +2343,9 @@ impl LocalTerminalActor {
         }
 
         for id in &fg_ids {
-            self.processes.remove(id);
+            if let Some(process) = self.processes.remove(id) {
+                self.stream_routes.remove(&process.stream_id);
+            }
         }
     }
 
@@ -2618,31 +2980,6 @@ impl TerminalBackend for LocalTerminalBackend {
 // Helper functions
 // ============================================================================
 
-/// Non-blocking read: returns `Some(Ok(n))` if data is available,
-/// `Some(Err(e))` on I/O error, `Some(Ok(0))` on EOF, or `None` if
-/// no data is ready right now.
-///
-/// Uses `Waker::noop()` — safe because the actor runs a periodic
-/// polling loop and doesn't need wake-up notifications from the pipe.
-/// This eliminates the 10 ms timeout-per-read that previously caused
-/// O(N × 20 ms) per-tick overhead for N processes.
-fn try_read_nonblocking(
-    reader: &mut (impl tokio::io::AsyncRead + Unpin),
-    buf: &mut [u8],
-) -> Option<std::io::Result<usize>> {
-    use std::pin::Pin;
-    use std::task::{Context, Poll, Waker};
-    use tokio::io::ReadBuf;
-
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    let mut read_buf = ReadBuf::new(buf);
-    match Pin::new(reader).poll_read(&mut cx, &mut read_buf) {
-        Poll::Ready(Ok(())) => Some(Ok(read_buf.filled().len())),
-        Poll::Ready(Err(e)) => Some(Err(e)),
-        Poll::Pending => None,
-    }
-}
 /// Soft-kill the process tree. Non-blocking, fire-and-forget.
 /// The actor's poll loop will reap the process on the next tick.
 fn send_sigterm_to_group(process: &ProcessState) {
@@ -2683,6 +3020,7 @@ async fn drain_remaining_output(process: &mut ProcessState) {
                 match stdout.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        process.output_analysis.push(&buf[..n]);
                         process.output_buffer.extend_from_slice(&buf[..n]);
                         process.total_bytes += n;
                         if let Some(ref mut file) = process.file_handle {
@@ -2699,6 +3037,7 @@ async fn drain_remaining_output(process: &mut ProcessState) {
                 match stderr.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        process.output_analysis.push(&buf[..n]);
                         process.output_buffer.extend_from_slice(&buf[..n]);
                         process.total_bytes += n;
                         if let Some(ref mut file) = process.file_handle {
@@ -3269,6 +3608,23 @@ mod tests {
             owner_session_id: None,
             description: None,
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_file_preview_reads_head_and_tail_without_loading_middle() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let content = format!("HEAD{}TAIL", "x".repeat(64 * 1024));
+        tokio::fs::write(temp.path(), &content).await.unwrap();
+        let preview = read_bounded_file_preview(temp.path(), 128).await.unwrap();
+        assert!(preview.starts_with("HEAD"));
+        assert!(preview.ends_with("TAIL"));
+        assert!(preview.contains("output file middle omitted"));
+        assert!(preview.len() < 512);
+        assert_eq!(
+            tokio::fs::metadata(temp.path()).await.unwrap().len(),
+            content.len() as u64,
+            "previewing must not truncate the complete output artifact"
+        );
     }
 
     #[tokio::test]
@@ -3887,6 +4243,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_job_uses_shared_registry_lifecycle_and_artifact() {
+        let backend = LocalTerminalBackend::new();
+        let request = make_request("printf registry-ok");
+        let output_file = request.output_file.clone();
+        let handle = backend.run_background(request).await.unwrap();
+        let registry_job = ExecutionSupervisor::global()
+            .jobs()
+            .get(&handle.task_id)
+            .expect("terminal job must be registered");
+        assert_eq!(registry_job.snapshot().kind, ExecutionJobKind::Terminal);
+
+        let result = backend
+            .wait_for_completion(&handle.task_id, Some(Duration::from_secs(5)))
+            .await
+            .expect("terminal task must remain queryable");
+        assert!(result.completed);
+
+        let registry_snapshot = registry_job.snapshot();
+        assert_eq!(
+            registry_snapshot.lifecycle,
+            crate::native::job_registry::ExecutionJobLifecycle::Completed
+        );
+        assert_eq!(
+            registry_snapshot.artifact.as_deref(),
+            Some(output_file.as_path())
+        );
+        assert_eq!(registry_snapshot.payload["exit_code"].as_i64(), Some(0));
+        assert_eq!(
+            tokio::fs::read_to_string(&output_file).await.unwrap(),
+            "registry-ok"
+        );
+        let _ = tokio::fs::remove_file(output_file).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "explicit 100-process performance gate; run on the release target host"]
+    async fn hundred_processes_with_twenty_writers_stay_responsive() {
+        let backend = LocalTerminalBackend::new();
+        let temp = tempfile::tempdir().unwrap();
+        let mut handles = Vec::with_capacity(100);
+        for index in 0..100 {
+            let command = if index < 20 {
+                "i=0; while [ $i -lt 100 ]; do printf x; i=$((i+1)); sleep 0.01; done; sleep 2"
+            } else {
+                "sleep 3"
+            };
+            let mut request = make_request(command);
+            request.output_file = temp.path().join(format!("{index}.log"));
+            handles.push(backend.run_background(request).await.unwrap());
+        }
+
+        let target = &handles[0].task_id;
+        let mut samples = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let started = Instant::now();
+            assert!(backend.get_task(target).await.is_some());
+            samples.push(started.elapsed());
+            tokio::task::yield_now().await;
+        }
+        samples.sort_unstable();
+        let p99 = samples[98];
+        eprintln!("terminal supervisor event-loop p99: {p99:?}");
+        assert!(
+            p99 < Duration::from_millis(50),
+            "terminal supervisor p99 event-loop delay was {p99:?}"
+        );
+
+        backend.cancel();
+    }
+
+    #[tokio::test]
     async fn test_kill_background_task() {
         let backend = LocalTerminalBackend::new();
 
@@ -4108,7 +4535,7 @@ mod tests {
 
     /// Verify retention cap constant and that small output is not truncated.
     #[tokio::test]
-    async fn output_file_truncated_after_exit() {
+    async fn output_file_remains_complete_after_exit() {
         let backend = LocalTerminalBackend::new();
         let tmp = tempfile::TempDir::new().unwrap();
         let output_file = tmp.path().join("output.log");
@@ -4133,14 +4560,11 @@ mod tests {
         let result = backend.run(request).await.unwrap();
         assert_eq!(result.exit_code, Some(0));
 
-        // Output is under 64 MB, so file should have full content (no truncation).
         let file_size = tokio::fs::metadata(&output_file).await.unwrap().len();
         assert!(
             file_size >= 190_000,
             "output file should have full ~200 KB, got {file_size}"
         );
-        // Verify the retention cap constant is reasonable.
-        assert_eq!(MAX_RETAINED_OUTPUT_FILE_BYTES, 64 * 1024 * 1024);
     }
 
     #[tokio::test]
@@ -4984,7 +5408,7 @@ mod tests {
     /// IMPORTANT: this test must NOT call `wait_for_completion` before
     /// eviction, because that would set `process.block_waited=true` on
     /// the live process and the eviction snapshot at
-    /// `poll_all_processes` step 4 would copy `block_waited: true` into
+    /// `service_processes` step 4 would copy `block_waited: true` into
     /// the tombstone (so the late-wait assertion would trivially pass
     /// even with Fix 3 reverted). Sequence below keeps the tombstone
     /// born with `block_waited=false` so the test actually exercises

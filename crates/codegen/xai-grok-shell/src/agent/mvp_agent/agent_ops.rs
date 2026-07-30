@@ -36,6 +36,177 @@ fn should_warn_missing_session(ctx: MissingSessionCtx) -> bool {
     }
 }
 impl MvpAgent {
+    fn prewarm_local_cooperation_models(&self) {
+        let (router, memory_embedding) = {
+            let config = self.cfg.borrow();
+            (
+                config.models.router.clone(),
+                config
+                    .memory_config
+                    .as_ref()
+                    .filter(|memory| memory.enabled)
+                    .map(|memory| memory.embedding.clone()),
+            )
+        };
+        if !router.enabled {
+            return;
+        }
+        let Ok((planner, executor, reviewer)) =
+            crate::agent::turn_coordinator::model_roles(&router)
+        else {
+            return;
+        };
+        let mut role_ids = vec![planner, executor, reviewer];
+        role_ids.sort();
+        role_ids.dedup();
+        let configs = role_ids
+            .into_iter()
+            .filter_map(|model_id| {
+                let entry = self
+                    .resolve_model_id(&acp::ModelId::new(model_id.clone()))
+                    .ok()?;
+                let config = self.prepare_sampling_config_for_model(&entry, None);
+                config.base_url.starts_with("litert-lm://").then_some(config)
+            })
+            .collect::<Vec<_>>();
+        if configs.is_empty() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                "local cooperation models could not prewarm because no Tokio runtime is active"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            let results = futures::future::join_all(
+                configs
+                    .iter()
+                    .map(xai_grok_sampler::prewarm_local_model),
+            )
+            .await;
+            for (config, result) in configs.iter().zip(results) {
+                if let Err(error) = result {
+                    tracing::warn!(
+                        model = %config.model,
+                        %error,
+                        "local cooperation model prewarm failed"
+                    );
+                }
+            }
+            if let Some(memory_embedding) = memory_embedding {
+                let _ = xai_grok_memory::embedding::prewarm_local(&memory_embedding);
+            }
+        });
+    }
+
+    /// Select and apply one model for an entire user turn. This runs before
+    /// `SessionCommand::Prompt` enters the actor, so tool continuations cannot
+    /// cross the chat/analysis boundary midway through a turn.
+    pub(super) async fn apply_contextual_model_route(
+        &self,
+        arguments: &mut acp::PromptRequest,
+        handle: &SessionHandle,
+    ) -> Result<(), acp::Error> {
+        let config = self.cfg.borrow().models.router.clone();
+        if !config.enabled {
+            return Ok(());
+        }
+        let prompt_id = arguments
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("promptId"))
+            .and_then(|value| value.as_str());
+        if prompt_id.is_some_and(|id| crate::session::PromptOrigin::from_prompt_id(id).is_synthetic())
+        {
+            return Ok(());
+        }
+
+        let cooperation_directive =
+            crate::agent::turn_coordinator::take_cooperation_directive(&mut arguments.prompt);
+        let directive = crate::agent::turn_classifier::take_directive(&mut arguments.prompt);
+        let prompt_text = crate::agent::turn_classifier::prompt_text(&arguments.prompt);
+        let has_non_text_content = arguments
+            .prompt
+            .iter()
+            .any(|block| !matches!(block, acp::ContentBlock::Text(_)));
+        let has_output_schema = arguments
+            .meta
+            .as_ref()
+            .is_some_and(|meta| meta.contains_key("outputSchema"));
+        let decision = directive.unwrap_or_else(|| {
+            crate::agent::turn_classifier::decide(
+                &config,
+                &prompt_text,
+                has_non_text_content,
+                has_output_schema,
+            )
+        });
+        let cooperation_mode =
+            crate::agent::turn_coordinator::mode_for(decision.clone(), cooperation_directive);
+        let (planner, executor, reviewer) =
+            crate::agent::turn_coordinator::model_roles(&config).map_err(|message| {
+                acp::Error::invalid_params().data(format!("[models.router]: {message}"))
+            })?;
+        crate::agent::turn_coordinator::stamp(
+            &mut arguments.prompt,
+            cooperation_mode,
+            &planner,
+            &executor,
+            &reviewer,
+        );
+        let Some(route) = decision.route else {
+            xai_grok_telemetry::unified_log::info(
+                "local model router: kept current model",
+                Some(arguments.session_id.0.as_ref()),
+                Some(serde_json::json!({
+                    "route": "current",
+                    "reason": decision.reason,
+                    "current_model": handle.model_id.0.as_ref(),
+                    "prompt_chars": prompt_text.chars().count(),
+                })),
+            );
+            return Ok(());
+        };
+        let target = if cooperation_mode.plans() {
+            executor.as_str()
+        } else {
+            crate::agent::turn_classifier::model_for(&config, route).ok_or_else(|| {
+                acp::Error::invalid_params().data(format!(
+                    "[models.router].{}_model must be set when routing is enabled",
+                    route.as_str()
+                ))
+            })?
+        };
+        let target_id = acp::ModelId::new(target.to_owned());
+        self.resolve_model_id(&target_id).map_err(|_| {
+            acp::Error::invalid_params().data(format!(
+                "[models.router].{}_model references unknown model {target:?}",
+                route.as_str()
+            ))
+        })?;
+        xai_grok_telemetry::unified_log::info(
+            "local model router: decision",
+            Some(arguments.session_id.0.as_ref()),
+            Some(serde_json::json!({
+                "route": route.as_str(),
+                "reason": decision.reason,
+                "previous_model": handle.model_id.0.as_ref(),
+                "target_model": target,
+                "prompt_chars": prompt_text.chars().count(),
+            })),
+        );
+        if handle.model_id == target_id {
+            return Ok(());
+        }
+        crate::agent::handlers::model_switch::apply(
+            self,
+            acp::SetSessionModelRequest::new(arguments.session_id.clone(), target_id),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub fn reload_skills_all_sessions(&self) -> usize {
         let session_ids: Vec<agent_client_protocol::SessionId> = self
             .sessions
@@ -84,6 +255,17 @@ impl MvpAgent {
         &self,
         primary: &SamplingConfig,
     ) -> Result<(OaiCompatClient, String), acp::Error> {
+        // Session-title generation is deterministic for local inference (the
+        // SamplingClient helper path is HTTP-only). Preserve the active local
+        // config so constructing the helper cannot emit credential warnings or
+        // accidentally pair another model slug with this model file.
+        if primary.base_url.starts_with("litert-lm://") {
+            let model = primary.model.clone();
+            let client =
+                OaiCompatClient::new(primary.clone()).map_err(map_sampling_err_to_acp)?;
+            return Ok((client, model));
+        }
+
         let slug = self.resolve_session_summary_model();
         let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
         let models = self.models_manager.models();
@@ -1985,6 +2167,7 @@ impl MvpAgent {
         if let Some(ref dk) = instance.cfg.borrow().endpoints.deployment_key {
             crate::auth::credential_provider::wire_otel_deployment_key(dk.clone());
         }
+        instance.prewarm_local_cooperation_models();
         instance
     }
     /// Handle `x.ai/internal/evict_sessions` — the leader server tells us a
@@ -2814,7 +2997,7 @@ impl MvpAgent {
                 .models_manager
                 .models()
                 .values()
-                .any(|m| m.has_own_credentials())
+                .any(|m| m.has_own_credentials() || m.is_local_inference())
             {
                 tracing::warn!("No credentials found: no login token and no model api_key/env_key");
                 xai_grok_telemetry::unified_log::warn(
@@ -3511,6 +3694,7 @@ impl MvpAgent {
         } else {
             session_env.extend(crate::terminal::color_env());
         }
+        let tool_output_budget = self.cfg.borrow().toolset.output_budget.clone();
         let mut tool_ctx = ToolContext::with_preloaded_env(
                 cwd.clone(),
                 Some(self.gateway.clone()),
@@ -3520,7 +3704,8 @@ impl MvpAgent {
                 hunk_tracker_handle,
                 session_env,
             )
-            .with_hunk_tracking_enabled(hunk_tracking_enabled);
+            .with_hunk_tracking_enabled(hunk_tracking_enabled)
+            .with_tool_output_budget(tool_output_budget);
         tool_ctx.process_scope = Some(ProcessScope::new());
         let workspace_ops = self
             .resolve_workspace_ops()

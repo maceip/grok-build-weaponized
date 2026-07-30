@@ -848,7 +848,7 @@ mod tests {
         let path = save_project_workflow(&linked, "safe", &script("safe")).unwrap();
         assert_eq!(
             dunce::canonicalize(path).unwrap(),
-            project.join(".grok/workflows/safe.rhai")
+            dunce::canonicalize(project.join(".grok/workflows/safe.rhai")).unwrap()
         );
     }
 

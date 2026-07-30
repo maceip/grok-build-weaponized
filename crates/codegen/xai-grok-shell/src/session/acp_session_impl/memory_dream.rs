@@ -132,6 +132,16 @@ impl SessionActor {
             );
             return;
         }
+        let capacity = xai_grok_sampler::litert_lm::local_runtime_capacity();
+        if capacity.queue_depth != 0 || capacity.active_requests != 0 {
+            tracing::debug!(
+                target: xai_grok_telemetry::memory_log::TARGET,
+                queue_depth = capacity.queue_depth,
+                active_requests = capacity.active_requests,
+                "MEMORY_DREAM_DEFER: local interactive runtime is not idle"
+            );
+            return;
+        }
 
         use crate::session::memory::dream::*;
 
@@ -335,7 +345,10 @@ impl SessionActor {
             ],
             model: Some(model),
             x_grok_conv_id: Some(format!("dream-{}", uuid::Uuid::new_v4())),
-            x_grok_req_id: Some(format!("xai-dream-{}", uuid::Uuid::new_v4())),
+            x_grok_req_id: Some(format!(
+                "grok-stage-embedding:dream:{}",
+                uuid::Uuid::new_v4()
+            )),
             x_grok_session_id: Some(session_id),
             x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
             ..Default::default()
@@ -507,9 +520,7 @@ impl SessionActor {
                                 is_semantically_duplicate(
                                     &content,
                                     &index,
-                                    provider.as_ref().map(|p| {
-                                        p as &dyn crate::session::memory::embedding::EmbeddingProvider
-                                    }),
+                                    provider.as_deref(),
                                     threshold,
                                 )
                                 .await

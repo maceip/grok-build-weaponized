@@ -6,7 +6,13 @@
 //! Embeddings are cached in the sqlite-vec `chunks_vec` table — the vec0
 //! virtual table IS the cache. No separate cache needed.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
 use async_trait::async_trait;
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use xai_grok_runtime::{ResourceClass, ResourceGovernor, ResourceLease};
 
 /// Maximum retry attempts for transient API errors (429, 5xx).
 const MAX_RETRIES: usize = 3;
@@ -24,13 +30,382 @@ pub trait EmbeddingProvider: Send + Sync {
     async fn embed_batch(
         &self,
         texts: &[&str],
-    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>>;
+    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Embed retrieval queries. Providers with asymmetric query/document
+    /// prompts override this; symmetric providers use `embed_batch`.
+    async fn embed_query(
+        &self,
+        query: &str,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+        self.embed_batch(&[query])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "embedding provider returned no query vector".into())
+    }
 
     /// The model name used for embeddings.
     fn model_name(&self) -> &str;
 
     /// The dimensionality of the embedding vectors.
     fn dimensions(&self) -> usize;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LocalEmbeddingProfile {
+    EmbeddingGemma,
+    Qwen3,
+}
+
+impl LocalEmbeddingProfile {
+    fn from_model(model: &str) -> Option<Self> {
+        let model = model.to_ascii_lowercase();
+        if model.contains("embeddinggemma") || model.contains("embedding-gemma") {
+            Some(Self::EmbeddingGemma)
+        } else if model.contains("qwen3") {
+            Some(Self::Qwen3)
+        } else {
+            None
+        }
+    }
+
+    fn model_name(self) -> &'static str {
+        match self {
+            Self::EmbeddingGemma => "embeddinggemma-300m-q4",
+            Self::Qwen3 => "qwen3-embedding-0.6b-metal",
+        }
+    }
+
+    fn maximum_dimensions(self) -> usize {
+        match self {
+            Self::EmbeddingGemma => 768,
+            Self::Qwen3 => 1024,
+        }
+    }
+
+    fn estimated_resident_bytes(self) -> u64 {
+        const MIB: u64 = 1024 * 1024;
+        match self {
+            // Includes quantized weights, tokenizer state, and ORT workspaces.
+            Self::EmbeddingGemma => 512 * MIB,
+            // F16 weights plus Metal execution workspaces.
+            Self::Qwen3 => 1536 * MIB,
+        }
+    }
+}
+
+enum LocalModel {
+    EmbeddingGemma(TextEmbedding),
+    #[cfg(feature = "high-recall-embeddings")]
+    Qwen3(fastembed::Qwen3TextEmbedding),
+}
+
+impl LocalModel {
+    fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        match self {
+            Self::EmbeddingGemma(model) => model
+                .embed(texts, Some(32))
+                .map_err(|error| error.to_string()),
+            #[cfg(feature = "high-recall-embeddings")]
+            Self::Qwen3(model) => {
+                let texts = texts.iter().map(String::as_str).collect::<Vec<_>>();
+                model.embed(&texts).map_err(|error| error.to_string())
+            }
+        }
+    }
+}
+
+enum LocalModelState {
+    Loading,
+    Ready {
+        model: LocalModel,
+        _lease: ResourceLease,
+    },
+    Failed(String),
+}
+
+struct LocalEmbeddingInner {
+    profile: LocalEmbeddingProfile,
+    dimensions: usize,
+    state: Mutex<LocalModelState>,
+    busy: AtomicBool,
+}
+
+/// Process-shared, non-blocking local embedding provider.
+///
+/// Model loading happens once in the background. Interactive retrieval never
+/// waits for a load or another embedding batch: `Loading` and `Busy` are
+/// returned immediately so the caller can continue with FTS5.
+#[derive(Clone)]
+pub struct LocalEmbeddingProvider {
+    inner: Arc<LocalEmbeddingInner>,
+}
+
+impl LocalEmbeddingProvider {
+    pub fn from_config(config: &xai_grok_config_types::MemoryEmbeddingConfig) -> Option<Self> {
+        let model = config.model.as_deref()?;
+        let profile = LocalEmbeddingProfile::from_model(model)?;
+        let dimensions = config.dimensions.min(profile.maximum_dimensions()).max(1);
+        let key = (profile, dimensions);
+        static REGISTRY: OnceLock<
+            Mutex<HashMap<(LocalEmbeddingProfile, usize), Weak<LocalEmbeddingInner>>>,
+        > = OnceLock::new();
+        let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(inner) = registry.get(&key).and_then(Weak::upgrade) {
+            return Some(Self { inner });
+        }
+        let inner = Arc::new(LocalEmbeddingInner {
+            profile,
+            dimensions,
+            state: Mutex::new(LocalModelState::Loading),
+            busy: AtomicBool::new(false),
+        });
+        let weak = Arc::downgrade(&inner);
+        ResourceGovernor::global().register_reclaimer(
+            ResourceClass::Embedding,
+            Arc::new(move || {
+                let Some(inner) = weak.upgrade() else {
+                    return 0;
+                };
+                if inner.busy.load(Ordering::Acquire) {
+                    return 0;
+                }
+                let mut state = inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let previous = std::mem::replace(
+                    &mut *state,
+                    LocalModelState::Failed(
+                        "local embedding model was evicted under memory pressure".to_string(),
+                    ),
+                );
+                match previous {
+                    LocalModelState::Ready { _lease: lease, .. } => {
+                        let bytes = lease.bytes();
+                        drop(lease);
+                        bytes
+                    }
+                    other => {
+                        *state = other;
+                        0
+                    }
+                }
+            }),
+        );
+        registry.insert(key, Arc::downgrade(&inner));
+        drop(registry);
+        start_local_model_load(Arc::clone(&inner));
+        Some(Self { inner })
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(
+            *self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            LocalModelState::Ready { .. }
+        )
+    }
+
+    fn prepare(&self, texts: &[&str], query: bool) -> Vec<String> {
+        texts
+            .iter()
+            .map(|text| match (self.inner.profile, query) {
+                (LocalEmbeddingProfile::EmbeddingGemma, true) => {
+                    format!("task: search result | query: {text}")
+                }
+                (LocalEmbeddingProfile::EmbeddingGemma, false) => {
+                    format!("title: none | text: {text}")
+                }
+                (LocalEmbeddingProfile::Qwen3, true) => {
+                    format!("Instruct: Retrieve relevant workspace evidence\nQuery: {text}")
+                }
+                (LocalEmbeddingProfile::Qwen3, false) => (*text).to_string(),
+            })
+            .collect()
+    }
+
+    async fn embed_local(
+        &self,
+        texts: &[&str],
+        query: bool,
+    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self
+            .inner
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err("local embedding model is busy".into());
+        }
+        let prepared = self.prepare(texts, query);
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            struct BusyReset(Arc<LocalEmbeddingInner>);
+            impl Drop for BusyReset {
+                fn drop(&mut self) {
+                    self.0.busy.store(false, Ordering::Release);
+                }
+            }
+            let _reset = BusyReset(Arc::clone(&inner));
+            let mut state = inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let model = match &mut *state {
+                LocalModelState::Loading => {
+                    return Err("local embedding model is still loading".to_string());
+                }
+                LocalModelState::Failed(error) => return Err(error.clone()),
+                LocalModelState::Ready { model, .. } => model,
+            };
+            let mut embeddings = model.embed(&prepared)?;
+            for embedding in &mut embeddings {
+                truncate_and_normalize(embedding, inner.dimensions)?;
+            }
+            Ok(embeddings)
+        })
+        .await
+        .map_err(|error| format!("local embedding task failed: {error}"))?
+        .map_err(Into::into)
+    }
+}
+
+/// Start the configured local embedding model load without waiting for model
+/// materialization. Returns `false` for non-local/off profiles.
+pub fn prewarm_local(config: &xai_grok_config_types::MemoryEmbeddingConfig) -> bool {
+    LocalEmbeddingProvider::from_config(config).is_some()
+}
+
+fn start_local_model_load(inner: Arc<LocalEmbeddingInner>) {
+    let load = move || {
+        let governor = ResourceGovernor::global();
+        let result = if governor.snapshot().soft_pressure {
+            Err("local embedding load deferred by memory pressure".to_string())
+        } else {
+            governor
+                .reserve(
+                    ResourceClass::Embedding,
+                    inner.profile.estimated_resident_bytes(),
+                )
+                .map_err(|error| error.to_string())
+                .and_then(|lease| {
+                    load_local_model(inner.profile).map(|model| LocalModelState::Ready {
+                        model,
+                        _lease: lease,
+                    })
+                })
+        };
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *state = match result {
+            Ok(ready) => ready,
+            Err(error) => LocalModelState::Failed(error),
+        };
+    };
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn_blocking(load);
+    } else {
+        std::thread::Builder::new()
+            .name("grok-local-embedding-load".to_string())
+            .spawn(load)
+            .ok();
+    }
+}
+
+fn load_local_model(profile: LocalEmbeddingProfile) -> Result<LocalModel, String> {
+    match profile {
+        LocalEmbeddingProfile::EmbeddingGemma => {
+            let options = TextInitOptions::new(EmbeddingModel::EmbeddingGemma300MQ4)
+                .with_show_download_progress(false)
+                .with_max_length(2048);
+            TextEmbedding::try_new(options)
+                .map(LocalModel::EmbeddingGemma)
+                .map_err(|error| error.to_string())
+        }
+        LocalEmbeddingProfile::Qwen3 => load_qwen3_model(),
+    }
+}
+
+#[cfg(feature = "high-recall-embeddings")]
+fn load_qwen3_model() -> Result<LocalModel, String> {
+    let device = candle_core::Device::new_metal(0).map_err(|error| error.to_string())?;
+    fastembed::Qwen3TextEmbedding::from_hf(
+        "Qwen/Qwen3-Embedding-0.6B",
+        &device,
+        candle_core::DType::F16,
+        32_768,
+    )
+    .map(LocalModel::Qwen3)
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(not(feature = "high-recall-embeddings"))]
+fn load_qwen3_model() -> Result<LocalModel, String> {
+    Err("Qwen3 local embeddings require the high-recall-embeddings build feature".to_string())
+}
+
+fn truncate_and_normalize(embedding: &mut Vec<f32>, dimensions: usize) -> Result<(), String> {
+    if embedding.len() < dimensions {
+        return Err(format!(
+            "embedding dimension mismatch: model returned {}, configured {dimensions}",
+            embedding.len()
+        ));
+    }
+    embedding.truncate(dimensions);
+    let norm = embedding
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if !norm.is_finite() || norm <= f32::EPSILON {
+        return Err("embedding model returned a non-normalizable vector".to_string());
+    }
+    for value in embedding {
+        *value /= norm;
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl EmbeddingProvider for LocalEmbeddingProvider {
+    async fn embed_batch(
+        &self,
+        texts: &[&str],
+    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>> {
+        self.embed_local(texts, false).await
+    }
+
+    async fn embed_query(
+        &self,
+        query: &str,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+        self.embed_local(&[query], true)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "local embedding model returned no query vector".into())
+    }
+
+    fn model_name(&self) -> &str {
+        self.inner.profile.model_name()
+    }
+
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions
+    }
 }
 
 /// API-based embedding provider using an OpenAI-compatible embeddings endpoint.
@@ -106,7 +481,7 @@ impl EmbeddingProvider for ApiEmbeddingProvider {
     async fn embed_batch(
         &self,
         texts: &[&str],
-    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
@@ -225,7 +600,7 @@ impl EmbeddingProvider for MockEmbeddingProvider {
     async fn embed_batch(
         &self,
         texts: &[&str],
-    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(texts
             .iter()
             .map(|text| {

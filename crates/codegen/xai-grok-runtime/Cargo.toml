@@ -1,0 +1,36 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-runtime"
+version = "0.1.0"
+edition.workspace = true
+description = "Supervised local model runtime, admission control, and native worker protocol"
+
+[dependencies]
+xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
+
+chrono = { workspace = true, features = ["serde"] }
+blake3 = { workspace = true }
+command-fds = { version = "0.3.2", features = ["tokio"] }
+libc = { workspace = true }
+libloading = "0.8.9"
+percent-encoding = "2"
+rmp-serde = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v4"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = { workspace = true }
+
+[[bin]]
+name = "grok-local-runtime-worker"
+path = "src/bin/grok-local-runtime-worker.rs"
+
+[lints]
+workspace = true

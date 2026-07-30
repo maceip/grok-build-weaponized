@@ -287,6 +287,7 @@ fn push_interactive_login(
 /// ACP session auth method. Use `is_session_based_method` for classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethodKind {
+    LocalInference,
     XaiApiKey,
     CachedToken,
     GrokCom,
@@ -297,6 +298,7 @@ pub enum AuthMethodKind {
 impl AuthMethodKind {
     pub fn from_id(id: &acp::AuthMethodId) -> Self {
         match id.0.as_ref() {
+            LOCAL_INFERENCE_METHOD_ID => Self::LocalInference,
             XAI_API_KEY_METHOD_ID => Self::XaiApiKey,
             CACHED_TOKEN_AUTH_METHOD_ID => Self::CachedToken,
             GROK_COM_METHOD_ID => Self::GrokCom,
@@ -423,6 +425,20 @@ pub const PREFERRED_OIDC_UNAVAILABLE: &str =
     "preferred_method=oidc but no session is available. Run `grok login` to authenticate.";
 
 pub const XAI_API_KEY_METHOD_ID: &str = "xai.api_key";
+
+pub const LOCAL_INFERENCE_METHOD_ID: &str = "local.inference";
+pub fn local_inference_auth_method() -> acp::AuthMethod {
+    acp::AuthMethod::Agent(
+        acp::AuthMethodAgent::new(
+            acp::AuthMethodId::new(LOCAL_INFERENCE_METHOD_ID),
+            "Local inference".to_string(),
+        )
+        .description(Some(
+            "In-process model; no external authentication".to_string(),
+        )),
+    )
+}
+
 pub fn xai_api_key_auth_method() -> acp::AuthMethod {
     acp::AuthMethod::Agent(
         acp::AuthMethodAgent::new(
@@ -1101,5 +1117,16 @@ mod tests {
         });
         assert_eq!(method_ids(&built), vec![GROK_COM_METHOD_ID]);
         assert!(built.default_auth_method_id.is_none());
+    }
+
+    #[test]
+    fn local_inference_auth_is_noninteractive_and_nonrefreshable() {
+        let method = local_inference_auth_method();
+        assert_eq!(method.id().0.as_ref(), LOCAL_INFERENCE_METHOD_ID);
+        let kind = AuthMethodKind::from_id(method.id());
+        assert_eq!(kind, AuthMethodKind::LocalInference);
+        assert!(!kind.needs_interactive_login());
+        assert!(!kind.is_session_based());
+        assert!(!kind.is_api_key());
     }
 }

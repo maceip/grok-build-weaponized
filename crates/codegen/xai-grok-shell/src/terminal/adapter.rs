@@ -246,6 +246,7 @@ impl TerminalBackend for AcpTerminalAdapter {
             timed_out,
             output_file: request.output_file,
             total_bytes,
+            structure: Default::default(),
             pid: None,
         })
     }

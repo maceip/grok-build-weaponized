@@ -714,6 +714,13 @@ impl AgentBuilder {
             )));
         }
         if definition.inject_default_tools {
+            if std::env::var_os(xai_grok_tools::implementations::grok_build::OPERATIONAL_SCOPE_ENV)
+                .is_some_and(|scope| !scope.is_empty())
+            {
+                tool_config
+                    .tools
+                    .push((&xai_grok_tools::implementations::grok_build::NativeNmapTool).into());
+            }
             if self.memory_backend.is_some() {
                 use xai_grok_tools::implementations::memory;
                 tool_config

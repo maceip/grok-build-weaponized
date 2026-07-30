@@ -1,0 +1,63 @@
+diff --git a/c/engine.cc b/c/engine.cc
+index 4706854..643dc2d 100644
+--- a/c/engine.cc
++++ b/c/engine.cc
+@@ -45,6 +45,12 @@
+
+ namespace {
+
++thread_local std::string g_grok_last_error;
++
++void SetGrokLastError(const absl::Status& status) {
++  g_grok_last_error = status.ToString();
++}
++
+ absl::AnyInvocable<void(absl::StatusOr<litert::lm::Responses>)> CreateCallback(
+     LiteRtLmStreamCallback callback, void* callback_data) {
+   return [callback,
+@@ -203,6 +209,11 @@ struct LiteRtLmTokenUnions {
+
+ extern "C" {
+
++__attribute__((visibility("default"))) const char*
++grok_litert_last_error_message() {
++  return g_grok_last_error.empty() ? nullptr : g_grok_last_error.c_str();
++}
++
+ void litert_lm_set_min_log_level(int level) {
+   litert::lm::SetMinLogSeverity(static_cast<litert::lm::LogSeverity>(level));
+ }
+@@ -747,7 +758,9 @@ double litert_lm_benchmark_info_get_decode_tokens_per_sec_at(
+
+ LiteRtLmConversation* litert_lm_conversation_create(
+     LiteRtLmEngine* engine, LiteRtLmConversationConfig* c_config) {
++  g_grok_last_error.clear();
+   if (!engine || !engine->engine) {
++    g_grok_last_error = "invalid or uninitialized LiteRT-LM engine";
+     return nullptr;
+   }
+
+@@ -806,6 +819,7 @@ LiteRtLmConversation* litert_lm_conversation_create(
+     if (!config.ok()) {
+       ABSL_LOG(ERROR) << "Failed to create conversation config: "
+                       << config.status();
++      SetGrokLastError(config.status());
+       return nullptr;
+     }
+     conversation = Conversation::Create(*engine->engine, *config);
+@@ -815,6 +829,7 @@ LiteRtLmConversation* litert_lm_conversation_create(
+     if (!default_conversation_config.ok()) {
+       ABSL_LOG(ERROR) << "Failed to create default conversation config: "
+                       << default_conversation_config.status();
++      SetGrokLastError(default_conversation_config.status());
+       return nullptr;
+     }
+     conversation =
+@@ -824,6 +839,7 @@ LiteRtLmConversation* litert_lm_conversation_create(
+   if (!conversation.ok()) {
+     ABSL_LOG(ERROR) << "Failed to create conversation: "
+                     << conversation.status();
++    SetGrokLastError(conversation.status());
+     return nullptr;
+   }
+   auto* c_conversation = new LiteRtLmConversation;

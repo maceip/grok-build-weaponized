@@ -21,6 +21,7 @@ pub mod kill_task;
 pub mod list_dir;
 pub mod lsp;
 pub mod monitor;
+pub mod native_nmap;
 pub mod read_file;
 pub mod scheduler;
 pub mod search_replace;
@@ -48,6 +49,7 @@ pub use kill_task::{KillTaskTool, KillTerminalCommandTool};
 pub use list_dir::ListDirTool;
 pub use lsp::LspTool;
 pub use monitor::tool::MonitorTool;
+pub use native_nmap::{NativeNmapJobTool, NativeNmapTool, OPERATIONAL_SCOPE_ENV};
 pub use read_file::ReadFileTool;
 pub use scheduler::create::{
     LoopFireMode, SCHEDULER_CREATE_TOOL_NAME, SchedulerCreateTool, loop_schedule_instruction,

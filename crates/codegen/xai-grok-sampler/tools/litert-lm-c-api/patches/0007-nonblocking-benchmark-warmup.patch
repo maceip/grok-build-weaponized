@@ -1,0 +1,17 @@
+diff --git a/c/engine.cc b/c/engine.cc
+index d03ae27..15ce7b1 100644
+--- a/c/engine.cc
++++ b/c/engine.cc
+@@ -391,6 +391,13 @@ void litert_lm_engine_settings_enable_benchmark(
+     LiteRtLmEngineSettings* settings) {
+   if (settings && settings->settings) {
+     settings->settings->GetMutableBenchmarkParams();
++    auto& main_settings =
++        settings->settings->GetMutableMainExecutorSettings();
++    auto advanced_settings = main_settings.GetAdvancedSettings().value_or(
++        litert::lm::AdvancedSettings());
++    advanced_settings.wait_for_weights_conversion_complete_in_benchmark =
++        false;
++    main_settings.SetAdvancedSettings(advanced_settings);
+   }
+ }

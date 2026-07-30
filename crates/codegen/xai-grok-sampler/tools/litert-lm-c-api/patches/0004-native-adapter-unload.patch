@@ -1,0 +1,89 @@
+diff --git a/runtime/engine/engine.h b/runtime/engine/engine.h
+--- a/runtime/engine/engine.h
++++ b/runtime/engine/engine.h
+@@ -305,6 +305,12 @@ class Engine {
+   // Get the reference to the tokenizer for the engine.
+   virtual const Tokenizer& GetTokenizer() const = 0;
+
++  // Releases one immutable LoRA revision from the shared base-model executor.
++  // Callers must ensure no live session still references the adapter.
++  virtual absl::Status UnloadLoRA(absl::string_view identity) {
++    return absl::UnimplementedError("LoRA unload is not implemented.");
++  }
++
+   // Get the audio model properties for the session. This is only available
+   // if the engine is created with audio modality enabled.
+   virtual absl::StatusOr<AudioExecutorProperties> GetAudioExecutorProperties()
+diff --git a/runtime/core/engine_impl.cc b/runtime/core/engine_impl.cc
+--- a/runtime/core/engine_impl.cc
++++ b/runtime/core/engine_impl.cc
+@@ -259,6 +259,16 @@ class EngineImpl : public Engine {
+
+   const Tokenizer& GetTokenizer() const override { return *tokenizer_; }
+
++  absl::Status UnloadLoRA(absl::string_view identity) override {
++    auto resident = lora_identity_to_id_.find(std::string(identity));
++    if (resident == lora_identity_to_id_.end()) {
++      return absl::NotFoundError("LoRA identity not found");
++    }
++    RETURN_IF_ERROR(executor_->UnloadLoRA(resident->second));
++    lora_identity_to_id_.erase(resident);
++    return absl::OkStatus();
++  }
++
+   absl::StatusOr<AudioExecutorProperties> GetAudioExecutorProperties()
+       const override {
+     if (audio_executor_ == nullptr) {
+diff --git a/c/engine.h b/c/engine.h
+--- a/c/engine.h
++++ b/c/engine.h
+@@ -323,6 +323,14 @@ LiteRtLmEngine* litert_lm_engine_create(const LiteRtLmEngineSettings* settings);
+ LITERT_LM_C_API_EXPORT
+ void litert_lm_engine_delete(LiteRtLmEngine* engine);
+
++// Releases one previously materialized LoRA revision from an engine.
++// Returns zero on success. `error_message`, when non-null, points to
++// thread-local bridge storage.
++LITERT_LM_C_API_EXPORT
++int grok_litert_engine_unload_lora(
++    LiteRtLmEngine* engine, const char* identity,
++    const char** error_message);
++
+ // Creates a LiteRT LM Session. The caller is responsible for destroying the
+ // session using `litert_lm_session_delete`.
+ //
+diff --git a/c/engine.cc b/c/engine.cc
+--- a/c/engine.cc
++++ b/c/engine.cc
+@@ -466,5 +466,31 @@ LiteRtLmEngine* litert_lm_engine_create(
+
+ void litert_lm_engine_delete(LiteRtLmEngine* engine) { delete engine; }
+
++int grok_litert_engine_unload_lora(
++    LiteRtLmEngine* engine, const char* identity,
++    const char** error_message) {
++  g_grok_last_error.clear();
++  if (error_message != nullptr) {
++    *error_message = nullptr;
++  }
++  if (engine == nullptr || engine->engine == nullptr || identity == nullptr ||
++      identity[0] == '\0') {
++    g_grok_last_error = "invalid engine or empty LoRA identity";
++    if (error_message != nullptr) {
++      *error_message = g_grok_last_error.c_str();
++    }
++    return 1;
++  }
++  absl::Status status = engine->engine->UnloadLoRA(identity);
++  if (!status.ok()) {
++    SetGrokLastError(status);
++    if (error_message != nullptr) {
++      *error_message = g_grok_last_error.c_str();
++    }
++    return 2;
++  }
++  return 0;
++}
++
+ LiteRtLmSession* litert_lm_engine_create_session(
+     LiteRtLmEngine* engine, LiteRtLmSessionConfig* config) {

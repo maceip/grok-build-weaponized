@@ -77,7 +77,15 @@ pub async fn generate_session_summary(
     model: &str,
 ) -> String {
     let clean_message = title_source_text(&user_message);
-    let request = ConversationRequest::from_items(vec![
+    // Auxiliary helpers call SamplingClient directly, while the native
+    // LiteRT-LM path is owned by the sampler actor. Until the public C API
+    // supports named tool choice, use the deterministic local fallback rather
+    // than allowing this helper to interpret a litert-lm:// URL as HTTP.
+    if client.is_local_inference() {
+        return title_fallback_from_user_text(&clean_message);
+    }
+
+    let mut request = ConversationRequest::from_items(vec![
         ConversationItem::system(
             r#"You are tasked with generating the session title. The user is asking almost always software engineering related questions on their codebase.
 We describe the session title below
@@ -96,24 +104,30 @@ Just generate the session_title and nothing else"#,
         )),
     ])
     .with_model(model)
-    .with_tools(vec![ToolSpec {
-        name: "session_title".to_owned(),
-        description: Some("Generate the session_title which we use for the user_message".to_owned()),
-        parameters: serde_json::json!({
-            "type": "object",
-            "required": ["session_title"],
-            "properties": {
-                "session_title": {
-                    "type": "string",
-                    "description": "Final session title, just 5-10 word descriptive title for the session. Super info dense, no filler."
-                }
-            },
-            "additionalProperties": false
-        }),
-    }])
     .with_max_output_tokens(100)
-    .with_temperature(1.0)
-    .with_tool_choice(ConversationToolChoice::Function("session_title".to_owned()));
+    .with_temperature(1.0);
+
+    request = request
+        .with_tools(vec![ToolSpec {
+            name: "session_title".to_owned(),
+            description: Some(
+                "Generate the session_title which we use for the user_message".to_owned(),
+            ),
+            parameters: serde_json::json!({
+                "type": "object",
+                "required": ["session_title"],
+                "properties": {
+                    "session_title": {
+                        "type": "string",
+                        "description": "Final session title, just 5-10 word descriptive title for the session. Super info dense, no filler."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        }])
+        .with_tool_choice(ConversationToolChoice::Function(
+            "session_title".to_owned(),
+        ));
 
     match client.conversation_collect(request).await {
         Ok(response) => {

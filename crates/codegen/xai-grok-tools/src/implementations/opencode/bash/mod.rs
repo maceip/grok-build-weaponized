@@ -499,6 +499,7 @@ mod tests {
                     timed_out: false,
                     output_file: PathBuf::from("/tmp/test.log"),
                     total_bytes: output.len(),
+                    structure: Default::default(),
                     pid: None,
                 }),
             }
@@ -514,6 +515,7 @@ mod tests {
                     timed_out: true,
                     output_file: PathBuf::from("/tmp/test.log"),
                     total_bytes: output.len(),
+                    structure: Default::default(),
                     pid: None,
                 }),
             }
@@ -774,6 +776,7 @@ mod tests {
                 timed_out: false,
                 output_file: PathBuf::from("/tmp/test.log"),
                 total_bytes: 100_000,
+                structure: Default::default(),
                 pid: None,
             }),
         };
@@ -808,6 +811,7 @@ mod tests {
                 timed_out: false,
                 output_file: PathBuf::from("/tmp/test.log"),
                 total_bytes: 0,
+                structure: Default::default(),
                 pid: None,
             }),
         };
@@ -1051,6 +1055,7 @@ mod tests {
                     timed_out: false,
                     output_file: PathBuf::from("/tmp/test.log"),
                     total_bytes: 2,
+                    structure: Default::default(),
                     pid: None,
                 })
             }

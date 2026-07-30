@@ -169,11 +169,8 @@ pub async fn hybrid_search(
     // Phase 2 (async): embed query — no &index borrow here
     let query_embedding = if vec_available {
         if let Some(provider) = embedding_provider {
-            match provider.embed_batch(&[query]).await {
-                Ok(embeddings) if !embeddings.is_empty() => {
-                    Some(embeddings.into_iter().next().unwrap())
-                }
-                Ok(_) => None,
+            match provider.embed_query(query).await {
+                Ok(embedding) => Some(embedding),
                 Err(e) => {
                     tracing::warn!(error = %e, "embedding query failed, falling back to FTS-only");
                     None

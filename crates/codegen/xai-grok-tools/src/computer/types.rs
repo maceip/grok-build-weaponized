@@ -148,6 +148,9 @@ pub struct TerminalRunResult {
     /// Total bytes of output (before truncation).
     /// When truncated, combined_output contains the first and last portions up to output_byte_limit chars.
     pub total_bytes: usize,
+    /// Structural facts extracted from the complete stdout/stderr stream
+    /// before the in-memory preview is truncated.
+    pub structure: crate::util::output_filter::OutputStructure,
     /// PID of the spawned shell process, when available. Set by the
     /// local terminal backend at spawn time. Useful for foreground
     /// commands that auto-background on timeout: the resulting

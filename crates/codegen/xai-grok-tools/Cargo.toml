@@ -36,7 +36,7 @@ pdf_oxide = { workspace = true }
 # drag aes/bzip2/lzma/zstd into the shipped pager binary. PPTX entries are
 # only ever stored or deflated.
 zip = { version = "3", default-features = false, features = ["deflate-flate2"] }
-quick-xml = { workspace = true }
+quick-xml = { workspace = true, features = ["async-tokio"] }
 indexmap = { workspace = true, features = ["serde"] }
 minijinja = { version = "2", features = ["custom_syntax"] }
 parking_lot = { workspace = true }
@@ -62,6 +62,7 @@ strip-ansi-escapes = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
+    "io-util",
     "process",
     "rt",
     "macros",

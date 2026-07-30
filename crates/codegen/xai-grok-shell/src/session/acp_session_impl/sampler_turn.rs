@@ -542,15 +542,33 @@ impl SessionActor {
         if !self.permissions.is_auto_mode() {
             return;
         }
+        let session_sampling_config = self.chat_state_handle.get_sampling_config().await;
+        if session_sampling_config
+            .as_ref()
+            .is_some_and(|config| config.base_url.starts_with("litert-lm://"))
+        {
+            // The auto-permission side query historically constructs its own
+            // HTTP sampling client and also requests JSON-schema-constrained
+            // output. Neither is part of LiteRT-LM's public C API. Keep local
+            // inference truly HTTP-free and retain the deterministic heuristic
+            // plus the normal operator prompt/Tier-3 safety floor.
+            if self.permissions.has_llm_side_query() {
+                self.permissions.set_classifier(Some(
+                    xai_grok_workspace::permission::LlmPermissionClassifier::production_default(),
+                ));
+            }
+            tracing::debug!(
+                session_id = %self.session_info.id,
+                "Using deterministic permission classifier for direct local inference"
+            );
+            return;
+        }
         if self.permissions.has_llm_side_query() {
             return;
         }
         let auto_cfg = crate::util::config::resolve_auto_mode_config_from_disk();
-        let session_model = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .map(|c| c.model)
+        let session_model = session_sampling_config
+            .map(|config| config.model)
             .unwrap_or_default();
         let aux_classifier_sampler = match auto_cfg.classifier_model.as_deref() {
             Some(slug) => self.resolve_auto_classifier_sampler(slug).await,
@@ -1118,6 +1136,7 @@ impl SessionActor {
     pub(crate) async fn run_turn_via_sampler(
         self: &Arc<Self>,
         request: ConversationRequest,
+        suppress_stream: bool,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
         self.prepare_sampler_for_turn().await;
         let stream_drained_rx = {
@@ -1127,6 +1146,8 @@ impl SessionActor {
         };
         let request_id = xai_grok_sampler::RequestId::random();
         let request_id_str = request_id.as_str().to_string();
+        let _suppressed =
+            suppress_stream.then(|| super::cooperation::suppress_sampling(&request_id_str));
         match self
             .sampler_handle
             .submit_and_collect(request_id, request)

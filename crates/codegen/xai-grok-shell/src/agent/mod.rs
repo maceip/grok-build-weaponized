@@ -23,6 +23,8 @@ pub(crate) mod session_metrics;
 pub mod session_registry_client;
 pub(crate) mod subagent;
 pub(crate) mod subscription_check;
+pub(crate) mod turn_classifier;
+pub(crate) mod turn_coordinator;
 pub(crate) mod update_chunk_merge;
 
 pub use mvp_agent::MvpAgent;

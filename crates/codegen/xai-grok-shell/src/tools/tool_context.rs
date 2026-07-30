@@ -17,6 +17,208 @@ use xai_grok_workspace::file_system::{AsyncFileSystem, AsyncFsWrapper};
 use xai_grok_workspace::session::file_state::FileStateHandle;
 use xai_hunk_tracker::HunkTrackerHandle;
 use xai_tty_utils::ProcessScope;
+
+#[derive(Clone, Debug)]
+pub struct ToolOutputTurnBudget {
+    config: crate::tools::config::ToolOutputBudgetConfig,
+    /// Packed `(generation, reserved_or_spent_tokens)`.
+    ///
+    /// Reserving the allowance before an async result is filtered prevents
+    /// parallel tool completions from each observing the same remaining
+    /// budget. The generation makes resetting a turn safe even if a stale
+    /// claim is dropped later.
+    state: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[derive(Debug)]
+pub struct ToolOutputBudgetClaim {
+    state: Option<Arc<std::sync::atomic::AtomicU64>>,
+    generation: u32,
+    limit: u32,
+    reserved: u32,
+    settled: bool,
+}
+
+impl Default for ToolOutputTurnBudget {
+    fn default() -> Self {
+        Self::new(crate::tools::config::ToolOutputBudgetConfig::default())
+    }
+}
+
+impl ToolOutputTurnBudget {
+    pub fn new(config: crate::tools::config::ToolOutputBudgetConfig) -> Self {
+        Self {
+            config,
+            state: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    pub fn reset_turn(&self) {
+        use std::sync::atomic::Ordering;
+        let mut observed = self.state.load(Ordering::Acquire);
+        loop {
+            let generation = generation_from_state(observed).wrapping_add(1);
+            let reset = u64::from(generation) << 32;
+            match self.state.compare_exchange_weak(
+                observed,
+                reset,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    pub fn claim_next_result(&self) -> Option<ToolOutputBudgetClaim> {
+        self.claim_next_result_with_cap(u32::MAX)
+    }
+
+    /// Claim a configured allowance capped by the live model-window runway.
+    /// `Off` remains an explicit bypass. `Soft` and `Hard` never reserve more
+    /// than can fit after completion and safety reserves.
+    pub fn claim_next_result_with_cap(
+        &self,
+        available_tokens: u32,
+    ) -> Option<ToolOutputBudgetClaim> {
+        use crate::tools::config::ToolOutputBudgetMode;
+        match self.config.mode {
+            ToolOutputBudgetMode::Off => None,
+            ToolOutputBudgetMode::Soft => Some(ToolOutputBudgetClaim::unreserved(
+                self.config
+                    .per_result_tokens
+                    .unwrap_or(available_tokens)
+                    .min(available_tokens),
+            )),
+            ToolOutputBudgetMode::Hard => {
+                let Some(turn_limit) = self.config.per_turn_tokens else {
+                    return Some(ToolOutputBudgetClaim::unreserved(
+                        self.config
+                            .per_result_tokens
+                            .unwrap_or(available_tokens)
+                            .min(available_tokens),
+                    ));
+                };
+                use std::sync::atomic::Ordering;
+                let mut observed = self.state.load(Ordering::Acquire);
+                loop {
+                    let generation = generation_from_state(observed);
+                    let spent = spent_from_state(observed);
+                    let remaining = turn_limit.saturating_sub(spent);
+                    let reservation = self
+                        .config
+                        .per_result_tokens
+                        .unwrap_or(remaining)
+                        .min(remaining)
+                        .min(available_tokens);
+                    let updated = (u64::from(generation) << 32)
+                        | u64::from(spent.saturating_add(reservation));
+                    match self.state.compare_exchange_weak(
+                        observed,
+                        updated,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            return Some(ToolOutputBudgetClaim {
+                                state: Some(Arc::clone(&self.state)),
+                                generation,
+                                limit: reservation,
+                                reserved: reservation,
+                                settled: false,
+                            });
+                        }
+                        Err(actual) => observed = actual,
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn spent(&self) -> u64 {
+        u64::from(spent_from_state(
+            self.state.load(std::sync::atomic::Ordering::Acquire),
+        ))
+    }
+}
+
+impl ToolOutputBudgetClaim {
+    fn unreserved(limit: u32) -> Self {
+        Self {
+            state: None,
+            generation: 0,
+            limit,
+            reserved: 0,
+            settled: false,
+        }
+    }
+
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// Commit the tokens actually retained and release any unused reservation.
+    pub fn finish(mut self, retained_tokens: u32) {
+        debug_assert!(
+            retained_tokens <= self.limit,
+            "retained tool output exceeded its token claim"
+        );
+        self.settle(retained_tokens.min(self.limit));
+    }
+
+    fn settle(&mut self, retained_tokens: u32) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        let refund = self.reserved.saturating_sub(retained_tokens);
+        let Some(state) = &self.state else {
+            return;
+        };
+        if refund == 0 {
+            return;
+        }
+
+        use std::sync::atomic::Ordering;
+        let mut observed = state.load(Ordering::Acquire);
+        loop {
+            if generation_from_state(observed) != self.generation {
+                return;
+            }
+            let spent = spent_from_state(observed);
+            let updated =
+                (u64::from(self.generation) << 32) | u64::from(spent.saturating_sub(refund));
+            match state.compare_exchange_weak(
+                observed,
+                updated,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+}
+
+impl Drop for ToolOutputBudgetClaim {
+    fn drop(&mut self) {
+        // A cancelled filter must not leak its reservation into the rest of
+        // the turn. A claim from an older generation cannot alter a new turn.
+        self.settle(0);
+    }
+}
+
+fn generation_from_state(state: u64) -> u32 {
+    (state >> 32) as u32
+}
+
+fn spent_from_state(state: u64) -> u32 {
+    state as u32
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TaskOutputTokenBudget {
     inner: Arc<parking_lot::Mutex<TaskOutputTokenBudgetState>>,
@@ -216,6 +418,7 @@ pub struct ToolContext {
     /// non-zero takes the send-now path.
     pub blocking_wait_depth: Arc<BlockingWaitState>,
     pub task_output_token_budget: Option<TaskOutputTokenBudget>,
+    pub tool_output_turn_budget: ToolOutputTurnBudget,
     pub(crate) sampler_retry_only_before_output: bool,
     /// This session's child-process reaper, set at session spawn; `None` for
     /// contexts without one (subagents, defaults). Spawn sites enroll children
@@ -285,6 +488,7 @@ impl ToolContext {
             goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             blocking_wait_depth: Arc::new(BlockingWaitState::new()),
             task_output_token_budget: None,
+            tool_output_turn_budget: ToolOutputTurnBudget::default(),
             sampler_retry_only_before_output: false,
             process_scope: None,
         }
@@ -326,6 +530,7 @@ impl ToolContext {
             goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             blocking_wait_depth: Arc::new(BlockingWaitState::new()),
             task_output_token_budget: None,
+            tool_output_turn_budget: ToolOutputTurnBudget::default(),
             sampler_retry_only_before_output: false,
             process_scope: None,
         }
@@ -344,10 +549,18 @@ impl ToolContext {
         self.hunk_tracking_enabled = enabled;
         self
     }
+    pub fn with_tool_output_budget(
+        mut self,
+        config: crate::tools::config::ToolOutputBudgetConfig,
+    ) -> Self {
+        self.tool_output_turn_budget = ToolOutputTurnBudget::new(config);
+        self
+    }
 }
 #[cfg(test)]
 mod output_budget_tests {
-    use super::TaskOutputTokenBudget;
+    use super::{TaskOutputTokenBudget, ToolOutputBudgetClaim, ToolOutputTurnBudget};
+    use crate::tools::config::{ToolOutputBudgetConfig, ToolOutputBudgetMode};
     #[test]
     fn clamps_every_request_to_remaining_and_stops_at_zero() {
         let budget = TaskOutputTokenBudget::limited(10);
@@ -375,6 +588,94 @@ mod output_budget_tests {
         budget.mark_incomplete_and_exhaust();
         assert_eq!(budget.usage(), (50, true));
         assert_eq!(budget.clamp_request(None), Some(0));
+    }
+    #[test]
+    fn hard_tool_budget_is_cumulative_and_resettable() {
+        let budget = ToolOutputTurnBudget::new(ToolOutputBudgetConfig {
+            mode: ToolOutputBudgetMode::Hard,
+            per_result_tokens: Some(2_000),
+            per_turn_tokens: Some(5_000),
+        });
+        let first = budget.claim_next_result().unwrap();
+        assert_eq!(first.limit(), 2_000);
+        first.finish(2_000);
+        budget.claim_next_result().unwrap().finish(2_000);
+        let final_claim = budget.claim_next_result().unwrap();
+        assert_eq!(final_claim.limit(), 1_000);
+        final_claim.finish(1_000);
+        assert_eq!(budget.claim_next_result().unwrap().limit(), 0);
+        assert_eq!(budget.spent(), 5_000);
+        budget.reset_turn();
+        assert_eq!(budget.claim_next_result().unwrap().limit(), 2_000);
+    }
+
+    #[test]
+    fn live_context_runway_caps_soft_and_hard_claims_but_not_off() {
+        let soft = ToolOutputTurnBudget::new(ToolOutputBudgetConfig {
+            mode: ToolOutputBudgetMode::Soft,
+            per_result_tokens: Some(2_000),
+            per_turn_tokens: None,
+        });
+        assert_eq!(soft.claim_next_result_with_cap(375).unwrap().limit(), 375);
+
+        let hard = ToolOutputTurnBudget::new(ToolOutputBudgetConfig {
+            mode: ToolOutputBudgetMode::Hard,
+            per_result_tokens: Some(2_000),
+            per_turn_tokens: Some(5_000),
+        });
+        let first = hard.claim_next_result_with_cap(400).unwrap();
+        assert_eq!(first.limit(), 400);
+        first.finish(400);
+        assert_eq!(hard.claim_next_result_with_cap(250).unwrap().limit(), 250);
+
+        let off = ToolOutputTurnBudget::new(ToolOutputBudgetConfig {
+            mode: ToolOutputBudgetMode::Off,
+            per_result_tokens: Some(1),
+            per_turn_tokens: Some(1),
+        });
+        assert!(off.claim_next_result_with_cap(0).is_none());
+    }
+
+    #[test]
+    fn parallel_tool_budget_claims_cannot_oversubscribe_turn() {
+        let budget = ToolOutputTurnBudget::new(ToolOutputBudgetConfig {
+            mode: ToolOutputBudgetMode::Hard,
+            per_result_tokens: Some(2_000),
+            per_turn_tokens: Some(5_000),
+        });
+        let claims = std::thread::scope(|scope| {
+            let handles = (0..16)
+                .map(|_| {
+                    let budget = budget.clone();
+                    scope.spawn(move || budget.claim_next_result().unwrap())
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let reserved = claims.iter().map(ToolOutputBudgetClaim::limit).sum::<u32>();
+        assert_eq!(reserved, 5_000);
+        for claim in claims {
+            let limit = claim.limit();
+            claim.finish(limit);
+        }
+        assert_eq!(budget.spent(), 5_000);
+    }
+
+    #[test]
+    fn stale_claim_drop_cannot_refund_new_turn() {
+        let budget = ToolOutputTurnBudget::new(ToolOutputBudgetConfig {
+            mode: ToolOutputBudgetMode::Hard,
+            per_result_tokens: Some(2_000),
+            per_turn_tokens: Some(5_000),
+        });
+        let stale = budget.claim_next_result().unwrap();
+        budget.reset_turn();
+        budget.claim_next_result().unwrap().finish(2_000);
+        drop(stale);
+        assert_eq!(budget.spent(), 2_000);
     }
 }
 #[cfg(test)]
@@ -420,6 +721,7 @@ mod tests {
                 goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 blocking_wait_depth: Arc::new(BlockingWaitState::new()),
                 task_output_token_budget: None,
+                tool_output_turn_budget: super::ToolOutputTurnBudget::default(),
                 sampler_retry_only_before_output: false,
                 process_scope: None,
             }

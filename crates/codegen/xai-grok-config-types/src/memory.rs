@@ -42,9 +42,9 @@ pub struct MemoryEmbeddingConfig {
 impl Default for MemoryEmbeddingConfig {
     fn default() -> Self {
         Self {
-            provider: "api".to_string(),
-            model: None,
-            dimensions: 1024,
+            provider: "local".to_string(),
+            model: Some("embeddinggemma-300m-q4".to_string()),
+            dimensions: 768,
         }
     }
 }
@@ -410,7 +410,10 @@ mod tests {
     #[test]
     fn sub_config_defaults_match() {
         assert_eq!(MemoryIndexConfig::default().max_chunk_chars, 1600);
-        assert_eq!(MemoryEmbeddingConfig::default().dimensions, 1024);
+        let embedding = MemoryEmbeddingConfig::default();
+        assert_eq!(embedding.provider, "local");
+        assert_eq!(embedding.model.as_deref(), Some("embeddinggemma-300m-q4"));
+        assert_eq!(embedding.dimensions, 768);
         let s = MemorySearchConfig::default();
         assert_eq!(s.max_results, 6);
         assert_eq!(s.recency_decay, DEFAULT_RECENCY_DECAY);

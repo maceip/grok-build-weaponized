@@ -1,0 +1,50 @@
+diff --git a/runtime/components/sampler_factory.cc b/runtime/components/sampler_factory.cc
+index 4e9594e..df19c4b 100644
+--- a/runtime/components/sampler_factory.cc
++++ b/runtime/components/sampler_factory.cc
+@@ -235,6 +235,10 @@ class TopKCApiSampler : public Sampler {
+   absl::Status UpdateConfig(
+       const proto::SamplerParameters& sampler_params, int batch_size,
+       std::shared_ptr<std::default_random_engine> rand_gen) override {
++    if (capi_->update_config_func == nullptr) {
++      return absl::UnimplementedError(
++          "The loaded GPU sampler does not support runtime reconfiguration.");
++    }
+     char* error_msg = nullptr;
+     int error_code = capi_->update_config_func(
+         sampler_, &sampler_params, batch_size, &rand_gen, &error_msg);
+@@ -301,10 +305,16 @@ class TopKCApiSampler : public Sampler {
+         lib.LookupSymbol<LiteRtTopKSampler_SampleToIdAndScoreBuffer>(
+             sample_func_name));
+-    LITERT_ASSIGN_OR_RETURN(auto sampler_update_config_func,
+-                            lib.LookupSymbol<LiteRtTopKSampler_UpdateConfig>(
+-                                update_config_func_name));
+     RET_CHECK_NE(sampler_sample_func, nullptr)
+         << "Failed to load " << sample_func_name;
++    LiteRtTopKSampler_UpdateConfig sampler_update_config_func = nullptr;
++    if (update_config_func_name != nullptr) {
++      LITERT_ASSIGN_OR_RETURN(
++          sampler_update_config_func,
++          lib.LookupSymbol<LiteRtTopKSampler_UpdateConfig>(
++              update_config_func_name));
++      RET_CHECK_NE(sampler_update_config_func, nullptr)
++          << "Failed to load " << update_config_func_name;
++    }
+
+     LiteRtTopKSampler_CanHandleInput sampler_can_handle_input_func = nullptr;
+     if (can_handle_input_func_name != nullptr) {
+@@ -434,10 +444,10 @@ class TopKWebGpuCApiSampler : public TopKCApiSampler {
+         "libLiteRtTopKWebGpuSampler" SO_EXT, "LiteRtTopKWebGpuSampler_Create",
+         "LiteRtTopKWebGpuSampler_Destroy",
+         "LiteRtTopKWebGpuSampler_SampleToIdAndScoreBuffer",
+-        "LiteRtTopKWebGpuSampler_UpdateConfig",
+-        "LiteRtTopKWebGpuSampler_CanHandleInput",
+-        "LiteRtTopKWebGpuSampler_HandlesInput",
+-        "LiteRtTopKWebGpuSampler_SetInputTensorsAndInferenceFunc");
++        /*update_config_func_name=*/nullptr,
++        /*can_handle_input_func_name=*/nullptr,
++        /*handles_input_func_name=*/nullptr,
++        /*set_input_tensors_func_name=*/nullptr);
+     if (capi_or.ok()) {
+       capi = std::move(capi_or.value());
+       ABSL_LOG(INFO) << "Dynamically loaded LiteRtTopKWebGpuSampler C API.";

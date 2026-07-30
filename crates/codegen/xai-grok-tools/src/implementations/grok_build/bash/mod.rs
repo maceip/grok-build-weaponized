@@ -22,10 +22,12 @@
 //! - `TemplateRenderer` — resolve client-facing tool/param names in hints/errors (optional)
 //! - `Params<BashParams>` — timeout, output_byte_limit, cmd_prefix (optional, all have defaults)
 
+use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use regex::Regex;
+use tokio::io::AsyncWriteExt;
 use xai_grok_config::shell::AmpersandSemantics;
 
 use crate::DEFAULT_TOOL_OUTPUT_CHARS;
@@ -60,6 +62,85 @@ pub enum BashError {
 
 fn default_true() -> bool {
     true
+}
+
+const TOKENIX_FILTER_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn tokenix_replacement(original: &str, stdout: &[u8]) -> Option<String> {
+    let response: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let replacement = response
+        .pointer("/modifiedResult/textResultForLlm")?
+        .as_str()?
+        .trim_end()
+        .to_owned();
+
+    if replacement.is_empty() || replacement.len() >= original.len() {
+        return None;
+    }
+
+    // The in-process streaming analyzer is the authority for high-signal
+    // findings. Never accept an optional third-party rewrite that drops its
+    // structural summary.
+    if original.contains("[output structure:") && !replacement.contains("[output structure:") {
+        return None;
+    }
+
+    Some(replacement)
+}
+
+async fn filter_with_tokenix(path: &str, command: &str, original: &str) -> Option<String> {
+    if path.trim().is_empty() || original.is_empty() {
+        return None;
+    }
+
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "toolName": "bash",
+        "toolArgs": {"command": command},
+        "toolResult": {
+            "resultType": "success",
+            "textResultForLlm": original,
+        },
+    }))
+    .ok()?;
+
+    let operation = async {
+        let mut child = tokio::process::Command::new(path)
+            .arg("hook-post")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        stdin.write_all(&payload).await.ok()?;
+        drop(stdin);
+        let output = child.wait_with_output().await.ok()?;
+        output
+            .status
+            .success()
+            .then(|| tokenix_replacement(original, &output.stdout))
+            .flatten()
+    };
+
+    match tokio::time::timeout(TOKENIX_FILTER_TIMEOUT, operation).await {
+        Ok(Some(filtered)) => {
+            tracing::debug!(
+                original_bytes = original.len(),
+                filtered_bytes = filtered.len(),
+                "Tokenix reduced model-visible foreground command output"
+            );
+            Some(filtered)
+        }
+        Ok(None) => None,
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = TOKENIX_FILTER_TIMEOUT.as_millis(),
+                "Tokenix output filter timed out; returning in-process filtered output"
+            );
+            None
+        }
+    }
 }
 
 /// Maximum size, in bytes, of a single emitted progress `delta`. Guards
@@ -159,6 +240,19 @@ pub struct BashParams {
     pub max_timeout_secs: Option<f64>,
     /// Max output chars. None → DEFAULT_TOOL_OUTPUT_CHARS (20k).
     pub output_byte_limit: Option<usize>,
+    /// Optional per-result context budget, expressed in estimated model tokens.
+    ///
+    /// `None` disables the token-specific rule and preserves the character
+    /// limit above. `Some(n)` enforces the lower of this budget and the normal
+    /// output limit. Grok Build's shared bytes/4 estimator is used until the
+    /// active inference backend exposes its tokenizer.
+    #[serde(default)]
+    pub output_token_budget: Option<usize>,
+    /// Optional Tokenix executable for command-aware post-processing of
+    /// completed foreground results. This is fail-open and never changes the
+    /// raw terminal stream or full output file.
+    #[serde(default)]
+    pub tokenix_path: Option<String>,
     /// Command prefix to prepend to all bash commands.
     pub cmd_prefix: Option<String>,
     #[serde(default = "default_true")]
@@ -213,6 +307,8 @@ impl Default for BashParams {
             timeout_secs: None,
             max_timeout_secs: None,
             output_byte_limit: None,
+            output_token_budget: None,
+            tokenix_path: None,
             cmd_prefix: None,
             enabled_background: true,
             auto_background_on_timeout: false,
@@ -238,6 +334,28 @@ impl crate::types::resources::ResourceType for BashParams {
             .with_field_path("auto_background_on_timeout")
             .with_expected("false (when enabled_background is false)")
             .with_bad_value(serde_json::Value::Bool(true)));
+        }
+        if value.output_token_budget == Some(0) {
+            return Err(crate::types::params_validation::ParamValidationError::new(
+                "output_token_budget must be greater than zero; omit it to disable the rule",
+                "params_constraint",
+            )
+            .with_field_path("output_token_budget")
+            .with_expected("a positive integer or null")
+            .with_bad_value(serde_json::Value::from(0)));
+        }
+        if value
+            .tokenix_path
+            .as_deref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            return Err(crate::types::params_validation::ParamValidationError::new(
+                "tokenix_path must not be empty; omit it to disable Tokenix filtering",
+                "params_constraint",
+            )
+            .with_field_path("tokenix_path")
+            .with_expected("a non-empty executable path or null")
+            .with_bad_value(serde_json::Value::String(String::new())));
         }
         Ok(())
     }
@@ -283,10 +401,14 @@ pub struct BashToolInput {
     )]
     pub timeout: Option<u64>,
 
-    /// One sentence explanation as to why this command needs to be run and how it contributes to the goal.
+    /// Optional operator-facing explanation of why this command contributes to
+    /// the goal. It is metadata, not part of command execution: compact local
+    /// models must not lose the ability to run an otherwise valid command when
+    /// they omit it.
     #[schemars(
-        description = "One sentence explanation as to why this command needs to be run and how it contributes to the goal."
+        description = "Optional one-sentence explanation of why this command contributes to the goal."
     )]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
 
     /// Set to true for long-running commands that should run in the background (e.g., dev servers, long builds).
@@ -1941,6 +2063,20 @@ impl xai_tool_runtime::Tool for BashTool {
                     .max_output_bytes_for("run_terminal_cmd", config_output_byte_limit)
             })
             .unwrap_or(config_output_byte_limit);
+        // A configured token budget is a hard upper bound relative to all
+        // other output configuration. The actor also reserves space for its
+        // structural summary, so the final model-visible result stays inside
+        // this derived character cap.
+        let output_byte_limit = params
+            .output_token_budget
+            .map(|tokens| {
+                crate::util::truncate::estimate_chars(tokens as u64)
+                    .try_into()
+                    .unwrap_or(usize::MAX)
+            })
+            .map_or(output_byte_limit, |token_chars| {
+                output_byte_limit.min(token_chars)
+            });
 
         // --- Validate: reject commands that use `&` as a background operator ---
         let version = BashVersion::from_contract(
@@ -2249,12 +2385,57 @@ impl xai_tool_runtime::Tool for BashTool {
                 });
             }
 
+            // Tokenix is deliberately post-execution: the terminal remains
+            // responsible for subprocess lifetime, streaming, backgrounding,
+            // and the complete on-disk output. Only the completed foreground
+            // text inserted into model history is eligible for this optional
+            // command-aware reduction.
+            let mut model_output = result.combined_output.clone();
+            let tokenix_filtered = if let Some(path) = params.tokenix_path.as_deref() {
+                if let Some(filtered) =
+                    filter_with_tokenix(path, &input.command, &model_output).await
+                {
+                    model_output = filtered;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let status = if result.timed_out {
+                "timed_out"
+            } else if result.signal.is_some() {
+                "signaled"
+            } else if result.exit_code == Some(0) {
+                "completed"
+            } else {
+                "failed"
+            };
+            let envelope = crate::util::output_filter::ToolResultEnvelope {
+                status: status.to_string(),
+                exit_code: result.exit_code,
+                signal: result.signal.clone(),
+                findings: result.structure.findings.clone(),
+                structure: result.structure.clone(),
+                preview: BashOutput::make_output_for_prompt(&model_output),
+                artifact: crate::util::output_filter::OutputArtifactRef {
+                    path: output_file.to_string_lossy().to_string(),
+                    total_bytes: result.total_bytes,
+                },
+                cursor: crate::util::output_filter::OutputCursor {
+                    next_byte: result.total_bytes,
+                    complete: true,
+                },
+                truncated: result.truncated || tokenix_filtered,
+            };
+
             let mut bash = BashOutput {
-                output_for_prompt: BashOutput::make_output_for_prompt(&result.combined_output),
-                output: result.combined_output.into_bytes(),
+                output_for_prompt: envelope.to_prompt_json(),
+                output: model_output.into_bytes(),
                 exit_code: result.exit_code.unwrap_or(-1),
                 command: input.command,
-                truncated: result.truncated,
+                truncated: result.truncated || tokenix_filtered,
                 signal: result.signal,
                 timed_out: result.timed_out,
                 description: Some(input.description).filter(|d| !d.trim().is_empty()),
@@ -2318,6 +2499,40 @@ impl xai_tool_runtime::Tool for BashTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokenix_replacement_is_shorter_and_keeps_structural_summary() {
+        let original = "[output structure: lines=12, errors=0, warnings=0, matches=1, \
+                        http_statuses=1, open_ports=0, vulnerable_banners=0]\n\
+                        Key findings retained from the full stream:\n- HTTP/1.1 302 Found\n\
+                        repeated repeated repeated repeated repeated";
+        let response = serde_json::to_vec(&serde_json::json!({
+            "modifiedResult": {
+                "resultType": "success",
+                "textResultForLlm": "[output structure: lines=12]\n- HTTP/1.1 302 Found"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            tokenix_replacement(original, &response).as_deref(),
+            Some("[output structure: lines=12]\n- HTTP/1.1 302 Found")
+        );
+    }
+
+    #[test]
+    fn tokenix_replacement_fails_open_when_structure_is_removed() {
+        let original = "[output structure: lines=100]\nHTTP/1.1 200 OK\nverbose verbose verbose";
+        let response = serde_json::to_vec(&serde_json::json!({
+            "modifiedResult": {
+                "resultType": "success",
+                "textResultForLlm": "short but lossy"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(tokenix_replacement(original, &response), None);
+    }
     #[test]
     fn bash_timeout_schema_defaults_to_120s() {
         let schema = serde_json::to_value(schemars::schema_for!(BashToolInput)).unwrap();
@@ -2344,6 +2559,23 @@ mod tests {
             ),
             std::time::Duration::MAX
         );
+    }
+
+    #[test]
+    fn command_description_is_optional_metadata() {
+        let schema = serde_json::to_value(schemars::schema_for!(BashToolInput)).unwrap();
+        let required = schema["required"]
+            .as_array()
+            .expect("object schema should declare required fields");
+        assert!(required.iter().any(|field| field == "command"));
+        assert!(
+            required.iter().all(|field| field != "description"),
+            "description metadata must not block command execution: {schema}"
+        );
+
+        let input: BashToolInput = serde_json::from_str(r#"{"command":"printf TOOL_OK"}"#).unwrap();
+        assert_eq!(input.command, "printf TOOL_OK");
+        assert!(input.description.is_empty());
     }
 
     use crate::computer::types::{
@@ -2477,6 +2709,7 @@ mod tests {
                     timed_out: false,
                     output_file: PathBuf::from("/tmp/test.log"),
                     total_bytes: output.len(),
+                    structure: Default::default(),
                     pid: None,
                 }),
                 bg_task_id: "task-1".to_string(),
@@ -2496,6 +2729,7 @@ mod tests {
                     timed_out: true,
                     output_file: PathBuf::from("/tmp/test.log"),
                     total_bytes: output.len(),
+                    structure: Default::default(),
                     pid: None,
                 }),
                 bg_task_id: "task-1".to_string(),
@@ -2525,6 +2759,7 @@ mod tests {
                     timed_out: false,
                     output_file: PathBuf::new(),
                     total_bytes: 0,
+                    structure: Default::default(),
                     pid: None,
                 }),
                 bg_task_id: task_id.to_string(),
@@ -2919,6 +3154,38 @@ mod tests {
             }
             other => panic!("expected Terminal(Ok(Foreground)), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn output_token_budget_bounds_history_and_retains_structural_findings() {
+        let (mut resources, _tmp) = make_real_resources(None);
+        resources.insert(Params(BashParams {
+            output_token_budget: Some(256),
+            ..BashParams::default()
+        }));
+        let tool = BashTool;
+        let result = xai_tool_runtime::Tool::run(
+            &tool,
+            test_ctx(resources.into_shared()),
+            make_input(
+                "echo FIRST; for i in $(seq 1 200); do echo noise-$i; done; \
+                 echo '22/tcp open ssh OpenSSH_9.8'; echo 'HTTP/1.1 302 Found'; echo LAST",
+            ),
+        )
+        .await
+        .unwrap();
+
+        let BashToolOutput::Foreground(bash) = result else {
+            panic!("expected foreground output");
+        };
+        let output = String::from_utf8_lossy(&bash.output);
+        assert!(bash.truncated);
+        assert!(output.chars().count() <= 1_024);
+        assert!(output.contains("[output structure:"));
+        assert!(output.contains("open_ports=1"));
+        assert!(output.contains("http_statuses=1"));
+        assert!(output.contains("22/tcp open ssh OpenSSH_9.8"));
+        assert!(output.contains("HTTP/1.1 302 Found"));
     }
 
     /// Critical regression guard for Key Decision 6: when output exceeds the

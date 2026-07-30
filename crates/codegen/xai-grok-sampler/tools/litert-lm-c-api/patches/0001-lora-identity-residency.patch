@@ -1,0 +1,421 @@
+diff --git a/runtime/components/lora.cc b/runtime/components/lora.cc
+index ee42c1b..142880b 100644
+--- a/runtime/components/lora.cc
++++ b/runtime/components/lora.cc
+@@ -84,6 +84,11 @@ absl::Status LoRA::Init() {
+
+     lora_buffers_[input_name] = std::move(tensor_buffer);
+   }
++  if (lora_buffers_.empty()) {
++    return absl::FailedPreconditionError(
++        "Base model has no LoRA input tensors; refusing a silent base-model "
++        "fallback.");
++  }
+   return absl::OkStatus();
+ }
+
+diff --git a/runtime/components/lora_manager.cc b/runtime/components/lora_manager.cc
+index e5bb4b5..c74b3ee 100644
+--- a/runtime/components/lora_manager.cc
++++ b/runtime/components/lora_manager.cc
+@@ -66,6 +66,18 @@ absl::Status LoraManager::UseLoRA(uint32_t lora_id) {
+   return absl::OkStatus();
+ }
+
++absl::Status LoraManager::UnloadLoRA(uint32_t lora_id) {
++  const bool removed = lora_data_.erase(lora_id) != 0 ||
++                       loras_.erase(lora_id) != 0;
++  if (current_lora_id_ == lora_id) {
++    current_lora_id_.reset();
++  }
++  if (!removed) {
++    return absl::NotFoundError("LoRA ID not found");
++  }
++  return absl::OkStatus();
++}
++
+ absl::StatusOr<absl::flat_hash_map<absl::string_view, litert::TensorBuffer>>
+ LoraManager::GetLoRABuffers() const {
+   if (!current_lora_id_.has_value()) {
+diff --git a/runtime/components/lora_manager.h b/runtime/components/lora_manager.h
+index 72cc7e3..43abb3d 100644
+--- a/runtime/components/lora_manager.h
++++ b/runtime/components/lora_manager.h
+@@ -59,6 +59,12 @@ class LoraManager {
+   // doesn't exist, it will be created.
+   absl::Status UseLoRA(uint32_t lora_id);
+
++  // Removes all host and backend resources for an adapter.
++  absl::Status UnloadLoRA(uint32_t lora_id);
++
++  // Selects the unmodified base model.
++  void ClearLoRA() { current_lora_id_.reset(); }
++
+   // Returns a map of all the LoRA tensor names to their duplicated
+   // TensorBuffers for the current LoRA ID.
+   absl::StatusOr<absl::flat_hash_map<absl::string_view, litert::TensorBuffer>>
+diff --git a/runtime/components/lora_manager_test.cc b/runtime/components/lora_manager_test.cc
+index e01ca5a..83e62f2 100644
+--- a/runtime/components/lora_manager_test.cc
++++ b/runtime/components/lora_manager_test.cc
+@@ -107,6 +107,28 @@ TEST_F(LoraManagerTest, UseLoRAUnknownIdFails) {
+   EXPECT_THAT(lora_manager_->UseLoRA(1), StatusIs(absl::StatusCode::kNotFound));
+ }
+
++TEST_F(LoraManagerTest, ClearLoRASelectsBaseAndKeepsAdapterReusable) {
++  ASSERT_OK_AND_ASSIGN(ModelAssets model_assets,
++                       ModelAssets::Create(GetLoraOnesFilePath()));
++  ASSERT_OK(lora_manager_->LoadLoRA(0, model_assets));
++  ASSERT_OK(lora_manager_->UseLoRA(0));
++  lora_manager_->ClearLoRA();
++  EXPECT_EQ(lora_manager_->GetCurrentLoRAId(), std::nullopt);
++  EXPECT_OK(lora_manager_->UseLoRA(0));
++  EXPECT_EQ(lora_manager_->GetCurrentLoRAId(), 0);
++}
++
++TEST_F(LoraManagerTest, UnloadLoRAReleasesActiveAdapter) {
++  ASSERT_OK_AND_ASSIGN(ModelAssets model_assets,
++                       ModelAssets::Create(GetLoraOnesFilePath()));
++  ASSERT_OK(lora_manager_->LoadLoRA(0, model_assets));
++  ASSERT_OK(lora_manager_->UseLoRA(0));
++  EXPECT_OK(lora_manager_->UnloadLoRA(0));
++  EXPECT_EQ(lora_manager_->GetCurrentLoRAId(), std::nullopt);
++  EXPECT_THAT(lora_manager_->UseLoRA(0),
++              StatusIs(absl::StatusCode::kNotFound));
++}
++
+ TEST_F(LoraManagerTest, GetCurrentLoRAIdSuccess) {
+   ASSERT_OK_AND_ASSIGN(ModelAssets model_assets,
+                        ModelAssets::Create(GetLoraOnesFilePath()));
+diff --git a/runtime/core/BUILD b/runtime/core/BUILD
+index 7da9f21..d106504 100644
+--- a/runtime/core/BUILD
++++ b/runtime/core/BUILD
+@@ -44,6 +44,7 @@ package_group(
+ ENGINE_IMPL_COMMON_DEPS = [
+     ":session_factory",
+     "@com_google_absl//absl/base:no_destructor",
++    "@com_google_absl//absl/container:flat_hash_map",
+     "@com_google_absl//absl/log",
+     "@com_google_absl//absl/log:absl_check",
+     "@com_google_absl//absl/log:absl_log",
+diff --git a/runtime/core/engine_impl.cc b/runtime/core/engine_impl.cc
+index 3921482..ea6f218 100644
+--- a/runtime/core/engine_impl.cc
++++ b/runtime/core/engine_impl.cc
+@@ -14,6 +14,7 @@
+
+ // TODO(b/417209286): Remove this once the model assets are stored in the
+ // litertlm file format.
++#include <cstdint>
+ #include <filesystem>  // NOLINT: Required for path manipulation.
+ #include <future>      // NOLINT(build/c++11)
+ #include <memory>
+@@ -23,6 +24,7 @@
+ #include <vector>
+
+ #include "absl/base/no_destructor.h"  // from @com_google_absl
++#include "absl/container/flat_hash_map.h"  // from @com_google_absl
+ #include "absl/log/absl_check.h"  // from @com_google_absl
+ #include "absl/log/absl_log.h"  // from @com_google_absl
+ #include "absl/log/check.h"  // from @com_google_absl
+@@ -185,6 +187,40 @@ class EngineImpl : public Engine {
+       return absl::FailedPreconditionError(
+           "Model resources are not initialized.");
+     }
++    const auto& lora_file = config.GetScopedLoraFile();
++    const std::string& lora_identity = config.GetLoraIdentity();
++    if (lora_file != nullptr) {
++      if (lora_identity.empty()) {
++        return absl::InvalidArgumentError(
++            "A scoped LoRA file requires an immutable adapter identity.");
++      }
++      auto resident = lora_identity_to_id_.find(lora_identity);
++      uint32_t lora_id;
++      bool newly_loaded = false;
++      if (resident == lora_identity_to_id_.end()) {
++        lora_id = next_lora_id_;
++        ASSIGN_OR_RETURN(ModelAssets lora_assets,
++                         ModelAssets::Create(lora_file));
++        RETURN_IF_ERROR(executor_->LoadLoRA(lora_id, lora_assets));
++        newly_loaded = true;
++      } else {
++        lora_id = resident->second;
++      }
++      absl::Status activation = executor_->UseLoRA(lora_id);
++      if (!activation.ok()) {
++        // UseLoRA may consume staged host data before backend validation
++        // fails. Remove the incomplete allocation so a retry starts cleanly.
++        executor_->UnloadLoRA(lora_id).IgnoreError();
++        lora_identity_to_id_.erase(lora_identity);
++        return activation;
++      }
++      if (newly_loaded) {
++        lora_identity_to_id_.emplace(lora_identity, lora_id);
++        ++next_lora_id_;
++      }
++    } else {
++      RETURN_IF_ERROR(executor_->ClearLoRA());
++    }
+     ASSIGN_OR_RETURN(
+         auto session,
+         InitializeSessionBasic(executor_.get(), tokenizer_.get(),
+@@ -236,6 +272,10 @@ class EngineImpl : public Engine {
+   std::unique_ptr<Tokenizer> tokenizer_;
+   // Shared executor for all sessions.
+   std::unique_ptr<LlmExecutor> executor_;
++  // Versioned adapter identity to executor-local allocation. IDs are never
++  // reused within an engine, even after failed activation.
++  absl::flat_hash_map<std::string, uint32_t> lora_identity_to_id_;
++  uint32_t next_lora_id_ = 0;
+   // Shared vision executor for all sessions.
+   std::unique_ptr<VisionExecutor> vision_executor_;
+   // shared audio executor for all sessions.
+diff --git a/runtime/engine/engine_settings.h b/runtime/engine/engine_settings.h
+index e05d09f..9b9955f 100644
+--- a/runtime/engine/engine_settings.h
++++ b/runtime/engine/engine_settings.h
+@@ -251,6 +251,13 @@ class SessionConfig {
+   std::shared_ptr<ScopedFile> GetScopedLoraFile() const;
+   void SetScopedLoraFile(std::shared_ptr<ScopedFile> scoped_lora_file);
+
++  // Stable identity for a scoped LoRA revision. The runtime uses this key to
++  // share one resident adapter allocation across compatible sessions.
++  const std::string& GetLoraIdentity() const { return lora_identity_; }
++  void SetLoraIdentity(std::string lora_identity) {
++    lora_identity_ = std::move(lora_identity);
++  }
++
+   // The maximum number of tokens to generate in a single request:
+   // Getters for the max output tokens.
+   int GetMaxOutputTokens() const { return max_output_tokens_; }
+@@ -317,6 +324,9 @@ class SessionConfig {
+   // Scoped file for the LoRA weights.
+   std::shared_ptr<ScopedFile> scoped_lora_file_;
+
++  // Immutable caller-supplied identity for the scoped LoRA revision.
++  std::string lora_identity_;
++
+   // The maximum number of tokens to generate in a single request. This limits
+   // the number of decoding steps for a request, as opposed to
+   // LlmExecutorSettings::GetMaxNumTokens(), which limits the total number of
+diff --git a/runtime/executor/BUILD b/runtime/executor/BUILD
+index 05e0b6d..65a0744 100644
+--- a/runtime/executor/BUILD
++++ b/runtime/executor/BUILD
+@@ -279,6 +279,7 @@ cc_library(
+         "//runtime/components:model_resources",
+         "//runtime/components:model_resources_litert_lm",
+         "//runtime/components:model_resources_task",
++        "//runtime/components:lora_manager",
+         "//runtime/components:sampler",
+         "//runtime/components:sampler_factory",
+         "//runtime/components/embedding_lookup:embedding_lookup_manager",
+diff --git a/runtime/executor/llm_executor_base.h b/runtime/executor/llm_executor_base.h
+index f94c77b..2fec80a 100644
+--- a/runtime/executor/llm_executor_base.h
++++ b/runtime/executor/llm_executor_base.h
+@@ -15,6 +15,7 @@
+ #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_LLM_EXECUTOR_BASE_H_
+ #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_LLM_EXECUTOR_BASE_H_
+
++#include <cstdint>
+ #include <vector>
+
+ #include "absl/status/status.h"  // from @com_google_absl
+@@ -23,6 +24,7 @@
+ #include "absl/strings/string_view.h"  // from @com_google_absl
+ #include "litert/cc/litert_environment.h"  // from @litert
+ #include "litert/cc/litert_tensor_buffer.h"  // from @litert
++#include "runtime/executor/executor_settings_base.h"
+ #include "runtime/executor/llm_executor_io_types.h"
+ #include "runtime/executor/llm_executor_settings.h"
+
+@@ -126,6 +128,28 @@ class LlmExecutorBase {
+     return absl::OkStatus();
+   }
+
++  // Loads an adapter into the base-model executor without selecting it.
++  virtual absl::Status LoadLoRA(uint32_t lora_id,
++                                const ModelAssets& model_assets) {
++    return absl::UnimplementedError(absl::StrCat(
++        "LoRA loading not implemented for backend: ", ExecutorBackendName()));
++  }
++
++  // Selects a previously loaded adapter for subsequent prefill/decode calls.
++  virtual absl::Status UseLoRA(uint32_t lora_id) {
++    return absl::UnimplementedError(absl::StrCat(
++        "LoRA selection not implemented for backend: ", ExecutorBackendName()));
++  }
++
++  // Removes an adapter after a failed activation or explicit eviction.
++  virtual absl::Status UnloadLoRA(uint32_t lora_id) {
++    return absl::UnimplementedError(absl::StrCat(
++        "LoRA unloading not implemented for backend: ", ExecutorBackendName()));
++  }
++
++  // Selects the unmodified base model for subsequent calls.
++  virtual absl::Status ClearLoRA() { return absl::OkStatus(); }
++
+   // ------------Vision APIs------------:
+   // This function will populate the GPU tensors with the vision embeddings and
+   // vision per layer embeddings. This should only be used before the
+diff --git a/runtime/executor/llm_litert_compiled_model_executor.cc b/runtime/executor/llm_litert_compiled_model_executor.cc
+index f210233..64a1e18 100644
+--- a/runtime/executor/llm_litert_compiled_model_executor.cc
++++ b/runtime/executor/llm_litert_compiled_model_executor.cc
+@@ -393,6 +393,47 @@ absl::StatusOr<TensorBuffer> CreateFP16OutputBuffer(
+
+ }  // namespace
+
++absl::Status LlmLiteRtCompiledModelExecutorBase::InitializeLoraManager() {
++  ASSIGN_OR_RETURN(auto manager, LoraManager::Create(compiled_model_));
++  lora_manager_ = std::move(manager);
++  return absl::OkStatus();
++}
++
++absl::Status LlmLiteRtCompiledModelExecutorBase::LoadLoRA(
++    uint32_t lora_id, const ModelAssets& model_assets) {
++  RET_CHECK_NE(lora_manager_, nullptr);
++  return lora_manager_->LoadLoRA(lora_id, model_assets);
++}
++
++absl::Status LlmLiteRtCompiledModelExecutorBase::UseLoRA(uint32_t lora_id) {
++  RET_CHECK_NE(lora_manager_, nullptr);
++  return lora_manager_->UseLoRA(lora_id);
++}
++
++absl::Status LlmLiteRtCompiledModelExecutorBase::UnloadLoRA(uint32_t lora_id) {
++  RET_CHECK_NE(lora_manager_, nullptr);
++  return lora_manager_->UnloadLoRA(lora_id);
++}
++
++absl::Status LlmLiteRtCompiledModelExecutorBase::ClearLoRA() {
++  RET_CHECK_NE(lora_manager_, nullptr);
++  lora_manager_->ClearLoRA();
++  return absl::OkStatus();
++}
++
++absl::Status LlmLiteRtCompiledModelExecutorBase::BindActiveLora(
++    absl::flat_hash_map<absl::string_view, TensorBuffer>& input_buffers) {
++  RET_CHECK_NE(lora_manager_, nullptr);
++  if (!lora_manager_->GetCurrentLoRAId().has_value()) {
++    return absl::OkStatus();
++  }
++  ASSIGN_OR_RETURN(auto lora_buffers, lora_manager_->GetLoRABuffers());
++  for (auto& [name, buffer] : lora_buffers) {
++    input_buffers[name] = std::move(buffer);
++  }
++  return absl::OkStatus();
++}
++
+ absl::Status LlmLiteRtCompiledModelExecutorBase::CreatePrefillInputBuffers(
+     absl::string_view prefill_signature, int sequence_length,
+     int context_length,
+@@ -756,6 +797,7 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::BindTensorsAndRunPrefill(
+     LITERT_ASSIGN_OR_RETURN(auto input_buffer_dup, input_buffer.Duplicate());
+     input_buffers[input_name] = std::move(input_buffer_dup);
+   }
++  RETURN_IF_ERROR(BindActiveLora(input_buffers));
+   absl::flat_hash_map<absl::string_view, TensorBuffer> output_buffers;
+   for (const auto& [output_name, output_buffer] : *output_kv_cache_buffers_) {
+     LITERT_ASSIGN_OR_RETURN(auto output_buffer_dup, output_buffer.Duplicate());
+@@ -958,6 +1000,7 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::BindTensorsAndRunDecode(
+     LITERT_ASSIGN_OR_RETURN(auto input_buffer_dup, input_buffer.Duplicate());
+     decode_input_buffers[input_name] = std::move(input_buffer_dup);
+   }
++  RETURN_IF_ERROR(BindActiveLora(decode_input_buffers));
+   absl::flat_hash_map<absl::string_view, TensorBuffer> decode_output_buffers;
+   for (const auto& [output_name, output_buffer] : decode_output_buffers_) {
+     // LITERT_ASSIGN_OR_RETURN() causes a compilation error on windows.
+@@ -1769,7 +1812,7 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
+     }
+   }
+
+-  return absl::WrapUnique(new LlmLiteRtCompiledModelExecutorStatic(
++  auto executor = absl::WrapUnique(new LlmLiteRtCompiledModelExecutorStatic(
+       std::move(executor_settings), lrt_env, litert_model,
+       std::move(compiled_model), std::move(decode_input_buffers),
+       std::move(decode_output_buffers), std::move(input_kv_cache_buffers),
+@@ -1779,6 +1822,8 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
+       signatures, batch_size, std::move(cache_path),
+       std::move(embedding_lookup), std::move(per_layer_embedding_lookup),
+       use_fp16_precision, activation_data_type, std::move(mtp_drafter)));
++  RETURN_IF_ERROR(executor->InitializeLoraManager());
++  return executor;
+ }
+
+ /* ===========================================================================*/
+@@ -2053,7 +2098,8 @@ LlmLiteRtCompiledModelExecutorDynamic::Create(
+     bool is_attn_mask_input =
+         signatures.input_attn_mask.has_value() &&
+         absl::StartsWith(input_name, signatures.input_attn_mask.value());
+-    if (!is_kv_cache_input && !is_attn_mask_input) {
++    if (!is_kv_cache_input && !is_attn_mask_input &&
++        !IsLoRAInputName(input_name)) {
+       LITERT_ASSIGN_OR_RETURN(
+           auto input_buffer,
+           compiled_model.CreateInputBuffer(kDecodeSignatureRunner, input_name));
+@@ -2090,7 +2136,7 @@ LlmLiteRtCompiledModelExecutorDynamic::Create(
+   std::unique_ptr<EmbeddingLookupManager> per_layer_embedding_lookup;
+   RETURN_IF_ERROR(InitializeEmbeddingLookups(
+       lrt_env, resources, embedding_lookup, per_layer_embedding_lookup));
+-  return absl::WrapUnique(new LlmLiteRtCompiledModelExecutorDynamic(
++  auto executor = absl::WrapUnique(new LlmLiteRtCompiledModelExecutorDynamic(
+       std::move(executor_settings), lrt_env, litert_model,
+       std::move(compiled_model), std::move(decode_input_buffers),
+       std::move(decode_output_buffers), prefill_chunk_size, k_dynamic_dim,
+@@ -2099,6 +2145,8 @@ LlmLiteRtCompiledModelExecutorDynamic::Create(
+       std::move(weight_cache_path), std::move(embedding_lookup),
+       std::move(per_layer_embedding_lookup), /*use_fp16_precision=*/false,
+       /*logits_data_type=*/LogitsDataType::FLOAT32));
++  RETURN_IF_ERROR(executor->InitializeLoraManager());
++  return executor;
+ }
+
+ }  // namespace litert::lm
+diff --git a/runtime/executor/llm_litert_compiled_model_executor.h b/runtime/executor/llm_litert_compiled_model_executor.h
+index 5a20518..5989ecb 100644
+--- a/runtime/executor/llm_litert_compiled_model_executor.h
++++ b/runtime/executor/llm_litert_compiled_model_executor.h
+@@ -35,6 +35,7 @@
+ #include "litert/cc/litert_options.h"  // from @litert
+ #include "litert/cc/litert_tensor_buffer.h"  // from @litert
+ #include "runtime/components/embedding_lookup/embedding_lookup_manager.h"
++#include "runtime/components/lora_manager.h"
+ #include "runtime/components/model_resources.h"
+ #include "runtime/components/sampler.h"
+ #include "runtime/executor/executor_settings_base.h"
+@@ -99,6 +100,12 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
+   absl::Status UpdateExecutorSettings(
+       const LlmExecutorSettings& executor_settings) override;
+
++  absl::Status LoadLoRA(uint32_t lora_id,
++                        const ModelAssets& model_assets) override;
++  absl::Status UseLoRA(uint32_t lora_id) override;
++  absl::Status UnloadLoRA(uint32_t lora_id) override;
++  absl::Status ClearLoRA() override;
++
+   // Gets the current step of the executor.
+   // Public API, the return value is the current step that user expects (e.g.
+   // users prefill 100 tokens, then they expect the current step to be 100). It
+@@ -187,6 +194,11 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
+   CreateMtpDrafterCompiledModel(ModelResources& resources, Environment& lrt_env,
+                                 Options& compilation_options);
+
++  absl::Status InitializeLoraManager();
++
++  absl::Status BindActiveLora(
++      absl::flat_hash_map<absl::string_view, TensorBuffer>& input_buffers);
++
+   // Rolls back the processed tokens to the current step.
+   absl::Status RollBackProcessedTokens();
+
+@@ -271,6 +283,7 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
+   Environment& env_;
+   const Model& model_;
+   CompiledModel compiled_model_;
++  std::unique_ptr<LoraManager> lora_manager_;
+
+   absl::flat_hash_map<absl::string_view, TensorBuffer> decode_input_buffers_;
+   absl::flat_hash_map<absl::string_view, TensorBuffer> decode_output_buffers_;

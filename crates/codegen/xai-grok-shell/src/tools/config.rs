@@ -11,6 +11,26 @@ use xai_grok_tools::registry::types::ToolConfig;
 /// background tasks are always unbounded.
 pub const PRODUCTION_MAX_TIMEOUT_SECS: f64 = 36_000.0; // 10 hours
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputBudgetMode {
+    #[default]
+    Off,
+    /// Enforce the per-result cap while leaving the cumulative turn uncapped.
+    Soft,
+    /// Enforce both per-result and cumulative per-turn caps.
+    Hard,
+}
+
+/// Cross-tool model-history budget (`[toolset.output_budget]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolOutputBudgetConfig {
+    pub mode: ToolOutputBudgetMode,
+    pub per_result_tokens: Option<u32>,
+    pub per_turn_tokens: Option<u32>,
+}
+
 /// User configurable settings for the built-in bash tool (`[toolset.bash]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -25,6 +45,13 @@ pub struct BashToolConfig {
     /// version gate needed.
     pub max_timeout_secs: Option<f64>,
     pub output_byte_limit: Option<usize>,
+    /// Optional per-command model-history budget in estimated tokens. Omit to
+    /// disable the token-specific rule.
+    pub output_token_budget: Option<usize>,
+    /// Optional Tokenix executable used as a fail-open post-processing filter
+    /// for completed foreground command output. The raw stream and output file
+    /// are not modified.
+    pub tokenix_path: Option<String>,
     pub cmd_prefix: Option<String>,
     /// Whether to auto-background a command when it times out (default: `true`).
     pub auto_background_on_timeout: Option<bool>,
@@ -60,6 +87,12 @@ impl BashToolConfig {
         map.insert("max_timeout_secs".into(), max_timeout_secs.into());
         if let Some(limit) = self.output_byte_limit {
             map.insert("output_byte_limit".into(), limit.into());
+        }
+        if let Some(limit) = self.output_token_budget {
+            map.insert("output_token_budget".into(), limit.into());
+        }
+        if let Some(ref path) = self.tokenix_path {
+            map.insert("tokenix_path".into(), path.clone().into());
         }
         if let Some(ref p) = self.cmd_prefix {
             map.insert("cmd_prefix".into(), p.clone().into());
@@ -168,6 +201,10 @@ impl WebFetchToolConfig {
 #[serde(default)]
 pub struct ShellToolsetConfig {
     pub bash: BashToolConfig,
+    /// Final history-insertion budget for native, MCP, task, Bash, and dynamic
+    /// tool outputs. The local runtime uses its exact active-model tokenizer.
+    #[serde(default)]
+    pub output_budget: ToolOutputBudgetConfig,
     pub web_search: SamplerConfig,
     /// Web fetch tool parameters (`[toolset.web_fetch]`).
     #[serde(default)]
@@ -251,6 +288,7 @@ impl ShellToolsetConfig {
         };
         let mut toolset = base.unwrap_or_else(|| Self {
             bash: BashToolConfig::default(),
+            output_budget: ToolOutputBudgetConfig::default(),
             web_search: web_search_sampling_config(default_base),
             web_fetch: WebFetchToolConfig::default(),
             ask_user_question: AskUserQuestionToolConfig::default(),
@@ -680,6 +718,32 @@ mod tests {
         assert_eq!(
             allow_bg_op(&local.to_bash_params_json(None, None)),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn output_token_budget_is_optional_and_forwarded_exactly() {
+        let unset = BashToolConfig::default().to_bash_params_json(None, None);
+        assert!(!unset.contains_key("output_token_budget"));
+        assert!(!unset.contains_key("tokenix_path"));
+
+        let configured = BashToolConfig {
+            output_token_budget: Some(2_000),
+            tokenix_path: Some("/opt/tokenix/bin/tokenix".to_string()),
+            ..BashToolConfig::default()
+        }
+        .to_bash_params_json(None, None);
+        assert_eq!(
+            configured
+                .get("output_token_budget")
+                .and_then(serde_json::Value::as_u64),
+            Some(2_000)
+        );
+        assert_eq!(
+            configured
+                .get("tokenix_path")
+                .and_then(serde_json::Value::as_str),
+            Some("/opt/tokenix/bin/tokenix")
         );
     }
 

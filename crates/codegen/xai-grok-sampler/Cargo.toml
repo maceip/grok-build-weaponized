@@ -8,6 +8,7 @@ description = "Actor-based sampling/inference layer for xAI grok (HTTP streaming
 [dependencies]
 # Internal
 xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
+xai-grok-runtime = { path = "../xai-grok-runtime" }
 xai-grok-version = { workspace = true }
 
 # External
@@ -17,6 +18,8 @@ chrono = { workspace = true, features = ["serde"] }
 eventsource-stream = { workspace = true }
 futures-util = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
+libloading = "0.8.9"
+percent-encoding = "2"
 reqwest = { workspace = true, features = ["stream"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -24,10 +27,12 @@ tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+url = { workspace = true }
 
 [dev-dependencies]
 # Mock HTTP server for actor / request_task integration tests.
 axum = { workspace = true }
+tempfile = { workspace = true }
 # Shared SSE generators for the happy-path mock payloads.
 xai-grok-test-support = { workspace = true }
 # `start_paused = true` for deterministic timeout testing; `net` for

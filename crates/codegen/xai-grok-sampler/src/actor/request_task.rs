@@ -80,7 +80,7 @@ enum AttemptOutcome {
 /// `active_requests` via [`tokio::task::JoinSet::join_next`].
 pub(crate) async fn run_request_task(
     request_id: RequestId,
-    request: ConversationRequest,
+    mut request: ConversationRequest,
     config: SamplerConfig,
     retry_policy: RetryPolicy,
     event_tx: mpsc::UnboundedSender<SamplingEvent>,
@@ -88,6 +88,63 @@ pub(crate) async fn run_request_task(
     completion_tx: Option<oneshot::Sender<CompletionResult>>,
 ) -> RequestId {
     let mut completion_tx = completion_tx;
+    match crate::litert_lm::LiteRtLmConfig::from_base_url(&config.base_url) {
+        Ok(Some(local_config)) => {
+            // The HTTP client normally applies these model defaults before
+            // serializing a request. Direct LiteRT-LM requests bypass that
+            // client entirely, so apply the same defaults here.
+            if request.model.is_none() {
+                request.model = Some(config.model.clone());
+            }
+            if request.temperature.is_none() {
+                request.temperature = config.temperature;
+            }
+            if request.top_p.is_none() {
+                request.top_p = config.top_p;
+            }
+            if request.max_output_tokens.is_none() {
+                request.max_output_tokens = config.max_completion_tokens;
+            }
+            let result = crate::litert_lm::run_local_request(
+                request_id.clone(),
+                request,
+                local_config,
+                config.model.clone(),
+                &event_tx,
+                &cancel_token,
+            )
+            .await;
+            match result {
+                Ok(crate::litert_lm::LocalInferenceResult::Completed { response, metrics }) => {
+                    let _ = event_tx.send(SamplingEvent::Completed {
+                        request_id: request_id.clone(),
+                        response: response.clone(),
+                        metrics: metrics.clone(),
+                    });
+                    send_completion(&mut completion_tx, Ok((*response, metrics)));
+                }
+                Ok(crate::litert_lm::LocalInferenceResult::Cancelled) => {
+                    handle_cancellation(&event_tx, &request_id, &mut completion_tx);
+                }
+                Err(error) => {
+                    emit_failed(&event_tx, &request_id, &error);
+                    send_completion(&mut completion_tx, Err(error));
+                }
+            }
+            return request_id;
+        }
+        Ok(None) => {}
+        Err(error) if config.base_url.starts_with("litert-lm:") => {
+            let error = SamplingError::StreamError {
+                error_type: "litert_lm_config".to_owned(),
+                message: error,
+            };
+            emit_failed(&event_tx, &request_id, &error);
+            send_completion(&mut completion_tx, Err(error));
+            return request_id;
+        }
+        Err(_) => {}
+    }
     let idle_timeout = Duration::from_secs(
         config
             .idle_timeout_secs

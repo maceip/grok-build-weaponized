@@ -1895,20 +1895,37 @@ pub(crate) async fn spawn_session_actor(
                     files = files.len(),
                     "MEMORY_REINDEX: background reindex complete"
                 );
-                let embedded_count = if let Some(api_key) = sampling_api_key {
-                    if let Some(provider) =
-                        crate::session::memory::embedding::ApiEmbeddingProvider::from_session(
-                            &embed_config,
-                            sampling_base_url,
-                            api_key,
-                        )
-                    {
-                        crate::session::memory::embed_missing_chunks(&index, &provider).await
-                    } else {
-                        0
+                let embedded_count = match embed_config
+                    .provider
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "local" | "auto" => {
+                        if let Some(provider) =
+                            crate::session::memory::embedding::LocalEmbeddingProvider::from_config(
+                                &embed_config,
+                            )
+                        {
+                            crate::session::memory::embed_missing_chunks(&index, &provider).await
+                        } else {
+                            0
+                        }
                     }
-                } else {
-                    0
+                    "api" => {
+                        if let Some(api_key) = sampling_api_key
+                            && let Some(provider) = crate::session::memory::embedding::ApiEmbeddingProvider::from_session(
+                                &embed_config,
+                                sampling_base_url,
+                                api_key,
+                            )
+                        {
+                            crate::session::memory::embed_missing_chunks(&index, &provider).await
+                        } else {
+                            0
+                        }
+                    }
+                    _ => 0,
                 };
                 xai_grok_telemetry::session_ctx::log_event(
                     xai_grok_telemetry::memory_telemetry::MemoryReindex {

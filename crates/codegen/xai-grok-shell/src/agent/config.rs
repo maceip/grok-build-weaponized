@@ -1099,6 +1099,72 @@ pub struct ModelsConfig {
     pub inference_idle_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    /// Deterministic per-turn selection between a lightweight chat model and
+    /// an analytical model. Routing happens before a user turn is dispatched,
+    /// so every inference and tool continuation in that turn uses one model.
+    #[serde(default, skip_serializing_if = "ModelRouterConfig::is_disabled")]
+    pub router: ModelRouterConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ModelRouterConfig {
+    /// Opt-in gate. Disabled configs preserve explicit `/model` selection.
+    pub enabled: bool,
+    /// Catalog ID for lightweight conversational turns.
+    pub chat_model: Option<String>,
+    /// Catalog ID for code, diagnosis, planning, and other analytical turns.
+    pub analysis_model: Option<String>,
+    /// Catalog ID for turns that are likely to require filesystem, process, or
+    /// other tool execution. This may equal `chat_model`, but is separate so a
+    /// reasoning model whose packaged chat template lacks tool support is never
+    /// asked to impersonate execution.
+    pub execution_model: Option<String>,
+    /// Planner model for typed PlanPacket generation. Falls back to
+    /// `analysis_model` for existing configurations.
+    pub planner_model: Option<String>,
+    /// Reviewer/final-synthesis model. Falls back to `planner_model`, then
+    /// `analysis_model`.
+    pub reviewer_model: Option<String>,
+    /// Route prompts at least this many Unicode scalar values to `analysis_model`.
+    pub analysis_min_chars: usize,
+    /// Additional case-insensitive substrings that force the analytical route.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub analysis_keywords: Vec<String>,
+    /// Additional case-insensitive substrings that force the tool-capable
+    /// execution route. Execution matching takes precedence over analysis.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub execution_keywords: Vec<String>,
+}
+
+impl Default for ModelRouterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            chat_model: None,
+            analysis_model: None,
+            execution_model: None,
+            planner_model: None,
+            reviewer_model: None,
+            analysis_min_chars: 480,
+            analysis_keywords: Vec::new(),
+            execution_keywords: Vec::new(),
+        }
+    }
+}
+
+impl ModelRouterConfig {
+    fn is_disabled(&self) -> bool {
+        !self.enabled
+            && self.chat_model.is_none()
+            && self.analysis_model.is_none()
+            && self.execution_model.is_none()
+            && self.planner_model.is_none()
+            && self.reviewer_model.is_none()
+            && self.analysis_min_chars == Self::default().analysis_min_chars
+            && self.analysis_keywords.is_empty()
+            && self.execution_keywords.is_empty()
+    }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -4428,6 +4494,11 @@ impl ModelEntry {
     pub fn has_own_credentials(&self) -> bool {
         self.own_credential().is_some() || self.auth_provider.is_some()
     }
+    /// Whether this model is served by Grok's in-process LiteRT-LM transport
+    /// and therefore intentionally has no API credential.
+    pub fn is_local_inference(&self) -> bool {
+        self.base_url.starts_with("litert-lm://")
+    }
 }
 impl std::ops::Deref for ModelEntry {
     type Target = ModelInfo;
@@ -5023,7 +5094,7 @@ pub fn resolve_aux_model_sampling_config(
             None,
             None,
         );
-        if sampler.api_key.is_some() {
+        if sampler.api_key.is_some() || sampler.base_url.starts_with("litert-lm://") {
             return Some(sampler);
         }
         if entry.effective_auth_provider().is_some() {
@@ -8460,6 +8531,36 @@ reasoning_effort = "low"
         assert_eq!(cfg.models.default.as_deref(), Some("my-enterprise-model"));
         assert_eq!(cfg.models.web_search.as_deref(), Some("enterprise-search"));
         assert_eq!(cfg.models.session_summary.as_deref(), Some("title-model"));
+    }
+    #[test]
+    fn parsed_config_has_contextual_model_router() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [models.router]
+            enabled = true
+            chat_model = "local-chat"
+            analysis_model = "local-analysis"
+            execution_model = "local-execution"
+            analysis_min_chars = 700
+            analysis_keywords = ["packet capture"]
+            execution_keywords = ["run command"]
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw).expect("router config should parse");
+        assert!(cfg.models.router.enabled);
+        assert_eq!(cfg.models.router.chat_model.as_deref(), Some("local-chat"));
+        assert_eq!(
+            cfg.models.router.analysis_model.as_deref(),
+            Some("local-analysis")
+        );
+        assert_eq!(
+            cfg.models.router.execution_model.as_deref(),
+            Some("local-execution")
+        );
+        assert_eq!(cfg.models.router.analysis_min_chars, 700);
+        assert_eq!(cfg.models.router.analysis_keywords, vec!["packet capture"]);
+        assert_eq!(cfg.models.router.execution_keywords, vec!["run command"]);
     }
     #[test]
     fn config_models_default_is_not_overwritten_by_default_models_json() {

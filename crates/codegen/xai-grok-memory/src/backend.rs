@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 use xai_grok_tools::types::memory_backend::{MemoryBackend, MemorySearchResult};
 
-use super::embedding::EmbeddingProvider as _;
 use super::storage::MemoryStorage;
 use super::watcher::MemoryFileWatcher;
 
@@ -125,7 +124,9 @@ pub struct MemoryBackendParams {
 impl MemoryBackendParams {
     /// Async so `current_api_key_async` can drive the AuthManager
     /// refresh chain; reindex loops outlive the OIDC TTL.
-    pub async fn make_embedding_provider(&self) -> Option<super::embedding::ApiEmbeddingProvider> {
+    pub async fn make_embedding_provider(
+        &self,
+    ) -> Option<Arc<dyn super::embedding::EmbeddingProvider>> {
         build_embedding_provider(
             self.embed_config.as_ref(),
             &self.embedding_credentials,
@@ -141,10 +142,27 @@ async fn build_embedding_provider(
     credentials: &EndpointScopedCredentials,
     static_api_key: Option<&str>,
     base_url: &str,
-) -> Option<super::embedding::ApiEmbeddingProvider> {
+) -> Option<Arc<dyn super::embedding::EmbeddingProvider>> {
     let config = config?;
     if config.model.as_ref().is_none_or(|m| m.is_empty()) {
         return None;
+    }
+    match config.provider.trim().to_ascii_lowercase().as_str() {
+        "local" | "auto" => {
+            return super::embedding::LocalEmbeddingProvider::from_config(config).map(|provider| {
+                Arc::new(provider) as Arc<dyn super::embedding::EmbeddingProvider>
+            });
+        }
+        "api" => {}
+        "off" | "none" | "disabled" => return None,
+        provider => {
+            tracing::warn!(
+                target: xai_grok_telemetry::memory_log::TARGET,
+                provider,
+                "unknown memory embedding provider; using FTS-only retrieval"
+            );
+            return None;
+        }
     }
 
     // Enforce at runtime, in release too: a `debug_assert` would compile out of
@@ -165,7 +183,8 @@ async fn build_embedding_provider(
             config,
             base_url.to_owned(),
             client,
-        );
+        )
+        .map(|provider| Arc::new(provider) as Arc<dyn super::embedding::EmbeddingProvider>);
     }
 
     let per_call_key = if credentials_approved && let Some(p) = credentials.api_key_provider() {
@@ -175,6 +194,7 @@ async fn build_embedding_provider(
     };
     let api_key = per_call_key.or_else(|| static_api_key.map(|s| s.to_owned()))?;
     super::embedding::ApiEmbeddingProvider::from_session(config, base_url.to_owned(), api_key)
+        .map(|provider| Arc::new(provider) as Arc<dyn super::embedding::EmbeddingProvider>)
 }
 
 /// `MemoryBackend` implementation backed by hybrid search (FTS5 + vector KNN).
@@ -269,7 +289,9 @@ impl MemoryBackendImpl {
         xai_sqlite_journal::JournalMode::for_db_path(&self.db_path).open_readonly(&self.db_path)
     }
 
-    async fn make_embedding_provider(&self) -> Option<super::embedding::ApiEmbeddingProvider> {
+    async fn make_embedding_provider(
+        &self,
+    ) -> Option<Arc<dyn super::embedding::EmbeddingProvider>> {
         build_embedding_provider(
             self.embed_config.as_ref(),
             &self.embedding_credentials,
@@ -397,36 +419,13 @@ impl MemoryBackend for MemoryBackendImpl {
             watcher_sync_stats = Some((dirty_count, changed_chunk_count, sync_start));
         }
 
-        // ── Async phase: embed missing chunks (no &index borrow) ──
+        // Provider construction is non-blocking for local models: the shared
+        // model loads in the background and reports unavailable until ready.
         let provider = self.make_embedding_provider().await;
-        let mut embedded_count: usize = 0;
-        if !reindex_chunks.is_empty()
-            && let Some(ref provider) = provider
-        {
-            let mut upserts: Vec<(String, Vec<f32>)> = Vec::new();
-            for batch in reindex_chunks.chunks(32) {
-                let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
-                match provider.embed_batch(&texts).await {
-                    Ok(embeddings) => {
-                        for ((chunk_id, _), emb) in batch.iter().zip(embeddings.into_iter()) {
-                            upserts.push((chunk_id.clone(), emb));
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: xai_grok_telemetry::memory_log::TARGET,
-                            error = %e,
-                            "embedding batch failed during sync-on-search, skipping"
-                        );
-                    }
-                }
-            }
-            // Sync: upsert embeddings back (borrows &index, no await)
-            for (chunk_id, emb) in &upserts {
-                let _ = index.upsert_embedding(chunk_id, emb);
-            }
-            embedded_count = upserts.len();
-        }
+        // Embedding writes are deliberately not performed on the interactive
+        // search path. The background backfill scheduled below opens its own
+        // WAL connection after FTS results have been returned.
+        let embedded_count: usize = 0;
         if needs_release {
             index.release_claim();
             // Fire watcher-sync telemetry now that we know the embedded count.
@@ -443,6 +442,20 @@ impl MemoryBackend for MemoryBackendImpl {
                 );
             }
         }
+
+        // Start vector query generation before lexical search. The local
+        // provider runs inference on the blocking pool while this task performs
+        // SQLite FTS work; an unavailable or busy provider returns immediately.
+        let query_embedding_task = if index.vec_available()
+            && let Some(provider) = provider.clone()
+        {
+            let query = query.to_owned();
+            Some(tokio::spawn(
+                async move { provider.embed_query(&query).await },
+            ))
+        } else {
+            None
+        };
 
         // ── Sync phase 2: FTS search ──
         let mut search_config = self.search_config.clone();
@@ -468,27 +481,33 @@ impl MemoryBackend for MemoryBackendImpl {
             }
         }
 
-        let vec_available = index.vec_available() && provider.is_some();
-
         // ── Async phase: embed query for vector search (no &index borrow) ──
-        let query_embedding = if vec_available {
-            if let Some(ref provider) = provider {
-                match provider.embed_batch(&[query]).await {
-                    Ok(embeddings) if !embeddings.is_empty() => {
-                        Some(embeddings.into_iter().next().unwrap())
-                    }
-                    Ok(_) => None,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "embedding query failed, falling back to FTS-only");
-                        None
-                    }
+        let query_embedding = if let Some(mut task) = query_embedding_task {
+            match tokio::time::timeout(std::time::Duration::from_millis(35), &mut task).await {
+                Ok(Ok(Ok(embedding))) => Some(embedding),
+                Ok(Ok(Err(error))) => {
+                    tracing::debug!(
+                        %error,
+                        "embedding query unavailable, using immediate FTS-only results"
+                    );
+                    None
                 }
-            } else {
-                None
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "embedding query task failed, using FTS-only results");
+                    None
+                }
+                Err(_) => {
+                    task.abort();
+                    tracing::debug!(
+                        "embedding query exceeded interactive budget, using immediate FTS-only results"
+                    );
+                    None
+                }
             }
         } else {
             None
         };
+        let vec_available = query_embedding.is_some();
 
         // ── Sync phase 3: vector search + scoring + merge (borrows &index) ──
         let results = super::search::hybrid_search_merge(
@@ -544,6 +563,18 @@ impl MemoryBackend for MemoryBackendImpl {
         self.search_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        if !reindex_chunks.is_empty()
+            && let Some(provider) = provider
+        {
+            schedule_embedding_backfill(
+                self.db_path.clone(),
+                self.storage.clone(),
+                embed_dims,
+                reindex_chunks,
+                provider,
+            );
+        }
+
         Ok(results
             .into_iter()
             .map(|r| MemorySearchResult {
@@ -589,6 +620,71 @@ impl MemoryBackend for MemoryBackendImpl {
     }
 }
 
+fn schedule_embedding_backfill(
+    db_path: PathBuf,
+    storage: MemoryStorage,
+    dimensions: usize,
+    chunks: Vec<(String, String)>,
+    provider: Arc<dyn super::embedding::EmbeddingProvider>,
+) {
+    tokio::spawn(async move {
+        let mut upserts = Vec::with_capacity(chunks.len());
+        for batch in chunks.chunks(32) {
+            let texts = batch
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>();
+            let mut retries = 0_u8;
+            let embeddings = loop {
+                match provider.embed_batch(&texts).await {
+                    Ok(embeddings) => break Some(embeddings),
+                    Err(error) if retries < 3 => {
+                        retries += 1;
+                        tracing::debug!(
+                            target: xai_grok_telemetry::memory_log::TARGET,
+                            %error,
+                            retries,
+                            "local embedding backfill deferred"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: xai_grok_telemetry::memory_log::TARGET,
+                            %error,
+                            "local embedding backfill skipped; FTS remains authoritative"
+                        );
+                        break None;
+                    }
+                }
+            };
+            let Some(embeddings) = embeddings else {
+                continue;
+            };
+            upserts.extend(
+                batch
+                    .iter()
+                    .zip(embeddings)
+                    .map(|((chunk_id, _), embedding)| (chunk_id.clone(), embedding)),
+            );
+        }
+        if upserts.is_empty() {
+            return;
+        }
+        let Ok(index) = super::index::MemoryIndex::open_or_create(
+            &db_path,
+            storage,
+            xai_grok_config_types::MemoryIndexConfig::default(),
+            dimensions,
+        ) else {
+            return;
+        };
+        for (chunk_id, embedding) in upserts {
+            let _ = index.upsert_embedding(&chunk_id, &embedding);
+        }
+    });
+}
+
 #[cfg(test)]
 mod factory_tests {
     use super::*;
@@ -615,6 +711,79 @@ mod factory_tests {
             search_source: "tool",
             embedding_credentials: EndpointScopedCredentials::none(),
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit 100,000-chunk warm retrieval gate for the release target host"]
+    async fn warm_retrieval_over_one_hundred_thousand_chunks_stays_below_fifty_ms_p95() {
+        use xai_grok_tools::types::memory_backend::MemoryBackend as _;
+
+        let tmp = TempDir::new().unwrap();
+        init_sqlite_vec();
+        let storage = make_storage(&tmp);
+        let db_path = storage.workspace_dir().join("index.sqlite");
+        let index = MemoryIndex::open_or_create(
+            &db_path,
+            storage.clone(),
+            xai_grok_config_types::MemoryIndexConfig::default(),
+            4,
+        )
+        .unwrap();
+        drop(index);
+
+        let mut db = rusqlite::Connection::open(&db_path).unwrap();
+        let transaction = db.transaction().unwrap();
+        for index in 0..100_000_u32 {
+            let text = if index % 1_000 == 0 {
+                format!("criticalport open service evidence row {index}")
+            } else {
+                format!("routine workspace evidence row {index}")
+            };
+            transaction
+                .execute(
+                    "INSERT INTO chunks \
+                     (id, path, start_line, end_line, text, hash, source, created_at, updated_at) \
+                     VALUES (?1, ?2, 1, 1, ?3, ?4, 'workspace', 1, 1)",
+                    rusqlite::params![
+                        format!("chunk-{index}"),
+                        format!("/workspace/{index}.md"),
+                        text,
+                        format!("hash-{index}"),
+                    ],
+                )
+                .unwrap();
+            let rowid = transaction.last_insert_rowid();
+            transaction
+                .execute(
+                    "INSERT INTO chunks_fts(rowid, text) VALUES (?1, ?2)",
+                    rusqlite::params![rowid, text],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(db);
+
+        let backend = MemoryBackendImpl::from_session_params(
+            storage,
+            &make_params_fts_only("retrieval-perf"),
+        );
+        for _ in 0..20 {
+            backend.search("criticalport", 6, 0.0).await.unwrap();
+        }
+        let mut samples = Vec::with_capacity(200);
+        for _ in 0..200 {
+            let started = std::time::Instant::now();
+            let results = backend.search("criticalport", 6, 0.0).await.unwrap();
+            assert!(!results.is_empty());
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let p95 = samples[samples.len() * 95 / 100];
+        eprintln!("100,000-chunk warm retrieval p95: {p95:?}");
+        assert!(
+            p95 < std::time::Duration::from_millis(50),
+            "100,000-chunk warm retrieval p95 was {p95:?}"
+        );
     }
 
     /// from_session_params stores the session_id it was given.
@@ -1207,6 +1376,7 @@ mod factory_tests {
         let params = MemoryBackendParams {
             session_id: "s1".into(),
             embed_config: Some(MemoryEmbeddingConfig {
+                provider: "api".into(),
                 model: Some("test-embed-model".into()),
                 ..Default::default()
             }),
@@ -1320,6 +1490,7 @@ mod tests {
         assert!(!scoped.is_empty(), "trusted endpoint keeps the credential");
 
         let config = xai_grok_config_types::MemoryEmbeddingConfig {
+            provider: "api".to_string(),
             model: Some("test-embedding-model".to_string()),
             ..Default::default()
         };
@@ -1372,6 +1543,7 @@ mod tests {
         assert!(!scoped.is_empty(), "trusted endpoint keeps the credential");
 
         let config = xai_grok_config_types::MemoryEmbeddingConfig {
+            provider: "api".to_string(),
             model: Some("test-embedding-model".to_string()),
             ..Default::default()
         };

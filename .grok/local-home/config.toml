@@ -1,0 +1,67 @@
+# Trusted local-runtime profile for this checkout. It is loaded only by
+# tools/litert-local/run.sh, which points GROK_HOME at this directory.
+
+[features]
+telemetry = false
+feedback = false
+remote_fetch = false
+
+[telemetry]
+trace_upload = false
+mixpanel_enabled = false
+
+[models]
+default = "local-vibethinker-3b"
+allowed_models = ["local-vibethinker-3b", "local-qwen2.5-1.5b-chat"]
+session_summary = "local-qwen2.5-1.5b-chat"
+
+[models.router]
+enabled = true
+chat_model = "local-qwen2.5-1.5b-chat"
+analysis_model = "local-vibethinker-3b"
+execution_model = "local-qwen2.5-1.5b-chat"
+analysis_min_chars = 480
+analysis_keywords = ["threat model", "incident", "cve"]
+execution_keywords = ["nmap", "port scan", "scan", "run ", "execute", "command", "build", "test", "inspect", "fix", "implement"]
+
+[model.local-vibethinker-3b]
+model = "local-vibethinker-3b"
+name = "VibeThinker 3B (local analysis)"
+description = "In-process LiteRT-LM analytical model"
+base_url = "litert-lm:///Users/mac/.cache/grok-build/models/vibethinker-3b/model.litertlm?library=/Users/mac/Documents/grok-build/.grok/runtime/liblitert_lm_c.dylib&backend=cpu&max_context_tokens=4096&max_resident_adapters=4&max_resident_sessions=8&max_resident_context_tokens=24576&context_strategy=sliding&min_recent_turns=3"
+context_window = 4096
+max_completion_tokens = 2048
+temperature = 0.6
+top_p = 0.95
+use_concise = true
+agent_type = "grok-build"
+
+[model."local-qwen2.5-1.5b-chat"]
+model = "local-qwen2.5-1.5b-chat"
+name = "Qwen2.5 1.5B Instruct (local chat)"
+description = "In-process LiteRT-LM lightweight conversational model"
+base_url = "litert-lm:///Users/mac/.cache/grok-build/models/qwen2.5-1.5b-instruct/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm?library=/Users/mac/Documents/grok-build/.grok/runtime/liblitert_lm_c.dylib&backend=cpu&max_context_tokens=4096&max_resident_adapters=4&max_resident_sessions=8&max_resident_context_tokens=24576&context_strategy=sliding&min_recent_turns=3"
+context_window = 4096
+max_completion_tokens = 1024
+temperature = 0.3
+top_p = 0.9
+use_concise = true
+agent_type = "grok-build"
+
+[toolset.bash]
+# Enforced per command. Remove this line to disable the token-specific cap,
+# or raise it for workloads where more raw output is valuable.
+output_token_budget = 2000
+tokenix_path = "/Users/mac/.cargo/bin/tokenix"
+auto_background_on_timeout = true
+foreground_block_budget_ms = 15000
+
+[toolset.output_budget]
+# Set mode to "off" to disable the cross-tool rule, or "soft" to enforce only
+# the per-result cap while allowing the cumulative turn budget to overflow.
+mode = "hard"
+per_result_tokens = 2000
+per_turn_tokens = 6000
+
+[marketplace]
+default_skills_installs_purged = true

@@ -1,3 +1,8 @@
 /target
 **/*.rs.bk
+*.profraw
 .DS_Store
+/.grok/runtime/
+/.grok/local-home/*
+!/.grok/local-home/config.toml
+**/.fastembed_cache/

@@ -728,7 +728,7 @@ impl From<Usage> for TokenUsage {
 /// and any client-executable `FunctionCall`s as `tool_calls`). Helpers
 /// (`assistant()`, `empty_reason()`, etc.) treat the trailing Assistant as
 /// "the response message" for backwards-compatible call sites.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationResponse {
     /// The flat ordered list of items produced by this turn. The trailing
     /// item is always an `Assistant` item (possibly with empty content if
