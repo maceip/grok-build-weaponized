@@ -3,7 +3,7 @@ use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use xai_grok_protocol::EventEnvelope;
+use xai_grok_protocol::{EngagementId, EventEnvelope};
 
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -129,6 +129,84 @@ impl EventJournal {
         }
         Ok(events)
     }
+
+    /// Read a bounded cursor page without materializing the complete journal.
+    ///
+    /// The startup replay verifies the entire journal. Cursor reads retain the
+    /// same frame and checksum checks for every record they traverse while
+    /// keeping result memory bounded by `maximum_events`.
+    pub fn read_after(
+        &self,
+        after_sequence: u64,
+        maximum_events: usize,
+        engagement_id: Option<&EngagementId>,
+    ) -> Result<(Vec<EventEnvelope>, u64), JournalError> {
+        let _writer_guard = self.writer.lock().map_err(|_| JournalError::Poisoned)?;
+        let mut reader = File::open(&self.path)?;
+        let mut events = Vec::with_capacity(maximum_events);
+        let mut previous: Option<u64> = None;
+        let mut scanned_through = after_sequence;
+        while events.len() < maximum_events {
+            let Some(event) = read_event_record(&mut reader, &mut previous)? else {
+                break;
+            };
+            if event.sequence <= after_sequence {
+                continue;
+            }
+            scanned_through = event.sequence;
+            if engagement_id.is_none_or(|expected| event.engagement_id.as_ref() == Some(expected)) {
+                events.push(event);
+            }
+        }
+        Ok((events, scanned_through))
+    }
+}
+
+fn read_event_record(
+    reader: &mut File,
+    previous: &mut Option<u64>,
+) -> Result<Option<EventEnvelope>, JournalError> {
+    let mut header = [0_u8; 4];
+    match reader.read(&mut header)? {
+        0 => return Ok(None),
+        4 => {}
+        _ => return Err(JournalError::Truncated),
+    }
+    let length = u32::from_be_bytes(header) as usize;
+    if length > MAX_EVENT_BYTES {
+        return Err(JournalError::RecordTooLarge {
+            actual: length,
+            maximum: MAX_EVENT_BYTES,
+        });
+    }
+    let mut bytes = vec![0; length];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => JournalError::Truncated,
+            _ => JournalError::Io(error),
+        })?;
+    let mut checksum = [0_u8; 32];
+    reader
+        .read_exact(&mut checksum)
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => JournalError::Truncated,
+            _ => JournalError::Io(error),
+        })?;
+    if blake3::hash(&bytes).as_bytes() != &checksum {
+        return Err(JournalError::ChecksumMismatch);
+    }
+    let event: EventEnvelope = rmp_serde::from_slice(&bytes)?;
+    if let Some(previous) = *previous
+        && previous.checked_add(1) != Some(event.sequence)
+    {
+        return Err(JournalError::NonMonotonic {
+            previous,
+            current: event.sequence,
+        });
+    }
+    *previous = Some(event.sequence);
+    Ok(Some(event))
 }
 
 #[cfg(test)]

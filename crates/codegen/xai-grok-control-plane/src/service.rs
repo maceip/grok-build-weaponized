@@ -192,7 +192,7 @@ mod tests {
 
     use xai_grok_protocol::{
         ArtifactContract, CancellationSemantics, ConcurrencyProfile, OperationDescriptor,
-        ProviderKind, RecoverySemantics, VersionRange,
+        PROTOCOL_VERSION, ProviderKind, RecoverySemantics, VersionRange,
     };
 
     use super::*;
@@ -201,7 +201,7 @@ mod tests {
         CapabilityManifest {
             provider_id: "runtime".into(),
             provider_version: "1".to_owned(),
-            protocol: VersionRange::exact(1),
+            protocol: VersionRange::exact(PROTOCOL_VERSION),
             kind: ProviderKind::ModelRuntime,
             features: BTreeSet::new(),
             operations: vec![OperationDescriptor {

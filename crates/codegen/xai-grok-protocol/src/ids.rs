@@ -47,12 +47,15 @@ macro_rules! string_id {
 }
 
 string_id!(ArtifactId, "art");
+string_id!(ClientId, "client");
 string_id!(CommandId, "cmd");
 string_id!(EngagementId, "eng");
 string_id!(EventId, "evt");
 string_id!(OperationId, "op");
+string_id!(ProfileId, "profile");
 string_id!(ProviderId, "provider");
 string_id!(RequestId, "req");
 string_id!(ServiceId, "service");
 string_id!(TaskId, "task");
+string_id!(TeamId, "team");
 string_id!(WorkspaceId, "workspace");

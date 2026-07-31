@@ -6,7 +6,6 @@
 //! tests may drive [`ControlPlane`] directly.
 
 pub mod artifact;
-pub mod client;
 pub mod control_plane;
 pub mod journal;
 pub mod projection;
@@ -15,7 +14,6 @@ pub mod server;
 pub mod service;
 
 pub use artifact::{ArtifactDescriptor, ArtifactStore, ArtifactStoreConfig};
-pub use client::{ClientError, ControlPlaneClient};
 pub use control_plane::{ControlPlane, ControlPlaneConfig, ControlPlaneError, ControlPlaneHandle};
 pub use journal::{EventJournal, JournalError};
 pub use projection::{EngagementProjection, ProjectionStore, ProviderProjection};
@@ -24,5 +22,6 @@ pub use provider::{
 };
 pub use server::{ControlPlaneServer, ServerConfig, ServerError};
 pub use service::{ServiceRecord, ServiceSupervisor};
+pub use xai_grok_control_client::{ClientError, ClientIdentity, ControlPlaneClient};
 
 pub const SERVER_NAME: &str = "grokd";

@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{CommandId, ProtocolError, ProtocolErrorCode, WorkspaceId};
+use crate::{CommandId, ProtocolError, ProtocolErrorCode, TeamClient, WorkspaceId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IngressSource {
     Cli,
     Tui,
+    Gui,
     Buzz,
     Qm,
     Api,
@@ -21,6 +22,9 @@ pub struct IngressEnvelope {
     pub session_id: String,
     pub prompt_id: String,
     pub request: String,
+    /// Optional collaborative client identity copied from the negotiated client.
+    #[serde(default)]
+    pub team: Option<TeamClient>,
     #[serde(default)]
     pub metadata: serde_json::Map<String, serde_json::Value>,
 }
@@ -68,6 +72,7 @@ impl BuzzIngress {
             session_id: format!("buzz:{}", self.channel_id),
             prompt_id: self.event_id,
             request: self.content,
+            team: None,
             metadata,
         }
     }
@@ -95,6 +100,7 @@ impl QmIngress {
             session_id: format!("qm:{}", self.scope_id),
             prompt_id: self.job_id,
             request: self.request,
+            team: None,
             metadata,
         }
     }

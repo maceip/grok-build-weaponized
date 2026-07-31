@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "profile_id": "compact-local",
+  "revision": 1,
+  "protocol_range": {
+    "minimum": 2,
+    "maximum": 2
+  },
+  "targets": [
+    {
+      "target_triple": "aarch64-apple-darwin",
+      "libc": {
+        "libc": "native"
+      }
+    },
+    {
+      "target_triple": "x86_64-unknown-linux-musl",
+      "libc": {
+        "libc": "musl_static"
+      }
+    },
+    {
+      "target_triple": "aarch64-unknown-linux-musl",
+      "libc": {
+        "libc": "musl_static"
+      }
+    },
+    {
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "libc": {
+        "libc": "glibc",
+        "minimum": "2.17"
+      }
+    },
+    {
+      "target_triple": "aarch64-unknown-linux-gnu",
+      "libc": {
+        "libc": "glibc",
+        "minimum": "2.17"
+      }
+    }
+  ],
+  "limits": {
+    "command_queue": 1024,
+    "event_batch": 128,
+    "maximum_clients": 128,
+    "maximum_worker_processes": 16,
+    "maximum_memory_bytes": 25769803776,
+    "maximum_spool_bytes": 10737418240
+  },
+  "providers": [
+    {
+      "kind": "model_runtime",
+      "operations": [],
+      "required_features": [
+        "binary_ipc",
+        "exact_prompt_measurement"
+      ],
+      "maximum_concurrency": 4
+    },
+    {
+      "kind": "native_execution",
+      "operations": [],
+      "required_features": [
+        "bounded_spool",
+        "cursor_output"
+      ],
+      "maximum_concurrency": 100
+    }
+  ],
+  "models": [],
+  "adapters": [],
+  "tool_bundles": [],
+  "maximum_headless_binary_bytes": 8388608,
+  "maximum_daemon_binary_bytes": 16777216,
+  "gui": {
+    "renderer": "glow",
+    "maximum_binary_bytes": 33554432
+  }
+}

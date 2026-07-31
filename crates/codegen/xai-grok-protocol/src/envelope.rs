@@ -1,17 +1,24 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CapabilityManifest, CommandId, EngagementId, EventId, IngressEnvelope, ProtocolError,
-    ProviderDispatch, ProviderId, RequestId, ServiceHealth, ServiceId, TaskId, TaskingPlan,
+    CapabilityManifest, CommandId, EngagementId, EventBatch, EventId, EventReadRequest,
+    ExecutionReceipt, IngressEnvelope, ProtocolError, ProviderDispatch, ProviderId, RequestId,
+    ServiceHealth, ServiceId, TaskId, TaskingPlan, TeamClient,
 };
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Protocol v2 adds collaborative client identity, durable event cursors, and
+/// mode-specific execution receipts. These are not wire-compatible with v1.
+pub const PROTOCOL_VERSION: u32 = 2;
+pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub protocol_version: u32,
     pub client_name: String,
     pub client_version: String,
+    /// Stable reconnect identity for collaborative clients.
+    #[serde(default)]
+    pub team: Option<TeamClient>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -46,6 +53,7 @@ pub enum Command {
         media_type: String,
         bytes: Vec<u8>,
     },
+    ReadEvents(EventReadRequest),
     QueryProjection(ProjectionQuery),
     Shutdown,
 }
@@ -95,6 +103,7 @@ pub enum Response {
     DispatchAccepted {
         request_id: RequestId,
         provider_id: ProviderId,
+        receipt: ExecutionReceipt,
     },
     ProviderRegistered {
         provider_id: ProviderId,
@@ -107,6 +116,7 @@ pub enum Response {
         byte_size: u64,
     },
     Projection(ProjectionSnapshot),
+    Events(EventBatch),
     Ack,
 }
 
@@ -123,6 +133,8 @@ pub enum Event {
     EngagementAccepted {
         workspace_id: String,
         session_id: String,
+        team_id: Option<crate::TeamId>,
+        client_id: Option<crate::ClientId>,
     },
     PlanAccepted {
         revision: u32,
@@ -197,6 +209,21 @@ mod tests {
         assert_eq!(
             envelope.validate(10).unwrap_err().code,
             crate::ProtocolErrorCode::DeadlineExceeded
+        );
+    }
+
+    #[test]
+    fn version_one_is_rejected_after_team_cursor_upgrade() {
+        let envelope = CommandEnvelope {
+            protocol_version: 1,
+            command_id: CommandId::new(),
+            causation_id: None,
+            deadline_unix_ms: 20,
+            command: Command::Shutdown,
+        };
+        assert_eq!(
+            envelope.validate(10).unwrap_err().code,
+            crate::ProtocolErrorCode::IncompatibleVersion
         );
     }
 }

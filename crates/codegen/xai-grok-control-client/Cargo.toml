@@ -1,0 +1,21 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-control-client"
+version = "0.1.0"
+edition.workspace = true
+description = "Small reconnecting Unix-socket client and shell CLI for grokd"
+
+[dependencies]
+rmp-serde = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+xai-grok-protocol = { workspace = true }
+
+[[bin]]
+name = "grokctl"
+path = "src/bin/grokctl.rs"
+
+[lints]
+workspace = true

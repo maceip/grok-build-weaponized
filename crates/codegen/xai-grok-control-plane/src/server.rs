@@ -5,12 +5,13 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use xai_grok_protocol::{
-    Command, CommandEnvelope, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ResponseEnvelope,
+    Command, CommandEnvelope, MAX_CONTROL_FRAME_BYTES, PROTOCOL_VERSION, ProtocolError,
+    ProtocolErrorCode, ResponseEnvelope,
 };
 
 use crate::control_plane::ControlPlaneHandle;
 
-pub(crate) const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_FRAME_BYTES: usize = MAX_CONTROL_FRAME_BYTES;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -219,4 +220,47 @@ fn remove_socket_if_owned(path: &Path) -> Result<(), ServerError> {
         Err(error) => return Err(ServerError::Io(error)),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use xai_grok_control_client::{ClientIdentity, ControlPlaneClient};
+    use xai_grok_protocol::{Command, ProjectionQuery, Response};
+
+    use super::*;
+    use crate::{ControlPlane, ControlPlaneConfig};
+
+    #[tokio::test]
+    async fn thin_client_negotiates_and_queries_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("grokd.sock");
+        let control_plane =
+            ControlPlane::open(ControlPlaneConfig::new(directory.path().join("state")))
+                .await
+                .unwrap();
+        let handle = control_plane.handle();
+        let server = ControlPlaneServer::bind(ServerConfig::new(&socket_path), handle.clone())
+            .await
+            .unwrap();
+        let server_task = tokio::spawn(server.run());
+        let client = ControlPlaneClient::connect(
+            &socket_path,
+            ClientIdentity::new("test-client", env!("CARGO_PKG_VERSION")),
+        )
+        .await
+        .unwrap();
+        let response = client
+            .send(
+                Command::QueryProjection(ProjectionQuery::Capacity),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Projection(_)));
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+        server_task.await.unwrap().unwrap();
+    }
 }

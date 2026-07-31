@@ -44,7 +44,14 @@ rustflags = [
     # These flags prevent: GOT overwrite attacks, lazy binding exploits, stack shellcode
     # IMPORTANT: If changing build system (e.g. from cargo to Bazel-only),
     # ensure equivalent linker hardening is applied to production binaries.
-    "-C", "link-arg=-Wl,-z,relro,-z,now,-z,noexecstack",
+    # Pass GNU linker arguments directly so the same configuration works with
+    # a musl compiler driver and Rust's bundled `rust-lld` cross linker.
+    "-C", "link-arg=-z",
+    "-C", "link-arg=relro",
+    "-C", "link-arg=-z",
+    "-C", "link-arg=now",
+    "-C", "link-arg=-z",
+    "-C", "link-arg=noexecstack",
 ]
 
 [target.aarch64-unknown-linux-musl]
@@ -55,7 +62,14 @@ rustflags = [
     # These flags prevent: GOT overwrite attacks, lazy binding exploits, stack shellcode
     # IMPORTANT: If changing build system (e.g. from cargo to Bazel-only),
     # ensure equivalent linker hardening is applied to production binaries.
-    "-C", "link-arg=-Wl,-z,relro,-z,now,-z,noexecstack",
+    # Pass GNU linker arguments directly so the same configuration works with
+    # a musl compiler driver and Rust's bundled `rust-lld` cross linker.
+    "-C", "link-arg=-z",
+    "-C", "link-arg=relro",
+    "-C", "link-arg=-z",
+    "-C", "link-arg=now",
+    "-C", "link-arg=-z",
+    "-C", "link-arg=noexecstack",
 ]
 
 [target.x86_64-pc-windows-msvc]

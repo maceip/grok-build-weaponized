@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use tokio::sync::RwLock;
 use xai_grok_protocol::{
-    EngagementId, Event, EventEnvelope, ProjectionQuery, ProjectionSnapshot, ProviderId,
-    ServiceHealth, ServiceId, TaskId, TaskStatus,
+    ClientId, EngagementId, Event, EventEnvelope, ProjectionQuery, ProjectionSnapshot, ProviderId,
+    ServiceHealth, ServiceId, TaskId, TaskStatus, TeamId,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -11,6 +11,8 @@ pub struct EngagementProjection {
     pub engagement_id: EngagementId,
     pub workspace_id: Option<String>,
     pub session_id: Option<String>,
+    pub team_id: Option<TeamId>,
+    pub client_id: Option<ClientId>,
     pub plan_revision: Option<u32>,
     pub task_count: u32,
     pub task_status: HashMap<TaskId, TaskStatus>,
@@ -64,11 +66,15 @@ impl ProjectionStore {
             Event::EngagementAccepted {
                 workspace_id,
                 session_id,
+                team_id,
+                client_id,
             } => {
                 if let Some(engagement_id) = &envelope.engagement_id {
                     let projection = engagement(&mut state, engagement_id);
                     projection.workspace_id = Some(workspace_id.clone());
                     projection.session_id = Some(session_id.clone());
+                    projection.team_id.clone_from(team_id);
+                    projection.client_id.clone_from(client_id);
                     projection.last_sequence = envelope.sequence;
                 }
             }

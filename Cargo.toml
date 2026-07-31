@@ -23,6 +23,7 @@ members = [
     "crates/codegen/xai-grok-auth",
     "crates/codegen/xai-grok-config",
     "crates/codegen/xai-grok-config-types",
+    "crates/codegen/xai-grok-control-client",
     "crates/codegen/xai-grok-control-plane",
     "crates/codegen/xai-grok-env",
     "crates/codegen/xai-grok-engagement",
@@ -34,6 +35,7 @@ members = [
     "crates/codegen/xai-grok-memory",
     "crates/codegen/xai-grok-mermaid",
     "crates/codegen/xai-grok-models",
+    "crates/codegen/xai-grok-operator-ui",
     "crates/codegen/xai-grok-pager",
     "crates/codegen/xai-grok-pager-bin",
     "crates/codegen/xai-grok-pager-minimal",
@@ -293,6 +295,7 @@ xai-grok-auth = { path = "crates/codegen/xai-grok-auth" }
 xai-grok-config = { path = "crates/codegen/xai-grok-config" }
 xai-grok-config-types = { path = "crates/codegen/xai-grok-config-types" }
 xai-grok-control-plane = { path = "crates/codegen/xai-grok-control-plane" }
+xai-grok-control-client = { path = "crates/codegen/xai-grok-control-client" }
 xai-grok-env = { path = "crates/codegen/xai-grok-env" }
 xai-grok-engagement = { path = "crates/codegen/xai-grok-engagement" }
 xai-grok-http = { path = "crates/codegen/xai-grok-http" }
@@ -302,6 +305,7 @@ xai-grok-mcp = { path = "crates/codegen/xai-grok-mcp" }
 xai-grok-memory = { path = "crates/codegen/xai-grok-memory" }
 xai-grok-mermaid = { path = "crates/codegen/xai-grok-mermaid" }
 xai-grok-models = { path = "crates/codegen/xai-grok-models" }
+xai-grok-operator-ui = { path = "crates/codegen/xai-grok-operator-ui" }
 xai-grok-protocol = { path = "crates/codegen/xai-grok-protocol" }
 xai-grok-runtime = { path = "crates/codegen/xai-grok-runtime" }
 xai-grok-sampler = { path = "crates/codegen/xai-grok-sampler" }
@@ -376,6 +380,19 @@ panic = "unwind"
 [profile.release-dist-jemalloc]
 inherits = "release-dist"
 # All settings now match the parent — this is an intentional alias.
+
+# Compact deployment profile for constrained red-team hosts. Headless Linux
+# artifacts are built for musl; the GUI is a separate target and never enters
+# the `grokctl` or `grokd` dependency graph.
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+debug = 0
+incremental = false
+panic = "abort"
 
 
 [profile.dev]

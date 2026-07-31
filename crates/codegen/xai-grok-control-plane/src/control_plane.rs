@@ -3,7 +3,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -11,9 +11,10 @@ use xai_grok_engagement::{
     EngagementCheckpoint, EngagementCoordinator, NewEngagement, QueuePriority,
 };
 use xai_grok_protocol::{
-    Command, CommandEnvelope, CommandId, EngagementId, Event, EventEnvelope, EventId,
-    EvidenceObservation, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ProviderDispatch,
-    ProviderId, Response, ResponseEnvelope, ServiceHealth, TaskStatus, TaskingPlan,
+    Command, CommandEnvelope, CommandId, EngagementId, Event, EventBatch, EventEnvelope, EventId,
+    EventReadRequest, EvidenceObservation, ExecutionReceipt, PROTOCOL_VERSION, ProtocolError,
+    ProtocolErrorCode, ProviderDispatch, ProviderId, Response, ResponseEnvelope, ServiceHealth,
+    TaskStatus, TaskingPlan,
 };
 
 use crate::SERVER_NAME;
@@ -360,6 +361,8 @@ struct ControlPlaneCore {
     event_order: Mutex<()>,
     next_sequence: AtomicU64,
     events: broadcast::Sender<EventEnvelope>,
+    event_cache: Mutex<VecDeque<EventEnvelope>>,
+    event_cache_capacity: usize,
     responses: Mutex<ResponseCache>,
     owner_epoch: String,
     shutdown: CancellationToken,
@@ -400,6 +403,9 @@ impl ControlPlaneCore {
                         ),
                     ));
                 }
+                if let Some(team) = &hello.team {
+                    team.validate()?;
+                }
                 Ok(Response::Hello(xai_grok_protocol::HelloAck {
                     protocol_version: PROTOCOL_VERSION,
                     server_name: SERVER_NAME.to_owned(),
@@ -410,11 +416,16 @@ impl ControlPlaneCore {
                         "artifact_spooling".to_owned(),
                         "generation_fencing".to_owned(),
                         "rebuildable_projections".to_owned(),
+                        "durable_event_cursors".to_owned(),
+                        "bounded_event_long_poll".to_owned(),
+                        "team_client_reconnect".to_owned(),
+                        "typed_execution_receipts".to_owned(),
                     ],
                 }))
             }
             Command::SubmitIngress(ingress) => {
                 ingress.validate()?;
+                let ingress_team = ingress.team.clone();
                 let outcome = self
                     .engagement
                     .accept(NewEngagement {
@@ -437,6 +448,8 @@ impl ControlPlaneCore {
                         Event::EngagementAccepted {
                             workspace_id: outcome.record.workspace_id,
                             session_id: outcome.record.session_id,
+                            team_id: ingress_team.as_ref().map(|team| team.team_id.clone()),
+                            client_id: ingress_team.as_ref().map(|team| team.client_id.clone()),
                         },
                     )
                     .await?;
@@ -540,9 +553,11 @@ impl ControlPlaneCore {
                 .await
                 .map_err(|error| internal_error(error.to_string()))??;
                 if let DispatchClaim::Existing(record) = claim {
+                    dispatch.provider_id = record.provider_id.clone();
                     return Ok(Response::DispatchAccepted {
                         request_id: record.request_id,
                         provider_id: record.provider_id,
+                        receipt: ExecutionReceipt::from_dispatch(&dispatch),
                     });
                 }
                 if let Err(error) = self
@@ -567,10 +582,12 @@ impl ControlPlaneCore {
                     .await;
                     return Err(error);
                 }
+                let receipt = ExecutionReceipt::from_dispatch(&dispatch);
                 self.spawn_dispatch(dispatch, causation_id);
                 Ok(Response::DispatchAccepted {
                     request_id,
                     provider_id,
+                    receipt,
                 })
             }
             Command::CancelTask {
@@ -661,6 +678,7 @@ impl ControlPlaneCore {
                     byte_size: descriptor.byte_size,
                 })
             }
+            Command::ReadEvents(request) => Ok(Response::Events(self.read_events(&request).await?)),
             Command::QueryProjection(query) => {
                 Ok(Response::Projection(self.projections.query(query).await))
             }
@@ -897,8 +915,116 @@ impl ControlPlaneCore {
         }
         self.next_sequence.store(sequence, Ordering::Release);
         self.projections.apply(&envelope).await;
+        let mut cache = self.event_cache.lock().await;
+        cache.push_back(envelope.clone());
+        while cache.len() > self.event_cache_capacity {
+            cache.pop_front();
+        }
+        drop(cache);
         let _ = self.events.send(envelope.clone());
         Ok(envelope)
+    }
+
+    async fn read_events(&self, request: &EventReadRequest) -> Result<EventBatch, ProtocolError> {
+        request.validate()?;
+        let mut live_events = self.events.subscribe();
+        let batch = self.read_event_page(request).await?;
+        if request.wait_ms == 0 || !batch.events.is_empty() || !batch.caught_up {
+            return Ok(batch);
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(request.wait_ms.into());
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return self.read_event_page(request).await;
+            }
+            match tokio::time::timeout(remaining, live_events.recv()).await {
+                Ok(Ok(event))
+                    if request
+                        .engagement_id
+                        .as_ref()
+                        .is_none_or(|expected| event.engagement_id.as_ref() == Some(expected)) =>
+                {
+                    return self.read_event_page(request).await;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    return self.read_event_page(request).await;
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
+                    return self.read_event_page(request).await;
+                }
+            }
+        }
+    }
+
+    async fn read_event_page(
+        &self,
+        request: &EventReadRequest,
+    ) -> Result<EventBatch, ProtocolError> {
+        let high_watermark = self.next_sequence.load(Ordering::Acquire);
+        if request.after_sequence > high_watermark {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::Conflict,
+                format!(
+                    "event cursor {} is ahead of durable high watermark {high_watermark}",
+                    request.after_sequence
+                ),
+            ));
+        }
+
+        let maximum_events = request.maximum_events as usize;
+        let cached = {
+            let cache = self.event_cache.lock().await;
+            let covers_cursor = cache
+                .front()
+                .is_none_or(|first| request.after_sequence >= first.sequence.saturating_sub(1));
+            let reaches_high_watermark = cache
+                .back()
+                .is_none_or(|last| last.sequence == high_watermark);
+            (covers_cursor && reaches_high_watermark).then(|| {
+                let mut events = Vec::with_capacity(maximum_events);
+                let mut scanned_through = request.after_sequence;
+                for event in cache
+                    .iter()
+                    .filter(|event| event.sequence > request.after_sequence)
+                {
+                    scanned_through = event.sequence;
+                    if request
+                        .engagement_id
+                        .as_ref()
+                        .is_none_or(|expected| event.engagement_id.as_ref() == Some(expected))
+                    {
+                        events.push(event.clone());
+                        if events.len() == maximum_events {
+                            break;
+                        }
+                    }
+                }
+                (events, scanned_through)
+            })
+        };
+
+        let (events, next_sequence) = if let Some(cached) = cached {
+            cached
+        } else {
+            let journal = self.journal.clone();
+            let after_sequence = request.after_sequence;
+            let engagement_id = request.engagement_id.clone();
+            tokio::task::spawn_blocking(move || {
+                journal.read_after(after_sequence, maximum_events, engagement_id.as_ref())
+            })
+            .await
+            .map_err(|error| internal_error(error.to_string()))?
+            .map_err(|error| internal_error(error.to_string()))?
+        };
+        Ok(EventBatch {
+            events,
+            high_watermark,
+            next_sequence,
+            caught_up: next_sequence >= high_watermark,
+        })
     }
 }
 
@@ -915,6 +1041,14 @@ impl ControlPlaneHandle {
         &self,
         envelope: CommandEnvelope,
     ) -> Result<ResponseEnvelope, ProtocolError> {
+        if let Command::ReadEvents(request) = &envelope.command {
+            envelope.validate(now_unix_ms())?;
+            return Ok(ResponseEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                command_id: envelope.command_id,
+                response: self.core.read_events(request).await.map(Response::Events),
+            });
+        }
         let (respond_to, response) = oneshot::channel();
         self.command_tx
             .try_send(QueuedCommand {
@@ -1051,6 +1185,13 @@ impl ControlPlane {
             event_order: Mutex::new(()),
             next_sequence: AtomicU64::new(next_sequence),
             events,
+            event_cache: Mutex::new(
+                replay[replay.len().saturating_sub(config.event_capacity.max(1))..]
+                    .iter()
+                    .cloned()
+                    .collect(),
+            ),
+            event_cache_capacity: config.event_capacity.max(1),
             responses: Mutex::new(ResponseCache::new(config.response_cache_capacity)),
             owner_epoch: uuid::Uuid::new_v4().simple().to_string(),
             shutdown: CancellationToken::new(),
@@ -1249,6 +1390,7 @@ mod tests {
             session_id: "session".to_owned(),
             prompt_id: "prompt".to_owned(),
             request: "test".to_owned(),
+            team: None,
             metadata: serde_json::Map::new(),
         }));
         let first = control_plane
@@ -1259,6 +1401,161 @@ mod tests {
         let second = control_plane.handle().submit(command).await.unwrap();
         assert_eq!(first, second);
         control_plane.handle.shutdown_token().cancel();
+        control_plane.wait().await;
+    }
+
+    #[tokio::test]
+    async fn reconnecting_client_reads_durable_events_by_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = ControlPlaneConfig::new(directory.path());
+        config.event_capacity = 1;
+        let control_plane = ControlPlane::open(config).await.unwrap();
+        let handle = control_plane.handle();
+        for index in 0..3 {
+            handle
+                .submit(envelope(Command::SubmitIngress(IngressEnvelope {
+                    command_id: CommandId::new(),
+                    source: IngressSource::Cli,
+                    source_event_id: format!("cursor-event-{index}"),
+                    workspace_id: WorkspaceId::from_string("workspace"),
+                    session_id: format!("session-{index}"),
+                    prompt_id: format!("prompt-{index}"),
+                    request: "test".to_owned(),
+                    team: None,
+                    metadata: serde_json::Map::new(),
+                })))
+                .await
+                .unwrap();
+        }
+
+        let first = handle
+            .submit(envelope(Command::ReadEvents(EventReadRequest {
+                after_sequence: 0,
+                maximum_events: 2,
+                wait_ms: 0,
+                engagement_id: None,
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Events(first) = first else {
+            panic!("expected event batch");
+        };
+        assert_eq!(first.events.len(), 2);
+        assert!(!first.caught_up);
+
+        let second = handle
+            .submit(envelope(Command::ReadEvents(EventReadRequest {
+                after_sequence: first.next_sequence,
+                maximum_events: 2,
+                wait_ms: 0,
+                engagement_id: None,
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Events(second) = second else {
+            panic!("expected event batch");
+        };
+        assert_eq!(second.events.len(), 1);
+        assert!(second.caught_up);
+        assert_eq!(second.high_watermark, second.next_sequence);
+
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+    }
+
+    #[tokio::test]
+    async fn event_long_poll_does_not_block_command_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        let reader = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                handle
+                    .submit(envelope(Command::ReadEvents(EventReadRequest {
+                        after_sequence: 0,
+                        maximum_events: 8,
+                        wait_ms: 1_000,
+                        engagement_id: None,
+                    })))
+                    .await
+                    .unwrap()
+            })
+        };
+        tokio::task::yield_now().await;
+        handle
+            .submit(envelope(Command::SubmitIngress(IngressEnvelope {
+                command_id: CommandId::new(),
+                source: IngressSource::Cli,
+                source_event_id: "wake-reader".to_owned(),
+                workspace_id: WorkspaceId::from_string("workspace"),
+                session_id: "session".to_owned(),
+                prompt_id: "prompt".to_owned(),
+                request: "test".to_owned(),
+                team: None,
+                metadata: serde_json::Map::new(),
+            })))
+            .await
+            .unwrap();
+        let Response::Events(batch) = reader.await.unwrap().response.unwrap() else {
+            panic!("expected event batch");
+        };
+        assert_eq!(batch.events.len(), 1);
+
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+    }
+
+    #[tokio::test]
+    async fn filtered_long_poll_advances_past_unrelated_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        let reader = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                handle
+                    .submit(envelope(Command::ReadEvents(EventReadRequest {
+                        after_sequence: 0,
+                        maximum_events: 8,
+                        wait_ms: 20,
+                        engagement_id: Some(EngagementId::from_string("not-present")),
+                    })))
+                    .await
+                    .unwrap()
+            })
+        };
+        tokio::task::yield_now().await;
+        handle
+            .submit(envelope(Command::SubmitIngress(IngressEnvelope {
+                command_id: CommandId::new(),
+                source: IngressSource::Cli,
+                source_event_id: "unrelated-event".to_owned(),
+                workspace_id: WorkspaceId::from_string("workspace"),
+                session_id: "session".to_owned(),
+                prompt_id: "prompt".to_owned(),
+                request: "test".to_owned(),
+                team: None,
+                metadata: serde_json::Map::new(),
+            })))
+            .await
+            .unwrap();
+        let Response::Events(batch) = reader.await.unwrap().response.unwrap() else {
+            panic!("expected event batch");
+        };
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.next_sequence, 1);
+        assert!(batch.caught_up);
+
+        handle.shutdown_token().cancel();
         control_plane.wait().await;
     }
 
@@ -1332,6 +1629,7 @@ mod tests {
                     session_id: "session-dispatch".to_owned(),
                     prompt_id: "prompt-dispatch".to_owned(),
                     request: "execute once".to_owned(),
+                    team: None,
                     metadata: serde_json::Map::new(),
                 })))
                 .await

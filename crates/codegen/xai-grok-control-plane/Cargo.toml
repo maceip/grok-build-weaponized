@@ -20,6 +20,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 uuid = { workspace = true, features = ["v4"] }
 xai-grok-engagement = { workspace = true }
+xai-grok-control-client = { workspace = true }
 xai-grok-protocol = { workspace = true }
 
 [dev-dependencies]
