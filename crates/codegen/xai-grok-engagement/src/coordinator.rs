@@ -15,13 +15,15 @@ use crate::types::{
 };
 
 const DEFAULT_EVENT_CAPACITY: usize = 1_024;
+const DEFAULT_WRITER_CAPACITY: usize = 1_024;
 const DEFAULT_LEASE_TTL_MS: u64 = 30_000;
 const CATCH_UP_PAGE: usize = 1_000;
 
 type StoreTask = Box<dyn FnOnce(&mut EngagementStore) + Send + 'static>;
 
 struct CoordinatorInner {
-    writer_tx: mpsc::UnboundedSender<StoreTask>,
+    writer_tx: mpsc::Sender<StoreTask>,
+    writer_capacity: usize,
     events_tx: broadcast::Sender<EngagementEvent>,
 }
 
@@ -37,12 +39,26 @@ pub struct EngagementCoordinator {
 
 impl EngagementCoordinator {
     pub async fn shared(path: impl AsRef<Path>) -> Result<Self, EngagementError> {
-        Self::shared_with_event_capacity(path.as_ref().to_path_buf(), DEFAULT_EVENT_CAPACITY).await
+        Self::shared_with_capacities(
+            path.as_ref().to_path_buf(),
+            DEFAULT_EVENT_CAPACITY,
+            DEFAULT_WRITER_CAPACITY,
+        )
+        .await
     }
 
+    #[cfg(test)]
     async fn shared_with_event_capacity(
         path: PathBuf,
         event_capacity: usize,
+    ) -> Result<Self, EngagementError> {
+        Self::shared_with_capacities(path, event_capacity, DEFAULT_WRITER_CAPACITY).await
+    }
+
+    async fn shared_with_capacities(
+        path: PathBuf,
+        event_capacity: usize,
+        writer_capacity: usize,
     ) -> Result<Self, EngagementError> {
         static SERVICES: OnceLock<tokio::sync::Mutex<HashMap<PathBuf, Weak<CoordinatorInner>>>> =
             OnceLock::new();
@@ -56,7 +72,8 @@ impl EngagementCoordinator {
         let store = tokio::task::spawn_blocking(move || EngagementStore::open(&open_path))
             .await
             .map_err(|_| EngagementError::WriterStopped)??;
-        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<StoreTask>();
+        let writer_capacity = writer_capacity.max(1);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<StoreTask>(writer_capacity);
         let (events_tx, _) = broadcast::channel(event_capacity.max(1));
         tokio::task::spawn_blocking(move || {
             let mut store = store;
@@ -66,6 +83,7 @@ impl EngagementCoordinator {
         });
         let inner = Arc::new(CoordinatorInner {
             writer_tx,
+            writer_capacity,
             events_tx,
         });
         services.insert(path, Arc::downgrade(&inner));
@@ -88,10 +106,15 @@ impl EngagementCoordinator {
         let (respond_to, response) = oneshot::channel();
         self.inner
             .writer_tx
-            .send(Box::new(move |store| {
+            .try_send(Box::new(move |store| {
                 let _ = respond_to.send(operation(store));
             }))
-            .map_err(|_| EngagementError::WriterStopped)?;
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => EngagementError::WriterOverloaded {
+                    capacity: self.inner.writer_capacity,
+                },
+                mpsc::error::TrySendError::Closed(_) => EngagementError::WriterStopped,
+            })?;
         response.await.map_err(|_| EngagementError::WriterStopped)?
     }
 
@@ -303,7 +326,7 @@ impl EngagementLease {
         self.coordinator
             .inner
             .writer_tx
-            .send(Box::new(move |store| {
+            .try_send(Box::new(move |store| {
                 match store.suspend_preserving_checkpoint(&engagement_id, lease_epoch, reason) {
                     Ok(mutation) => {
                         if let Some(event) = mutation.event {
@@ -458,7 +481,7 @@ impl EngagementLease {
         self.coordinator
             .inner
             .writer_tx
-            .send(Box::new(move |store| {
+            .try_send(Box::new(move |store| {
                 match store.upsert_job(&engagement_id, lease_epoch, checkpoint) {
                     Ok(mutation) => {
                         if let Some(event) = mutation.event {
@@ -608,4 +631,48 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod bounded_writer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn writer_queue_rejects_overload_without_unbounded_growth() {
+        let directory = tempfile::tempdir().unwrap();
+        let coordinator = EngagementCoordinator::shared_with_capacities(
+            directory.path().join("bounded.sqlite3"),
+            4,
+            1,
+        )
+        .await
+        .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first = coordinator.clone();
+        let first_call = tokio::spawn(async move {
+            first
+                .call(move |_| {
+                    let _ = started_tx.send(());
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+
+        let second = coordinator.clone();
+        let second_call = tokio::spawn(async move { second.call(|_| Ok(())).await });
+        while coordinator.inner.writer_tx.capacity() != 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            coordinator.call(|_| Ok(())).await,
+            Err(EngagementError::WriterOverloaded { capacity: 1 })
+        ));
+
+        release_tx.send(()).unwrap();
+        first_call.await.unwrap().unwrap();
+        second_call.await.unwrap().unwrap();
+    }
 }

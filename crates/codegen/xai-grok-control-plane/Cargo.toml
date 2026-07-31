@@ -1,0 +1,33 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-control-plane"
+version = "0.1.0"
+edition.workspace = true
+description = "Persistent local Grok control plane, provider registry, artifact store, and IPC daemon"
+
+[dependencies]
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+clap = { workspace = true }
+rmp-serde = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+uuid = { workspace = true, features = ["v4"] }
+xai-grok-engagement = { workspace = true }
+xai-grok-protocol = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "grokd"
+path = "src/bin/grokd.rs"
+
+[lints]
+workspace = true

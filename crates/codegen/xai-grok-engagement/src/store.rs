@@ -53,6 +53,8 @@ pub enum EngagementError {
     InvalidPersistedValue { field: &'static str, value: String },
     #[error("engagement writer stopped")]
     WriterStopped,
+    #[error("engagement writer queue is full (capacity {capacity})")]
+    WriterOverloaded { capacity: usize },
     #[error("engagement admission rejected before acceptance: durable queue capacity {capacity}")]
     AdmissionOverloaded { capacity: usize },
 }

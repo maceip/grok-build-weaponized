@@ -7,6 +7,7 @@ description = "Supervised local model runtime, admission control, and native wor
 
 [dependencies]
 xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
+xai-grok-protocol = { workspace = true }
 
 chrono = { workspace = true, features = ["serde"] }
 blake3 = { workspace = true }

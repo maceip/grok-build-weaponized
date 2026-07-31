@@ -27,6 +27,10 @@ pub struct ExecutionSupervisor {
 }
 
 impl ExecutionSupervisor {
+    pub fn capability_manifest() -> xai_grok_protocol::CapabilityManifest {
+        super::native_execution_capability_manifest()
+    }
+
     pub fn global() -> &'static Self {
         static SUPERVISOR: OnceLock<ExecutionSupervisor> = OnceLock::new();
         SUPERVISOR.get_or_init(|| {

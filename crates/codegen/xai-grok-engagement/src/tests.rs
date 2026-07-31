@@ -103,11 +103,13 @@ fn overload_rejects_before_acceptance_without_dropping_already_accepted_work() {
 
     let reopened = EngagementStore::open(&path).unwrap();
     assert_eq!(reopened.queue_depth().unwrap(), 2);
-    assert!(reopened
-        .list(None, 0, 10)
-        .unwrap()
-        .iter()
-        .all(|record| record.status == EngagementStatus::Queued));
+    assert!(
+        reopened
+            .list(None, 0, 10)
+            .unwrap()
+            .iter()
+            .all(|record| record.status == EngagementStatus::Queued)
+    );
 }
 
 #[test]

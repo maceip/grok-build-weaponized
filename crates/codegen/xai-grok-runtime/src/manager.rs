@@ -218,6 +218,12 @@ pub struct RuntimeManager {
 }
 
 impl RuntimeManager {
+    pub fn capability_manifest(
+        config: &RuntimeManagerConfig,
+    ) -> xai_grok_protocol::CapabilityManifest {
+        crate::local_runtime_capability_manifest(config)
+    }
+
     pub fn new(config: RuntimeManagerConfig) -> Self {
         let governor = ResourceGovernor::new(config.memory_limits);
         Self::with_governor(config, governor)

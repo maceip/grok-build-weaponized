@@ -5,6 +5,7 @@
 //! sampler remains responsible for provider-neutral request/retry behavior.
 
 pub mod adapter;
+pub mod capability;
 pub mod context;
 pub mod events;
 pub mod evidence;
@@ -19,6 +20,7 @@ pub use adapter::{
     AdapterBinding, AdapterDescriptor, AdapterDtype, AdapterError, AdapterLease, AdapterManager,
     AdapterResidency, AdapterState, hash_artifact,
 };
+pub use capability::local_runtime_capability_manifest;
 pub use context::{
     AdmissionError, ContextAllocation, ContextBudgetBroker, ContextComponent, ContextComponentKind,
     ContextPlan, DroppedContext, StageBudget,

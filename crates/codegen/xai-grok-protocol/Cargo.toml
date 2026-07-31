@@ -1,0 +1,16 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-protocol"
+version = "0.1.0"
+edition.workspace = true
+description = "Zero-I/O control-plane protocol, tasking, capability, and event types"
+
+[dependencies]
+blake3 = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v4"] }
+
+[lints]
+workspace = true
