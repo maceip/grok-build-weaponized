@@ -14124,7 +14124,6 @@ dependencies = [
  "reflink-copy",
  "reqwest 0.12.24",
  "reqwest-middleware 0.4.2",
- "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -14140,7 +14139,6 @@ dependencies = [
  "xai-circuit-breaker",
  "xai-grok-auth",
  "xai-grok-version",
- "xai-sqlite-journal",
  "xai-test-utils",
  "zstd",
 ]
