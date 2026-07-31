@@ -7,6 +7,7 @@
 //! identity.
 
 use serde::{Deserialize, Serialize};
+use xai_grok_verification_core::{advance_stream_cursor, stream_window};
 use xai_tool_protocol::StreamingSpec;
 
 use crate::tool::ToolProgress;
@@ -92,17 +93,13 @@ pub fn stream_chunk(
     if total <= *last_total {
         return None;
     }
-    let new = total - *last_total;
-    let tail_len = tail.len() as u64;
     // Deltas are keyed off the monotonic `total`, not the buffer length: when
     // all genuinely-new bytes still fit in the tail we slice its suffix; when a
     // single tick's burst exceeded the buffer the middle was dropped upstream,
     // so we emit what survived plus a `gap` marker.
-    let (delta_bytes, gap) = if new <= tail_len {
-        (&tail[(tail_len - new) as usize..], false)
-    } else {
-        (tail, true)
-    };
+    let window = stream_window(tail.len(), total, *last_total)?;
+    let delta_bytes = &tail[window.start..];
+    let gap = window.gap;
 
     let cap = spec
         .max_delta_bytes
@@ -129,15 +126,9 @@ pub fn stream_chunk(
         return None;
     }
     let delta = String::from_utf8_lossy(&delta_bytes[..cut]).into_owned();
-    let consumed = cut as u64;
-
     // Advance only past what was emitted (gap case: the upstream-dropped
     // middle counts as consumed — those bytes can never be re-sliced).
-    *last_total = if gap {
-        total - (delta_bytes.len() as u64 - consumed.min(delta_bytes.len() as u64))
-    } else {
-        *last_total + consumed
-    };
+    *last_total = advance_stream_cursor(total, *last_total, delta_bytes.len(), cut, gap)?;
 
     let payload = PartialResultPayload {
         delta,
