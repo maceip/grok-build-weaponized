@@ -37,7 +37,29 @@ impl MemoryLimits {
     }
 
     pub fn detect() -> Self {
-        Self::from_physical(physical_memory_bytes().unwrap_or(16 * 1024 * 1024 * 1024))
+        let detected =
+            Self::from_physical(physical_memory_bytes().unwrap_or(16 * 1024 * 1024 * 1024));
+        std::env::var("GROK_RESOURCE_MAX_MEMORY_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map_or(detected, |hard_cap| detected.with_hard_cap(hard_cap))
+    }
+
+    /// Apply a deployment ceiling while preserving an early soft-pressure
+    /// signal. The soft limit never rises above the host-derived limit and is
+    /// kept below the configured hard ceiling.
+    pub fn with_hard_cap(self, hard_cap: u64) -> Self {
+        let hard_bytes = self.hard_bytes.min(hard_cap.max(1));
+        let soft_bytes = self
+            .soft_bytes
+            .min(hard_bytes.saturating_mul(80) / 100)
+            .min(hard_bytes);
+        Self {
+            physical_bytes: self.physical_bytes,
+            soft_bytes,
+            hard_bytes,
+        }
     }
 }
 
@@ -346,6 +368,19 @@ mod tests {
         let limits = MemoryLimits::from_physical(128 * 1024 * 1024 * 1024);
         assert_eq!(limits.soft_bytes, 76_8_u64 * 1024 * 1024 * 1024 / 10);
         assert_eq!(limits.hard_bytes, 96 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn deployment_cap_reduces_hard_and_soft_limits() {
+        let limits = MemoryLimits {
+            physical_bytes: 1_000,
+            soft_bytes: 600,
+            hard_bytes: 750,
+        }
+        .with_hard_cap(500);
+        assert_eq!(limits.physical_bytes, 1_000);
+        assert_eq!(limits.hard_bytes, 500);
+        assert_eq!(limits.soft_bytes, 400);
     }
 
     #[test]

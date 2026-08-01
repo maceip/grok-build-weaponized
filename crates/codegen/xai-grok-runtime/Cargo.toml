@@ -12,6 +12,7 @@ xai-grok-protocol = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 blake3 = { workspace = true }
 command-fds = { version = "0.3.2", features = ["tokio"] }
+futures = { workspace = true }
 libc = { workspace = true }
 libloading = "0.8.9"
 percent-encoding = "2"

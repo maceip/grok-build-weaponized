@@ -10,6 +10,7 @@ agent-client-protocol = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
+futures = { workspace = true }
 rmp-serde = "1"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

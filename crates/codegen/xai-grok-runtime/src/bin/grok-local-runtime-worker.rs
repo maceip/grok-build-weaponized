@@ -65,6 +65,7 @@ impl WorkerState {
             resident_adapters: self.adapters.resident_count(),
             resident_sessions,
             resident_context_tokens,
+            resident_session_owners: xai_grok_runtime::litert_lm::resident_session_owners(),
             active_requests: self.active_count.load(Ordering::Acquire),
             completed_requests: self.completed.load(Ordering::Acquire),
             poisoned: false,

@@ -18,7 +18,7 @@ mod worker;
 
 pub use adapter::{
     AdapterBinding, AdapterDescriptor, AdapterDtype, AdapterError, AdapterLease, AdapterManager,
-    AdapterResidency, AdapterState, hash_artifact,
+    AdapterResidency, AdapterResidencySnapshot, AdapterState, hash_artifact,
 };
 pub use capability::local_runtime_capability_manifest;
 pub use context::{
@@ -38,7 +38,7 @@ pub use litert_lm::{
 };
 pub use manager::{
     CapacitySnapshot, RuntimeManager, RuntimeManagerConfig, RuntimeMode, RuntimePriority,
-    RuntimeRequest, RuntimeStage,
+    RuntimeRequest, RuntimeStage, RuntimeStatusSnapshot,
 };
 pub use metrics::{InferenceLatencyStats, compute_percentiles};
 pub use resource::{

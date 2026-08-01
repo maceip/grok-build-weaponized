@@ -159,6 +159,11 @@ impl ExecutionProvider for NativeExecutionProvider {
         ServiceHealth::Ready
     }
 
+    async fn status(&self) -> serde_json::Value {
+        serde_json::to_value(self.supervisor.capacity().await)
+            .unwrap_or_else(|error| serde_json::json!({"error":error.to_string()}))
+    }
+
     async fn execute(&self, dispatch: ProviderDispatch) -> Result<ProviderOutput, ProtocolError> {
         let operation = dispatch.task.capability.operation_id.as_str();
         let owner_id = dispatch.engagement_id.to_string();
@@ -529,6 +534,10 @@ mod tests {
             .await
             .unwrap();
         let job_id = started.output["job_id"].as_str().unwrap().to_owned();
+        let status = provider.status().await;
+        assert_eq!(status["jobs"], 1);
+        assert_eq!(status["maximum_parallel"], 100);
+        assert!(status["spool"]["used_bytes"].as_u64().is_some());
         let waited = provider
             .execute(dispatch(
                 "native.command.wait",

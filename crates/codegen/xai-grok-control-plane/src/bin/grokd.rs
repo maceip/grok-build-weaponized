@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use xai_grok_control_plane::{
@@ -8,7 +9,8 @@ use xai_grok_control_plane::{
 };
 use xai_grok_native_execution::NativeExecutionLimits;
 use xai_grok_protocol::{
-    CapabilityManifest, PROTOCOL_VERSION, ProfileProviderRequirement, ProviderKind, RuntimeProfile,
+    ArtifactBinding, CapabilityManifest, LibcTarget, PROTOCOL_VERSION, ProfileProviderRequirement,
+    ProviderKind, RuntimeProfile,
 };
 
 #[derive(Debug, Parser)]
@@ -49,6 +51,11 @@ struct Arguments {
     /// Model selected for new daemon-owned agent sessions.
     #[arg(long, env = "GROK_AGENT_MODEL")]
     agent_model: Option<String>,
+
+    /// Isolated LiteRT-LM worker executable used by the daemon-owned agent.
+    /// Defaults to `grok-local-runtime-worker` beside the agent binary.
+    #[arg(long, env = "GROK_LOCAL_RUNTIME_WORKER")]
+    local_runtime_worker: Option<PathBuf>,
 
     /// Start only the durable protocol/state service. This mode deliberately
     /// does not advertise or accept executable agent work.
@@ -122,6 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     } else {
         let binary = resolve_agent_binary(arguments.agent_binary.as_ref())?;
+        let runtime_worker =
+            resolve_runtime_worker(arguments.local_runtime_worker.as_ref(), &binary)?;
         let workspace = arguments
             .agent_workspace
             .unwrap_or(std::env::current_dir()?)
@@ -143,6 +152,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provider_config
             .environment
             .insert("GROK_MEMORY".to_owned(), "1".to_owned());
+        provider_config
+            .environment
+            .insert("GROK_LOCAL_RUNTIME_MODE".to_owned(), "worker".to_owned());
+        provider_config.environment.insert(
+            "GROK_LOCAL_RUNTIME_WORKER".to_owned(),
+            runtime_worker.to_string_lossy().into_owned(),
+        );
+        if let Some(profile) = profile.as_ref() {
+            provider_config.environment.insert(
+                "GROK_RESOURCE_MAX_MEMORY_BYTES".to_owned(),
+                profile.limits.maximum_memory_bytes.to_string(),
+            );
+            let runtime_workers = profile_requirement(Some(profile), ProviderKind::ModelRuntime)
+                .map(|requirement| requirement.maximum_concurrency)
+                .unwrap_or(1)
+                .min(profile.limits.maximum_worker_processes)
+                .max(1);
+            provider_config.environment.insert(
+                "GROK_LOCAL_RUNTIME_MAX_WORKERS".to_owned(),
+                runtime_workers.to_string(),
+            );
+        }
         provider_config.environment.insert(
             "GROKD_SOCKET".to_owned(),
             socket_path.to_string_lossy().into_owned(),
@@ -377,6 +408,35 @@ fn resolve_agent_binary(explicit: Option<&PathBuf>) -> Result<PathBuf, Box<dyn s
     .into())
 }
 
+fn resolve_runtime_worker(
+    explicit: Option<&PathBuf>,
+    agent_binary: &std::path::Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(explicit) = explicit {
+        return Ok(explicit.canonicalize()?);
+    }
+    let candidate = agent_binary
+        .parent()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "agent executable has no parent directory",
+            )
+        })?
+        .join("grok-local-runtime-worker");
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!(
+            "no grok-local-runtime-worker found beside {}; pass --local-runtime-worker",
+            agent_binary.display()
+        ),
+    )
+    .into())
+}
+
 fn resolve_sibling_binary(
     explicit: Option<&PathBuf>,
     name: &str,
@@ -436,7 +496,223 @@ fn load_profile(path: &PathBuf) -> Result<RuntimeProfile, Box<dyn std::error::Er
         )
         .into());
     }
+    verify_deployment_compatibility(&profile, &std::env::current_exe()?)?;
+    verify_profile_artifacts(&profile)?;
     Ok(profile)
+}
+
+fn verify_deployment_compatibility(
+    profile: &RuntimeProfile,
+    daemon_binary: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let current_target = current_target_triple();
+    let target = profile
+        .targets
+        .iter()
+        .find(|target| target.target_triple == current_target)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("runtime profile does not contain current target {current_target}"),
+            )
+        })?;
+    verify_current_libc(&target.libc)?;
+    let actual_bytes = std::fs::metadata(daemon_binary)?.len();
+    if actual_bytes > profile.maximum_daemon_binary_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "grokd binary exceeds runtime profile budget: actual={actual_bytes}, maximum={}",
+                profile.maximum_daemon_binary_bytes
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn current_target_triple() -> String {
+    let architecture = std::env::consts::ARCH;
+    if cfg!(target_os = "macos") {
+        format!("{architecture}-apple-darwin")
+    } else if cfg!(all(target_os = "linux", target_env = "musl")) {
+        format!("{architecture}-unknown-linux-musl")
+    } else if cfg!(all(target_os = "linux", target_env = "gnu")) {
+        format!("{architecture}-unknown-linux-gnu")
+    } else {
+        format!("{architecture}-unknown-{}", std::env::consts::OS)
+    }
+}
+
+fn verify_current_libc(required: &LibcTarget) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
+    if matches!(required, LibcTarget::Native) {
+        return Ok(());
+    }
+    #[cfg(all(target_os = "linux", target_env = "musl"))]
+    if matches!(required, LibcTarget::MuslStatic) {
+        return Ok(());
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if let LibcTarget::Glibc { minimum } = required {
+        let actual = current_glibc_version()?;
+        if numeric_version_at_least(&actual, minimum) {
+            return Ok(());
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("glibc {actual} is older than profile minimum {minimum}"),
+        )
+        .into());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("runtime profile libc target {required:?} does not match this binary"),
+    )
+    .into())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn current_glibc_version() -> Result<String, Box<dyn std::error::Error>> {
+    unsafe extern "C" {
+        fn gnu_get_libc_version() -> *const std::ffi::c_char;
+    }
+    // SAFETY: glibc returns a process-lifetime NUL-terminated version string.
+    let pointer = unsafe { gnu_get_libc_version() };
+    if pointer.is_null() {
+        return Err(std::io::Error::other("glibc version query returned null").into());
+    }
+    // SAFETY: the non-null pointer is owned by glibc and remains valid.
+    Ok(unsafe { std::ffi::CStr::from_ptr(pointer) }
+        .to_str()?
+        .to_owned())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn numeric_version_at_least(actual: &str, minimum: &str) -> bool {
+    let components = |version: &str| {
+        version
+            .split('.')
+            .map(|component| component.parse::<u64>().unwrap_or(0))
+            .collect::<Vec<_>>()
+    };
+    let mut actual = components(actual);
+    let mut minimum = components(minimum);
+    let width = actual.len().max(minimum.len());
+    actual.resize(width, 0);
+    minimum.resize(width, 0);
+    actual >= minimum
+}
+
+fn verify_profile_artifacts(profile: &RuntimeProfile) -> Result<(), Box<dyn std::error::Error>> {
+    for (collection, artifacts) in [
+        ("models", &profile.models),
+        ("adapters", &profile.adapters),
+        ("tool_bundles", &profile.tool_bundles),
+    ] {
+        for (index, artifact) in artifacts.iter().enumerate() {
+            verify_artifact(artifact).map_err(|message| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("runtime profile {collection}[{index}] failed activation: {message}"),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_artifact(artifact: &ArtifactBinding) -> Result<(), String> {
+    let (content_hash, byte_size) = hash_artifact(&artifact.path)?;
+    if content_hash != artifact.content_hash {
+        return Err(format!(
+            "content hash mismatch for {}: expected={}, actual={content_hash}",
+            artifact.path.display(),
+            artifact.content_hash
+        ));
+    }
+    if byte_size != artifact.byte_size {
+        return Err(format!(
+            "byte size mismatch for {}: expected={}, actual={byte_size}",
+            artifact.path.display(),
+            artifact.byte_size
+        ));
+    }
+    Ok(())
+}
+
+fn hash_artifact(path: &Path) -> Result<(String, u64), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "symbolic links are not allowed: {}",
+            path.display()
+        ));
+    }
+    if metadata.is_file() {
+        let mut hasher = blake3::Hasher::new();
+        hash_file_contents(path, &mut hasher)?;
+        return Ok((hasher.finalize().to_hex().to_string(), metadata.len()));
+    }
+    if !metadata.is_dir() {
+        return Err(format!(
+            "artifact is not a regular file or directory: {}",
+            path.display()
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut byte_size = 0_u64;
+    hash_directory(path, path, &mut hasher, &mut byte_size)?;
+    Ok((hasher.finalize().to_hex().to_string(), byte_size))
+}
+
+fn hash_directory(
+    root: &Path,
+    path: &Path,
+    hasher: &mut blake3::Hasher,
+    byte_size: &mut u64,
+) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("artifact contains a symlink: {}", path.display()));
+    }
+    if metadata.is_dir() {
+        let mut children = std::fs::read_dir(path)
+            .map_err(|error| format!("cannot enumerate {}: {error}", path.display()))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot enumerate {}: {error}", path.display()))?;
+        children.sort();
+        for child in children {
+            hash_directory(root, &child, hasher, byte_size)?;
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Err(format!("unsupported artifact entry: {}", path.display()));
+    }
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    hasher.update(relative.as_os_str().as_encoded_bytes());
+    hasher.update(&metadata.len().to_le_bytes());
+    *byte_size = byte_size.saturating_add(metadata.len());
+    hash_file_contents(path, hasher)
+}
+
+fn hash_file_contents(path: &Path, hasher: &mut blake3::Hasher) -> Result<(), String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if read == 0 {
+            return Ok(());
+        }
+        hasher.update(&buffer[..read]);
+    }
 }
 
 #[cfg(test)]
@@ -457,8 +733,16 @@ mod tests {
             revision: 1,
             protocol_range: VersionRange::exact(PROTOCOL_VERSION),
             targets: vec![DeploymentTarget {
-                target_triple: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
-                libc: LibcTarget::Native,
+                target_triple: current_target_triple(),
+                libc: if cfg!(target_os = "macos") {
+                    LibcTarget::Native
+                } else if cfg!(all(target_os = "linux", target_env = "musl")) {
+                    LibcTarget::MuslStatic
+                } else {
+                    LibcTarget::Glibc {
+                        minimum: "2.0".to_owned(),
+                    }
+                },
             }],
             limits: RuntimeResourceLimits {
                 command_queue: 32,
@@ -548,6 +832,60 @@ mod tests {
         assert_eq!(
             requested_connectors(&["neo4j".to_owned()], None).unwrap(),
             vec!["bloodhound"]
+        );
+    }
+
+    #[test]
+    fn profile_activation_verifies_real_artifact_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_path = directory.path().join("executor.litertlm");
+        std::fs::write(&artifact_path, b"immutable model bytes").unwrap();
+        let required = ProfileProviderRequirement {
+            kind: ProviderKind::ModelRuntime,
+            operations: vec!["agent.turn".into()],
+            required_features: Vec::new(),
+            maximum_concurrency: 1,
+        };
+        let mut profile = profile(required);
+        profile.models.push(ArtifactBinding {
+            logical_name: "executor".to_owned(),
+            path: artifact_path.clone(),
+            content_hash: blake3::hash(b"immutable model bytes").to_hex().to_string(),
+            byte_size: 21,
+        });
+        verify_profile_artifacts(&profile).unwrap();
+
+        std::fs::write(artifact_path, b"changed model bytes").unwrap();
+        let error = verify_profile_artifacts(&profile).unwrap_err();
+        assert!(error.to_string().contains("content hash mismatch"));
+    }
+
+    #[test]
+    fn profile_activation_enforces_target_and_daemon_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let daemon = directory.path().join("grokd");
+        std::fs::write(&daemon, [7_u8; 32]).unwrap();
+        let required = ProfileProviderRequirement {
+            kind: ProviderKind::ModelRuntime,
+            operations: Vec::new(),
+            required_features: Vec::new(),
+            maximum_concurrency: 1,
+        };
+        let mut profile = profile(required);
+        profile.maximum_daemon_binary_bytes = 32;
+        verify_deployment_compatibility(&profile, &daemon).unwrap();
+
+        profile.maximum_daemon_binary_bytes = 31;
+        let error = verify_deployment_compatibility(&profile, &daemon).unwrap_err();
+        assert!(error.to_string().contains("exceeds runtime profile budget"));
+
+        profile.maximum_daemon_binary_bytes = 32;
+        profile.targets[0].target_triple = "wrong-unknown-target".to_owned();
+        let error = verify_deployment_compatibility(&profile, &daemon).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not contain current target")
         );
     }
 }

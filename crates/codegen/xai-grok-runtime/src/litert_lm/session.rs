@@ -145,6 +145,37 @@ pub fn resident_session_stats() -> (u32, u64) {
     (sessions, tokens)
 }
 
+pub fn resident_session_owners() -> Vec<crate::protocol::ResidentSessionOwner> {
+    let Some(cache) = SESSION_CACHE.get() else {
+        return Vec::new();
+    };
+    let cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut owners = cache
+        .iter()
+        .map(|(key, session)| {
+            let (prefix, session_id) = key.rsplit_once('\0').unwrap_or(("", key.as_str()));
+            let adapter_id = prefix
+                .rsplit_once("\0adapter=")
+                .map(|(_, adapter)| adapter)
+                .filter(|adapter| *adapter != "base")
+                .map(str::to_owned);
+            crate::protocol::ResidentSessionOwner {
+                session_id: session_id.to_owned(),
+                adapter_id,
+                resident_tokens: session.resident_tokens,
+            }
+        })
+        .collect::<Vec<_>>();
+    owners.sort_by(|left, right| {
+        left.session_id
+            .cmp(&right.session_id)
+            .then_with(|| left.adapter_id.cmp(&right.adapter_id))
+    });
+    owners
+}
+
 fn take_cached_conversation(
     key: &str,
     prepared: &PreparedConversation,

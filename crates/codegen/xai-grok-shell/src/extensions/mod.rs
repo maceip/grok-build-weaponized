@@ -26,6 +26,7 @@ pub mod repair;
 pub mod rewind;
 pub mod rollout;
 pub mod routing;
+pub mod runtime_status;
 pub mod search;
 pub mod session_admin;
 pub mod session_search;

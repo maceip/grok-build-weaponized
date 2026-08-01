@@ -216,6 +216,30 @@ impl ExecutionProvider for ProcessExecutionProvider {
         }
     }
 
+    async fn status(&self) -> serde_json::Value {
+        let retry_in_ms = self
+            .restart_not_before
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|deadline| deadline.checked_duration_since(tokio::time::Instant::now()))
+            .map(|remaining| remaining.as_millis() as u64);
+        let Ok(process) = self.process.try_lock() else {
+            return serde_json::json!({
+                "transport":"local_binary_ipc",
+                "busy":true,
+                "restart_in_ms":retry_in_ms,
+            });
+        };
+        serde_json::json!({
+            "transport":"local_binary_ipc",
+            "busy":false,
+            "child_pid":process.as_ref().and_then(|worker| worker.child.id()),
+            "restart_in_ms":retry_in_ms,
+            "manifest_hash":self.manifest_hash,
+        })
+    }
+
     async fn execute(&self, dispatch: ProviderDispatch) -> Result<ProviderOutput, ProtocolError> {
         let request_id = dispatch.request_id.clone();
         let remaining = dispatch.task.deadline_unix_ms.saturating_sub(now_unix_ms());

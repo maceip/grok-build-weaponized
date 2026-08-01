@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xai_grok_sampling_types::SamplingError;
 
@@ -16,8 +16,8 @@ use crate::protocol::{
     WORKER_PROTOCOL_VERSION, WorkerCommand, WorkerMessage, WorkerStats, read_frame, write_frame,
 };
 
-const NATIVE_CANCEL_GRACE: Duration = Duration::from_millis(1_500);
-const FORCED_KILL_WAIT: Duration = Duration::from_millis(400);
+const NATIVE_CANCEL_GRACE: Duration = Duration::from_secs(1);
+const FORCED_KILL_WAIT: Duration = Duration::from_millis(250);
 
 enum PendingRequest {
     Generation {
@@ -37,6 +37,7 @@ struct WorkerClientInner {
     control_gate: Mutex<()>,
     dead: AtomicBool,
     active_requests: AtomicU32,
+    _process_slot: OwnedSemaphorePermit,
 }
 
 /// Persistent client for one isolated native engine worker.
@@ -52,6 +53,7 @@ impl WorkerClient {
         config: LiteRtLmConfig,
         model_id: String,
         model_load_timeout: Duration,
+        process_slot: OwnedSemaphorePermit,
     ) -> Result<Self, SamplingError> {
         use command_fds::{CommandFdExt, FdMapping};
         use std::os::fd::OwnedFd;
@@ -84,6 +86,7 @@ impl WorkerClient {
                 control_gate: Mutex::new(()),
                 dead: AtomicBool::new(false),
                 active_requests: AtomicU32::new(0),
+                _process_slot: process_slot,
             }),
         };
         client.spawn_reader(reader);
@@ -125,6 +128,7 @@ impl WorkerClient {
         _config: LiteRtLmConfig,
         _model_id: String,
         _model_load_timeout: Duration,
+        _process_slot: OwnedSemaphorePermit,
     ) -> Result<Self, SamplingError> {
         Err(worker_error(
             "worker_platform",

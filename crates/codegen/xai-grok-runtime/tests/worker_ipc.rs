@@ -5,8 +5,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use xai_grok_runtime::{
     AdapterBinding, AdapterDescriptor, AdapterDtype, ContextOverflowStrategy, LiteRtLmConfig,
-    LocalInferenceResult, MemoryLimits, PreparedConversation, RuntimeManager, RuntimeManagerConfig,
-    RuntimeMode, RuntimePriority, RuntimeRequest, RuntimeStage, hash_artifact,
+    LocalInferenceResult, MemoryLimits, PreparedConversation, RuntimeEvent, RuntimeManager,
+    RuntimeManagerConfig, RuntimeMode, RuntimePriority, RuntimeRequest, RuntimeStage,
+    hash_artifact,
 };
 use xai_grok_sampling_types::ConversationItem;
 
@@ -72,6 +73,7 @@ fn runtime_fixture() -> (tempfile::TempDir, RuntimeManager, LiteRtLmConfig) {
         ))),
         queue_capacity: 8,
         max_active_requests: 2,
+        max_worker_processes: 4,
         memory_limits: MemoryLimits {
             physical_bytes: 1024 * 1024 * 1024,
             soft_bytes: 768 * 1024 * 1024,
@@ -165,6 +167,7 @@ async fn persistent_worker_measures_streams_and_releases_session() {
         ))),
         queue_capacity: 8,
         max_active_requests: 2,
+        max_worker_processes: 4,
         memory_limits: MemoryLimits {
             physical_bytes: 16 * 1024 * 1024,
             soft_bytes: 12 * 1024 * 1024,
@@ -246,6 +249,7 @@ async fn live_real_worker_measures_generates_and_streams_without_http() {
         ))),
         queue_capacity: 8,
         max_active_requests: 1,
+        max_worker_processes: 4,
         memory_limits: MemoryLimits::detect(),
     });
     let max_output_tokens = std::env::var("LITERT_LM_TEST_MAX_OUTPUT")
@@ -314,6 +318,140 @@ async fn live_real_worker_measures_generates_and_streams_without_http() {
     manager.shutdown().await;
 }
 
+#[tokio::test]
+#[ignore = "requires the real Grok LiteRT-LM bridge and a compatible model artifact"]
+async fn live_real_worker_cancellation_stays_bounded_and_worker_recovers() {
+    let library_path =
+        PathBuf::from(std::env::var("LITERT_LM_LIBRARY").expect("LITERT_LM_LIBRARY"));
+    let model_path =
+        PathBuf::from(std::env::var("LITERT_LM_TEST_MODEL").expect("LITERT_LM_TEST_MODEL"));
+    let backend = std::env::var("LITERT_LM_TEST_BACKEND").unwrap_or_else(|_| "gpu".to_owned());
+    let config = LiteRtLmConfig {
+        model_path,
+        library_path,
+        backend,
+        max_context_tokens: Some(4_096),
+        supported_lora_ranks: Vec::new(),
+        adapter_descriptor: None,
+        lora_adapter: None,
+        max_resident_adapters: 8,
+        max_resident_sessions: 8,
+        max_resident_context_tokens: 32_768,
+        context_strategy: ContextOverflowStrategy::Strict,
+        min_recent_turns: 4,
+    };
+    let manager = RuntimeManager::new(RuntimeManagerConfig {
+        mode: RuntimeMode::Worker,
+        worker_path: Some(PathBuf::from(env!(
+            "CARGO_BIN_EXE_grok-local-runtime-worker"
+        ))),
+        queue_capacity: 8,
+        max_active_requests: 1,
+        max_worker_processes: 1,
+        memory_limits: MemoryLimits::detect(),
+    });
+    manager
+        .prewarm_model("live-cancellation-model".to_owned(), config.clone())
+        .await
+        .expect("real model prewarm");
+
+    let mut cancellation_samples = Vec::with_capacity(20);
+    for index in 0..20 {
+        let request_id = format!("live-cancel-{index}");
+        let mut conversation = prepared();
+        conversation.max_output_tokens = Some(2_048);
+        conversation.current_message = r#"{"role":"user","content":[{"type":"text","text":"Generate a long numbered technical inventory with detailed explanations."}]}"#.to_owned();
+        let running_manager = manager.clone();
+        let running_config = config.clone();
+        let running_request_id = request_id.clone();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            running_manager
+                .generate(
+                    RuntimeRequest {
+                        request_id: running_request_id,
+                        session_id: format!("live-cancel-session-{index}"),
+                        model_id: "live-cancellation-model".to_owned(),
+                        model_config: running_config,
+                        stage: RuntimeStage::Direct,
+                        adapter: None,
+                        conversation,
+                        completion_reserve: 2_048,
+                        priority: RuntimePriority::Interactive,
+                        deadline: Instant::now() + Duration::from_secs(180),
+                        admission_hook: None,
+                    },
+                    event_tx,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(RuntimeEvent::FirstToken { .. }) => break,
+                    Some(_) => {}
+                    None => panic!("real native generation closed before its first token"),
+                }
+            }
+        })
+        .await
+        .expect("real native generation must emit a first token before cancellation");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if manager.cancel(&request_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real generation must become cancellable");
+        let cancelled_at = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("real native cancellation must complete within two seconds")
+            .expect("real cancellation task join")
+            .expect("real cancellation result");
+        assert!(matches!(result, LocalInferenceResult::Cancelled));
+        cancellation_samples.push(cancelled_at.elapsed());
+    }
+    cancellation_samples.sort_unstable();
+    let cancellation_p95 = cancellation_samples[cancellation_samples.len() * 95 / 100];
+    assert!(
+        cancellation_p95 <= Duration::from_secs(2),
+        "real native cancellation p95 was {cancellation_p95:?}"
+    );
+
+    let mut recovery_conversation = prepared();
+    recovery_conversation.max_output_tokens = Some(64);
+    recovery_conversation.current_message =
+        r#"{"role":"user","content":[{"type":"text","text":"Reply with OK."}]}"#.to_owned();
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let recovered = manager
+        .generate(
+            RuntimeRequest {
+                request_id: "live-after-cancellation".to_owned(),
+                session_id: "live-after-cancellation-session".to_owned(),
+                model_id: "live-cancellation-model".to_owned(),
+                model_config: config,
+                stage: RuntimeStage::Direct,
+                adapter: None,
+                conversation: recovery_conversation,
+                completion_reserve: 64,
+                priority: RuntimePriority::Interactive,
+                deadline: Instant::now() + Duration::from_secs(180),
+                admission_hook: None,
+            },
+            event_tx,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("worker must remain usable after repeated real cancellations");
+    assert!(matches!(recovered, LocalInferenceResult::Completed { .. }));
+    manager.shutdown().await;
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires a GPU LoRA-capable base artifact and two compatible adapters"]
@@ -371,6 +509,7 @@ async fn live_gpu_worker_switches_two_adapters_without_kv_cross_contamination() 
         ))),
         queue_capacity: 8,
         max_active_requests: 2,
+        max_worker_processes: 4,
         memory_limits: MemoryLimits::detect(),
     });
     manager
@@ -382,28 +521,44 @@ async fn live_gpu_worker_switches_two_adapters_without_kv_cross_contamination() 
         .await
         .expect("second real adapter prewarm and probe");
 
-    let first_result = generate_with_adapter(
-        &manager,
-        config.clone(),
-        "real-adapter-one",
-        AdapterBinding {
-            adapter_id: first.adapter_id.clone(),
-            revision: first.revision.clone(),
-        },
-    )
-    .await
-    .expect("first adapter generation");
-    let second_result = generate_with_adapter(
-        &manager,
-        config,
-        "real-adapter-two",
-        AdapterBinding {
-            adapter_id: second.adapter_id.clone(),
-            revision: second.revision.clone(),
-        },
-    )
-    .await
-    .expect("second adapter generation");
+    let mut selection_samples = Vec::with_capacity(100);
+    for _ in 0..100 {
+        let started = Instant::now();
+        manager
+            .prewarm_adapter("stub-model".to_owned(), config.clone(), first.clone())
+            .await
+            .expect("resident adapter selection");
+        selection_samples.push(started.elapsed());
+    }
+    selection_samples.sort_unstable();
+    let selection_p95 = selection_samples[selection_samples.len() * 95 / 100];
+    assert!(
+        selection_p95 <= Duration::from_millis(25),
+        "real resident adapter selection p95 was {selection_p95:?}"
+    );
+
+    let (first_result, second_result) = tokio::join!(
+        generate_with_adapter(
+            &manager,
+            config.clone(),
+            "real-adapter-one",
+            AdapterBinding {
+                adapter_id: first.adapter_id.clone(),
+                revision: first.revision.clone(),
+            },
+        ),
+        generate_with_adapter(
+            &manager,
+            config,
+            "real-adapter-two",
+            AdapterBinding {
+                adapter_id: second.adapter_id.clone(),
+                revision: second.revision.clone(),
+            },
+        ),
+    );
+    let first_result = first_result.expect("first adapter generation");
+    let second_result = second_result.expect("second adapter generation");
     let output = |result: LocalInferenceResult| match result {
         LocalInferenceResult::Completed { response, .. } => response
             .items
@@ -484,7 +639,7 @@ async fn native_hang_is_killed_after_request_id_cancellation_and_runtime_recover
     })
     .await
     .expect("request should become cancellable");
-    let result = tokio::time::timeout(Duration::from_millis(2_500), task)
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
         .await
         .expect("hung worker must be terminated within the cancellation bound")
         .expect("generation task join");

@@ -64,6 +64,10 @@ pub trait ExecutionProvider: Send + Sync + 'static {
         ServiceHealth::Ready
     }
 
+    async fn status(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+
     async fn execute(&self, dispatch: ProviderDispatch) -> Result<ProviderOutput, ProtocolError>;
 
     async fn cancel(&self, request_id: &RequestId) -> Result<(), ProtocolError>;
@@ -149,6 +153,7 @@ pub struct ProviderCapacity {
     pub draining: bool,
     pub completed: u64,
     pub failed: u64,
+    pub status: serde_json::Value,
 }
 
 pub struct ProviderRegistry {
@@ -487,11 +492,15 @@ impl ProviderRegistry {
     }
 
     pub async fn capacity(&self) -> Vec<ProviderCapacity> {
-        self.entries
+        let entries = self
+            .entries
             .read()
             .await
             .iter()
-            .map(|(provider_id, entry)| ProviderCapacity {
+            .map(|(provider_id, entry)| (provider_id.clone(), entry.clone()))
+            .collect::<Vec<_>>();
+        futures::future::join_all(entries.into_iter().map(|(provider_id, entry)| async move {
+            ProviderCapacity {
                 provider_id: provider_id.clone(),
                 generation: entry.generation,
                 maximum_parallel: entry.manifest.concurrency.maximum_parallel,
@@ -501,8 +510,10 @@ impl ProviderRegistry {
                 draining: entry.draining.load(Ordering::Acquire),
                 completed: entry.completed.load(Ordering::Relaxed),
                 failed: entry.failed.load(Ordering::Relaxed),
-            })
-            .collect()
+                status: entry.provider.status().await,
+            }
+        }))
+        .await
     }
 }
 
@@ -571,6 +582,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::atomic::AtomicUsize;
 
+    use tokio::sync::Barrier;
     use xai_grok_protocol::{
         ArtifactContract, CancellationSemantics, CapabilityRequirement, ConcurrencyProfile,
         EngagementId, ExecutionTask, OperationDescriptor, ProviderKind, RecoverySemantics, TaskId,
@@ -578,6 +590,34 @@ mod tests {
     };
 
     use super::*;
+
+    struct BarrierStatusProvider {
+        manifest: CapabilityManifest,
+        barrier: Arc<Barrier>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionProvider for BarrierStatusProvider {
+        fn manifest(&self) -> CapabilityManifest {
+            self.manifest.clone()
+        }
+
+        async fn status(&self) -> serde_json::Value {
+            self.barrier.wait().await;
+            serde_json::json!({"observed": true})
+        }
+
+        async fn execute(
+            &self,
+            _dispatch: ProviderDispatch,
+        ) -> Result<ProviderOutput, ProtocolError> {
+            Ok(ProviderOutput::default())
+        }
+
+        async fn cancel(&self, _request_id: &RequestId) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
 
     fn manifest() -> CapabilityManifest {
         CapabilityManifest {
@@ -649,6 +689,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.output, serde_json::json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn capacity_queries_provider_status_concurrently() {
+        let registry = ProviderRegistry::new(ProviderRegistryConfig::default());
+        let barrier = Arc::new(Barrier::new(3));
+        for index in 0..3 {
+            let mut provider_manifest = manifest();
+            provider_manifest.provider_id = format!("status-{index}").into();
+            registry
+                .register(Arc::new(BarrierStatusProvider {
+                    manifest: provider_manifest,
+                    barrier: Arc::clone(&barrier),
+                }))
+                .await
+                .unwrap();
+        }
+
+        let capacity = tokio::time::timeout(std::time::Duration::from_secs(1), registry.capacity())
+            .await
+            .expect("all provider status futures must be polled together");
+        assert_eq!(capacity.len(), 3);
+        assert!(
+            capacity
+                .iter()
+                .all(|provider| provider.status["observed"] == true)
+        );
     }
 
     #[tokio::test]

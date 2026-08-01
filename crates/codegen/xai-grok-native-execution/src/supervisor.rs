@@ -11,7 +11,9 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::nmap::{NmapRequest, NmapResult, parse_result};
-use crate::spool::{OutputPage, OutputStream, SequencedSpool, SpoolBudget, read_page};
+use crate::spool::{
+    OutputPage, OutputStream, SequencedSpool, SpoolBudget, SpoolBudgetSnapshot, read_page,
+};
 
 const DEFAULT_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_PAGE_RECORDS: usize = 512;
@@ -181,9 +183,21 @@ pub struct NativeExecutionSupervisor {
     root: PathBuf,
     jobs: RwLock<HashMap<String, Arc<JobState>>>,
     permits: Arc<Semaphore>,
+    maximum_parallel: usize,
     maximum_jobs: usize,
     maximum_spool_bytes_per_job: u64,
     spool_budget: Arc<SpoolBudget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeExecutionCapacity {
+    pub maximum_parallel: usize,
+    pub available_parallel: usize,
+    pub maximum_jobs: usize,
+    pub jobs: usize,
+    pub lifecycle_counts: BTreeMap<String, usize>,
+    pub maximum_spool_bytes_per_job: u64,
+    pub spool: SpoolBudgetSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +246,7 @@ impl NativeExecutionSupervisor {
             root,
             jobs: RwLock::new(HashMap::new()),
             permits: Arc::new(Semaphore::new(limits.maximum_parallel.max(1))),
+            maximum_parallel: limits.maximum_parallel.max(1),
             maximum_jobs: limits.maximum_jobs.max(1),
             maximum_spool_bytes_per_job: limits.maximum_spool_bytes_per_job.max(1024),
             spool_budget: Arc::new(SpoolBudget::new(
@@ -241,6 +256,24 @@ impl NativeExecutionSupervisor {
         });
         supervisor.recover().await?;
         Ok(supervisor)
+    }
+
+    pub async fn capacity(&self) -> NativeExecutionCapacity {
+        let jobs = self.jobs.read().await.values().cloned().collect::<Vec<_>>();
+        let mut lifecycle_counts = BTreeMap::new();
+        for job in &jobs {
+            let lifecycle = format!("{:?}", job.snapshot.lock().await.lifecycle).to_lowercase();
+            *lifecycle_counts.entry(lifecycle).or_insert(0) += 1;
+        }
+        NativeExecutionCapacity {
+            maximum_parallel: self.maximum_parallel,
+            available_parallel: self.permits.available_permits(),
+            maximum_jobs: self.maximum_jobs,
+            jobs: jobs.len(),
+            lifecycle_counts,
+            maximum_spool_bytes_per_job: self.maximum_spool_bytes_per_job,
+            spool: self.spool_budget.snapshot().await,
+        }
     }
 
     pub async fn start_command(
@@ -991,6 +1024,18 @@ fn now_unix_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn command(script: impl Into<String>, timeout_ms: u64) -> CommandRequest {
+        CommandRequest {
+            executable: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), script.into()],
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout_ms,
+            stdin: CommandStdin::Null,
+            metadata: BTreeMap::new(),
+        }
+    }
+
     #[tokio::test]
     async fn command_output_is_sequenced_cursor_readable_and_durable() {
         let directory = tempfile::tempdir().unwrap();
@@ -1184,5 +1229,80 @@ mod tests {
                 .await,
             Err(NativeExecutionError::InvalidRequest(_))
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "explicit 100-process continuous-output latency gate for the release host"]
+    async fn hundred_processes_with_twenty_output_streams_keep_status_below_fifty_ms_p99() {
+        let directory = tempfile::tempdir().unwrap();
+        let supervisor = NativeExecutionSupervisor::open_with_limits(
+            directory.path(),
+            NativeExecutionLimits {
+                maximum_parallel: 100,
+                maximum_jobs: 128,
+                maximum_spool_bytes_per_job: 8 * 1024 * 1024,
+                maximum_spool_bytes_per_owner: 64 * 1024 * 1024,
+                maximum_total_spool_bytes: 128 * 1024 * 1024,
+            },
+        )
+        .await
+        .unwrap();
+        let mut job_ids = Vec::with_capacity(100);
+        for index in 0..100 {
+            let script = if index < 20 {
+                "i=0; while [ $i -lt 250 ]; do printf 'stdout-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' \"$i\"; printf 'stderr-%06d-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\\n' \"$i\" >&2; i=$((i+1)); sleep 0.01; done"
+            } else {
+                "sleep 3"
+            };
+            let job = supervisor
+                .start_command_for(format!("engagement-{}", index % 4), command(script, 10_000))
+                .await
+                .unwrap();
+            job_ids.push(job.job_id);
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut samples = Vec::with_capacity(300);
+        for _ in 0..300 {
+            let started = std::time::Instant::now();
+            let capacity = supervisor.capacity().await;
+            let listed = supervisor.list(None, 0, 128).await;
+            assert_eq!(capacity.jobs, 100);
+            assert_eq!(listed.len(), 100);
+            assert!(capacity.spool.used_bytes <= capacity.spool.maximum_total_bytes);
+            samples.push(started.elapsed());
+            tokio::task::yield_now().await;
+        }
+        samples.sort_unstable();
+        let p99 = samples[samples.len() * 99 / 100];
+        eprintln!("100-process native status/list p99: {p99:?}");
+        assert!(
+            p99 < Duration::from_millis(50),
+            "100-process status/list p99 was {p99:?}"
+        );
+
+        let mut cancellations = Vec::new();
+        for job_id in job_ids {
+            let supervisor = supervisor.clone();
+            cancellations.push(tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let snapshot = supervisor.snapshot(&job_id).await.unwrap();
+                if !snapshot.lifecycle.is_terminal() {
+                    supervisor.cancel(&job_id).await.unwrap();
+                }
+                started.elapsed()
+            }));
+        }
+        let mut cancellation_samples = Vec::new();
+        for cancellation in cancellations {
+            cancellation_samples.push(cancellation.await.unwrap());
+        }
+        cancellation_samples.sort_unstable();
+        let cancellation_p95 = cancellation_samples[cancellation_samples.len() * 95 / 100];
+        eprintln!("100-process cancellation p95: {cancellation_p95:?}");
+        assert!(
+            cancellation_p95 < Duration::from_secs(1),
+            "subprocess cancellation p95 was {cancellation_p95:?}"
+        );
     }
 }

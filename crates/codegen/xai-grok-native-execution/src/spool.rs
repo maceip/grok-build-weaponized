@@ -62,6 +62,14 @@ struct BudgetUsage {
     owners: HashMap<String, u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpoolBudgetSnapshot {
+    pub used_bytes: u64,
+    pub maximum_total_bytes: u64,
+    pub maximum_owner_bytes: u64,
+    pub owners: HashMap<String, u64>,
+}
+
 pub(crate) struct SpoolBudget {
     usage: Mutex<BudgetUsage>,
     maximum_total_bytes: u64,
@@ -106,6 +114,16 @@ impl SpoolBudget {
             if *owner_bytes == 0 {
                 usage.owners.remove(owner);
             }
+        }
+    }
+
+    pub(crate) async fn snapshot(&self) -> SpoolBudgetSnapshot {
+        let usage = self.usage.lock().await;
+        SpoolBudgetSnapshot {
+            used_bytes: usage.total,
+            maximum_total_bytes: self.maximum_total_bytes,
+            maximum_owner_bytes: self.maximum_owner_bytes,
+            owners: usage.owners.clone(),
         }
     }
 

@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{OperationId, ProfileId, ProviderKind, VersionRange};
 
-pub const RUNTIME_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_PROFILE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +38,7 @@ pub struct DeploymentTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactBinding {
     pub logical_name: String,
+    pub path: PathBuf,
     pub content_hash: String,
     pub byte_size: u64,
 }
@@ -259,6 +261,12 @@ impl RuntimeProfile {
                 if !names.insert(artifact.logical_name.as_str()) {
                     error(&path, "artifact logical name is duplicated".to_owned());
                 }
+                if !artifact.path.is_absolute() {
+                    error(
+                        &format!("{path}.path"),
+                        "artifact path must be absolute".to_owned(),
+                    );
+                }
                 if !valid_blake3_hex(&artifact.content_hash) {
                     error(
                         &format!("{path}.content_hash"),
@@ -322,6 +330,7 @@ mod tests {
             providers: Vec::new(),
             models: vec![ArtifactBinding {
                 logical_name: "executor".to_owned(),
+                path: PathBuf::from("/opt/grok/models/executor.litertlm"),
                 content_hash: "a".repeat(64),
                 byte_size: 1,
             }],

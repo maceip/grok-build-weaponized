@@ -236,6 +236,20 @@ struct AdapterRecord {
     memory: Option<ResourceLease>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterResidencySnapshot {
+    pub adapter_id: String,
+    pub revision: String,
+    pub native_id: u32,
+    pub residency: AdapterResidency,
+    pub state: AdapterState,
+    pub active_leases: u32,
+    pub byte_size: u64,
+    pub last_used: u64,
+    pub use_count: u64,
+    pub predicted_use: u64,
+}
+
 struct AdapterManagerInner {
     records: Mutex<HashMap<String, AdapterRecord>>,
     clock: AtomicU64,
@@ -412,6 +426,34 @@ impl AdapterManager {
             .values()
             .map(|record| record.descriptor.byte_size)
             .fold(0_u64, u64::saturating_add)
+    }
+
+    pub fn snapshot(&self) -> Vec<AdapterResidencySnapshot> {
+        let mut adapters = self
+            .inner
+            .records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|record| AdapterResidencySnapshot {
+                adapter_id: record.descriptor.adapter_id.clone(),
+                revision: record.descriptor.revision.clone(),
+                native_id: record.native_id,
+                residency: record.residency,
+                state: record.state.clone(),
+                active_leases: record.active_leases,
+                byte_size: record.descriptor.byte_size,
+                last_used: record.last_used,
+                use_count: record.use_count,
+                predicted_use: record.predicted_use,
+            })
+            .collect::<Vec<_>>();
+        adapters.sort_by(|left, right| {
+            left.adapter_id
+                .cmp(&right.adapter_id)
+                .then_with(|| left.revision.cmp(&right.revision))
+        });
+        adapters
     }
 
     pub fn bindings_for_adapter(&self, adapter_id: &str) -> Vec<AdapterBinding> {
@@ -633,6 +675,11 @@ mod tests {
             revision: "v1".to_string(),
         };
         let lease = manager.acquire(&binding).unwrap();
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].adapter_id, "adapter");
+        assert_eq!(snapshot[0].active_leases, 1);
+        assert_eq!(snapshot[0].state, AdapterState::InUse { leases: 1 });
         assert!(matches!(
             manager.evict(&binding),
             Err(AdapterError::InUse(_))

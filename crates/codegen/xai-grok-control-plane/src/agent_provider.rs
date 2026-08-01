@@ -115,6 +115,9 @@ enum WorkerCommand {
         request_id: RequestId,
         respond_to: oneshot::Sender<Result<(), ProtocolError>>,
     },
+    Status {
+        respond_to: oneshot::Sender<Result<serde_json::Value, ProtocolError>>,
+    },
     Shutdown,
 }
 
@@ -274,6 +277,24 @@ impl ExecutionProvider for AgentExecutionProvider {
 
     async fn health(&self) -> ServiceHealth {
         *self.health.borrow()
+    }
+
+    async fn status(&self) -> serde_json::Value {
+        let (respond_to, response) = oneshot::channel();
+        if self
+            .commands
+            .send(WorkerCommand::Status { respond_to })
+            .await
+            .is_err()
+        {
+            return serde_json::json!({"error":"agent provider command channel is closed"});
+        }
+        match tokio::time::timeout(Duration::from_secs(2), response).await {
+            Ok(Ok(Ok(status))) => status,
+            Ok(Ok(Err(error))) => serde_json::json!({"error":error.to_string()}),
+            Ok(Err(_)) => serde_json::json!({"error":"agent provider dropped status response"}),
+            Err(_) => serde_json::json!({"error":"agent provider status timed out"}),
+        }
     }
 
     async fn execute(&self, dispatch: ProviderDispatch) -> Result<ProviderOutput, ProtocolError> {
@@ -453,6 +474,24 @@ async fn run_generation(
                         };
                         let _ = respond_to.send(result);
                     }
+                    WorkerCommand::Status { respond_to } => {
+                        let raw_params = serde_json::value::to_raw_value(&serde_json::json!({}))
+                            .map(Arc::from)
+                            .map_err(|error| unavailable(format!("encode agent runtime status request: {error}")));
+                        let result = match raw_params {
+                            Ok(raw_params) => connection
+                                .ext_method(acp::ExtRequest::new("x.ai/runtime/status", raw_params))
+                                .await
+                                .map_err(|error| unavailable(format!("agent runtime status failed: {error}")))
+                                .and_then(|response| {
+                                    serde_json::from_str(response.0.get()).map_err(|error| {
+                                        unavailable(format!("decode agent runtime status: {error}"))
+                                    })
+                                }),
+                            Err(error) => Err(error),
+                        };
+                        let _ = respond_to.send(result);
+                    }
                     WorkerCommand::Execute { dispatch, respond_to } => {
                         let connection = connection.clone();
                         let captures = captures.clone();
@@ -511,8 +550,7 @@ async fn initialize_agent(connection: &acp::ClientSideConnection) -> Result<(), 
     if let Some(method) = response
         .auth_methods
         .iter()
-        .find(|method| method.id().0.as_ref() == "xai.api_key")
-        .or(response.auth_methods.first())
+        .find(|method| non_interactive_auth_id(method.id().0.as_ref()))
     {
         connection
             .authenticate(
@@ -525,6 +563,10 @@ async fn initialize_agent(connection: &acp::ClientSideConnection) -> Result<(), 
             })?;
     }
     Ok(())
+}
+
+fn non_interactive_auth_id(method_id: &str) -> bool {
+    matches!(method_id, "xai.api_key" | "cached_token")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -623,20 +665,40 @@ fn manifest(config: &AgentProviderConfig) -> CapabilityManifest {
         architecture: std::env::consts::ARCH.to_owned(),
         accelerator: None,
     });
+    let mut features = [
+        "persistent_acp_worker",
+        "session_continuity",
+        "tool_loop",
+        "turn_cooperation",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    if config
+        .environment
+        .get("GROK_LOCAL_RUNTIME_MODE")
+        .is_some_and(|mode| mode == "worker")
+        && config
+            .environment
+            .get("GROK_LOCAL_RUNTIME_WORKER")
+            .is_some_and(|path| PathBuf::from(path).is_file())
+    {
+        features.extend(
+            [
+                "bounded_binary_ipc",
+                "exact_prompt_measurement",
+                "isolated_litert_worker",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    }
     CapabilityManifest {
         provider_id: ProviderId::from_string("agent-runtime"),
         provider_version: env!("CARGO_PKG_VERSION").to_owned(),
         protocol: VersionRange::exact(PROTOCOL_VERSION),
         kind: ProviderKind::ModelRuntime,
-        features: [
-            "persistent_acp_worker",
-            "session_continuity",
-            "tool_loop",
-            "turn_cooperation",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
+        features,
         operations: vec![OperationDescriptor {
             operation_id: AGENT_TURN_OPERATION.into(),
             display_name: "Execute coordinated agent turn".to_owned(),
@@ -688,4 +750,17 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::non_interactive_auth_id;
+
+    #[test]
+    fn supervised_provider_never_selects_browser_authentication() {
+        assert!(non_interactive_auth_id("xai.api_key"));
+        assert!(non_interactive_auth_id("cached_token"));
+        assert!(!non_interactive_auth_id("grok.com"));
+        assert!(!non_interactive_auth_id("enterprise_oidc"));
+    }
 }

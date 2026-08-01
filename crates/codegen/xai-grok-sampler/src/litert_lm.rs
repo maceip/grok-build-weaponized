@@ -57,6 +57,11 @@ pub fn local_runtime_capacity() -> xai_grok_runtime::CapacitySnapshot {
     RuntimeManager::global().capacity()
 }
 
+pub async fn local_runtime_status() -> Result<xai_grok_runtime::RuntimeStatusSnapshot, SamplingError>
+{
+    RuntimeManager::global().status().await
+}
+
 pub async fn bound_text_for_sampler(
     sampler: &SamplerConfig,
     text: &str,

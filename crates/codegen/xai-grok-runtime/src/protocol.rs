@@ -119,9 +119,18 @@ pub struct WorkerStats {
     pub resident_adapters: u32,
     pub resident_sessions: u32,
     pub resident_context_tokens: u64,
+    #[serde(default)]
+    pub resident_session_owners: Vec<ResidentSessionOwner>,
     pub active_requests: u32,
     pub completed_requests: u64,
     pub poisoned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidentSessionOwner {
+    pub session_id: String,
+    pub adapter_id: Option<String>,
+    pub resident_tokens: u32,
 }
 
 pub async fn write_frame<W, T>(writer: &mut W, value: &T) -> io::Result<()>

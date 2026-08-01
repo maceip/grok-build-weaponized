@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex as AsyncMutex, OnceCell, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, OnceCell, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xai_grok_protocol::WrappedToolResultEnvelope;
 use xai_grok_sampling_types::SamplingError;
@@ -55,6 +55,7 @@ pub struct RuntimeManagerConfig {
     pub worker_path: Option<PathBuf>,
     pub queue_capacity: usize,
     pub max_active_requests: usize,
+    pub max_worker_processes: usize,
     pub memory_limits: MemoryLimits,
 }
 
@@ -70,6 +71,11 @@ impl Default for RuntimeManagerConfig {
             worker_path: std::env::var_os("GROK_LOCAL_RUNTIME_WORKER").map(PathBuf::from),
             queue_capacity: 64,
             max_active_requests: 2,
+            max_worker_processes: std::env::var("GROK_LOCAL_RUNTIME_MAX_WORKERS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(8),
             memory_limits: MemoryLimits::detect(),
         }
     }
@@ -183,12 +189,24 @@ pub struct CapacitySnapshot {
     pub active_requests: u32,
     pub completed_requests: u64,
     pub resident_workers: u32,
+    pub maximum_workers: u32,
     pub resources: ResourceSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeStatusSnapshot {
+    pub capacity: CapacitySnapshot,
+    pub workers: HashMap<String, WorkerStats>,
+    pub adapters: Vec<crate::adapter::AdapterResidencySnapshot>,
+    pub backend_selections: HashMap<String, String>,
+    pub replica_counts: HashMap<String, usize>,
 }
 
 struct RuntimeManagerInner {
     mode: RuntimeMode,
     worker_path: Option<PathBuf>,
+    worker_process_slots: Arc<Semaphore>,
+    maximum_workers: u32,
     scheduler: Scheduler,
     queue_depth: Arc<AtomicUsize>,
     active_requests: AtomicU32,
@@ -254,6 +272,8 @@ impl RuntimeManager {
             inner: Arc::new(RuntimeManagerInner {
                 mode: config.mode.resolve(),
                 worker_path: config.worker_path,
+                worker_process_slots: Arc::new(Semaphore::new(config.max_worker_processes.max(1))),
+                maximum_workers: config.max_worker_processes.max(1).min(u32::MAX as usize) as u32,
                 scheduler,
                 queue_depth,
                 active_requests: AtomicU32::new(0),
@@ -348,6 +368,7 @@ impl RuntimeManager {
         } else {
             &["cpu", "gpu"]
         };
+        let retain_probe_workers = self.inner.maximum_workers as usize >= candidates.len();
         let mut probes = Vec::new();
         let mut failures = Vec::new();
         for backend in candidates {
@@ -370,11 +391,14 @@ impl RuntimeManager {
             };
             match result {
                 Ok(sample) => probes.push(BackendProbeSample {
-                    config: candidate,
+                    config: candidate.clone(),
                     sample,
                     elapsed: started.elapsed(),
                 }),
                 Err(error) => failures.push(format!("{backend}: {error}")),
+            }
+            if self.inner.mode == RuntimeMode::Worker && !retain_probe_workers {
+                self.remove_backend_probe_worker(&candidate, model_id).await;
             }
         }
         let selected_index = select_backend_probe(&probes, require_gpu).ok_or_else(|| {
@@ -387,7 +411,7 @@ impl RuntimeManager {
             )
         })?;
         let selected = probes[selected_index].config.clone();
-        if self.inner.mode == RuntimeMode::Worker {
+        if self.inner.mode == RuntimeMode::Worker && retain_probe_workers {
             let rejected_backends: &[&str] = if require_gpu { &["cpu"] } else { candidates };
             for backend in rejected_backends {
                 if *backend != selected.backend {
@@ -1569,8 +1593,19 @@ impl RuntimeManager {
             active_requests: self.inner.active_requests.load(Ordering::Acquire),
             completed_requests: self.inner.completed_requests.load(Ordering::Acquire),
             resident_workers: self.inner.resident_workers.load(Ordering::Acquire),
+            maximum_workers: self.inner.maximum_workers,
             resources: self.inner.governor.snapshot(),
         }
+    }
+
+    pub async fn status(&self) -> Result<RuntimeStatusSnapshot, SamplingError> {
+        Ok(RuntimeStatusSnapshot {
+            capacity: self.capacity(),
+            workers: self.worker_capacity().await?,
+            adapters: self.inner.adapters.snapshot(),
+            backend_selections: self.inner.backend_selections.lock().await.clone(),
+            replica_counts: self.inner.replica_counts.lock().await.clone(),
+        })
     }
 
     /// Stop accepting useful work from existing workers, cancel active
@@ -1621,12 +1656,16 @@ impl RuntimeManager {
                 .filter_map(|(key, cell)| cell.get().cloned().map(|worker| (key.clone(), worker)))
                 .collect::<Vec<_>>()
         };
-        let mut stats = HashMap::with_capacity(workers.len());
-        for (key, worker) in workers {
-            if !worker.is_dead() {
-                self.ensure_worker_reservation(&key, &worker).await?;
-                stats.insert(key, worker.stats().await?);
-            }
+        let results = futures::future::join_all(workers.into_iter().filter_map(|(key, worker)| {
+            (!worker.is_dead()).then_some(async move { (key, worker.stats().await) })
+        }))
+        .await;
+        let mut stats = HashMap::with_capacity(results.len());
+        for (key, result) in results {
+            let worker_stats = result?;
+            self.ensure_worker_reservation_from_stats(&key, &worker_stats)
+                .await?;
+            stats.insert(key, worker_stats);
         }
         Ok(stats)
     }
@@ -1708,9 +1747,11 @@ impl RuntimeManager {
             self.release_worker_reservation(&key).await;
         }
         let path = self.worker_path()?;
+        let manager = self.clone();
         let worker = cell
             .get_or_try_init(|| async move {
-                WorkerClient::spawn(&path, config, model_id, model_load_timeout)
+                manager
+                    .spawn_worker(&path, config, model_id, model_load_timeout)
                     .await
                     .map(Arc::new)
             })
@@ -1732,12 +1773,58 @@ impl RuntimeManager {
         Ok(worker)
     }
 
+    async fn spawn_worker(
+        &self,
+        path: &std::path::Path,
+        config: LiteRtLmConfig,
+        model_id: String,
+        timeout: Duration,
+    ) -> Result<WorkerClient, SamplingError> {
+        let started = Instant::now();
+        let process_slot = tokio::time::timeout(
+            timeout,
+            Arc::clone(&self.inner.worker_process_slots).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            runtime_error(
+                "local_runtime_worker_capacity",
+                format!(
+                    "timed out waiting for one of {} local runtime worker slots",
+                    self.inner.maximum_workers
+                ),
+            )
+        })?
+        .map_err(|_| {
+            runtime_error(
+                "local_runtime_worker_capacity",
+                "local runtime worker capacity is closed",
+            )
+        })?;
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(runtime_error(
+                "local_runtime_worker_capacity",
+                "local runtime worker deadline elapsed before process spawn",
+            ));
+        }
+        WorkerClient::spawn(path, config, model_id, remaining, process_slot).await
+    }
+
     async fn ensure_worker_reservation(
         &self,
         key: &str,
         worker: &Arc<WorkerClient>,
     ) -> Result<(), SamplingError> {
         let stats = worker.stats().await?;
+        self.ensure_worker_reservation_from_stats(key, &stats).await
+    }
+
+    async fn ensure_worker_reservation_from_stats(
+        &self,
+        key: &str,
+        stats: &WorkerStats,
+    ) -> Result<(), SamplingError> {
         let engine_bytes = stats
             .resident_bytes
             .saturating_sub(stats.resident_adapter_bytes)
@@ -1828,6 +1915,9 @@ impl RuntimeManager {
     }
 
     async fn start_replica_calibration(&self, config: LiteRtLmConfig, model_id: String) {
+        if self.inner.worker_process_slots.available_permits() == 0 {
+            return;
+        }
         let base_key = replica_base_key(&config, &model_id);
         if self
             .inner
@@ -1879,7 +1969,7 @@ impl RuntimeManager {
         let primary = self.worker(config.clone(), model_id.clone()).await?;
         let path = self.worker_path()?;
         let candidate = Arc::new(
-            WorkerClient::spawn(&path, config, model_id.clone(), DEFAULT_MODEL_LOAD_TIMEOUT)
+            self.spawn_worker(&path, config, model_id.clone(), DEFAULT_MODEL_LOAD_TIMEOUT)
                 .await?,
         );
         let candidate_key = replica_worker_key(base_key, 1);
@@ -2831,6 +2921,7 @@ mod tests {
             worker_path: None,
             queue_capacity: 4,
             max_active_requests: 1,
+            max_worker_processes: 2,
             memory_limits: MemoryLimits {
                 physical_bytes: 1000,
                 soft_bytes: 600,
@@ -2838,6 +2929,7 @@ mod tests {
             },
         });
         assert_eq!(manager.capacity().resources.limits.hard_bytes, 750);
+        assert_eq!(manager.capacity().maximum_workers, 2);
     }
 
     #[test]

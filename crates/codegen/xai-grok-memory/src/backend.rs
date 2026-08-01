@@ -10,7 +10,8 @@
 //! per query. WAL mode ensures concurrent readers don't block.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use xai_grok_tools::types::memory_backend::{MemoryBackend, MemorySearchResult};
 
@@ -226,6 +227,89 @@ pub struct MemoryBackendImpl {
     /// injection and compaction-recovery backends use their own local counters.
     pub search_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     embedding_credentials: EndpointScopedCredentials,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct EmbeddingBackfillStatus {
+    pub active_tasks: usize,
+    pub pending_chunks: usize,
+    pub embedded_chunks: u64,
+    pub failed_batches: u64,
+    pub indexes: Vec<EmbeddingBackfillIndexStatus>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct EmbeddingBackfillIndexStatus {
+    pub database: PathBuf,
+    pub active: bool,
+    pub pending_chunks: usize,
+    pub embedded_chunks: u64,
+    pub failed_batches: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EmbeddingBackfillState {
+    active: bool,
+    pending_chunks: usize,
+    embedded_chunks: u64,
+    failed_batches: u64,
+    update_sequence: u64,
+}
+
+const MAX_BACKFILL_STATUS_INDEXES: usize = 128;
+
+fn next_backfill_sequence() -> u64 {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
+fn prune_backfill_statuses(
+    backfills: &mut std::collections::HashMap<PathBuf, EmbeddingBackfillState>,
+    target_len: usize,
+) {
+    while backfills.len() > target_len {
+        let Some(oldest) = backfills
+            .iter()
+            .filter(|(_, state)| !state.active)
+            .min_by_key(|(_, state)| state.update_sequence)
+            .map(|(database, _)| database.clone())
+        else {
+            break;
+        };
+        backfills.remove(&oldest);
+    }
+}
+
+fn embedding_backfills()
+-> &'static StdMutex<std::collections::HashMap<PathBuf, EmbeddingBackfillState>> {
+    static BACKFILLS: OnceLock<
+        StdMutex<std::collections::HashMap<PathBuf, EmbeddingBackfillState>>,
+    > = OnceLock::new();
+    BACKFILLS.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+}
+
+pub fn embedding_backfill_status() -> EmbeddingBackfillStatus {
+    let backfills = embedding_backfills()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut indexes = backfills
+        .iter()
+        .map(|(database, state)| EmbeddingBackfillIndexStatus {
+            database: database.clone(),
+            active: state.active,
+            pending_chunks: state.pending_chunks,
+            embedded_chunks: state.embedded_chunks,
+            failed_batches: state.failed_batches,
+        })
+        .collect::<Vec<_>>();
+    indexes.sort_by(|left, right| left.database.cmp(&right.database));
+    EmbeddingBackfillStatus {
+        active_tasks: indexes.iter().filter(|index| index.active).count(),
+        pending_chunks: indexes.iter().map(|index| index.pending_chunks).sum(),
+        embedded_chunks: indexes.iter().map(|index| index.embedded_chunks).sum(),
+        failed_batches: indexes.iter().map(|index| index.failed_batches).sum(),
+        indexes,
+    }
 }
 
 impl MemoryBackendImpl {
@@ -627,62 +711,132 @@ fn schedule_embedding_backfill(
     chunks: Vec<(String, String)>,
     provider: Arc<dyn super::embedding::EmbeddingProvider>,
 ) {
-    tokio::spawn(async move {
-        let mut upserts = Vec::with_capacity(chunks.len());
-        for batch in chunks.chunks(32) {
-            let texts = batch
-                .iter()
-                .map(|(_, text)| text.as_str())
-                .collect::<Vec<_>>();
-            let mut retries = 0_u8;
-            let embeddings = loop {
-                match provider.embed_batch(&texts).await {
-                    Ok(embeddings) => break Some(embeddings),
-                    Err(error) if retries < 3 => {
-                        retries += 1;
-                        tracing::debug!(
-                            target: xai_grok_telemetry::memory_log::TARGET,
-                            %error,
-                            retries,
-                            "local embedding backfill deferred"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            target: xai_grok_telemetry::memory_log::TARGET,
-                            %error,
-                            "local embedding backfill skipped; FTS remains authoritative"
-                        );
-                        break None;
-                    }
-                }
-            };
-            let Some(embeddings) = embeddings else {
-                continue;
-            };
-            upserts.extend(
-                batch
-                    .iter()
-                    .zip(embeddings)
-                    .map(|((chunk_id, _), embedding)| (chunk_id.clone(), embedding)),
+    {
+        let mut backfills = embedding_backfills()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !backfills.contains_key(&db_path) {
+            prune_backfill_statuses(
+                &mut backfills,
+                MAX_BACKFILL_STATUS_INDEXES.saturating_sub(1),
             );
         }
-        if upserts.is_empty() {
+        let state = backfills.entry(db_path.clone()).or_default();
+        state.pending_chunks = state.pending_chunks.max(chunks.len());
+        state.update_sequence = next_backfill_sequence();
+        if state.active {
             return;
         }
-        let Ok(index) = super::index::MemoryIndex::open_or_create(
-            &db_path,
-            storage,
-            xai_grok_config_types::MemoryIndexConfig::default(),
-            dimensions,
-        ) else {
-            return;
-        };
-        for (chunk_id, embedding) in upserts {
-            let _ = index.upsert_embedding(&chunk_id, &embedding);
+        state.active = true;
+    }
+    tokio::spawn(async move {
+        let mut pending = chunks;
+        loop {
+            let index = match super::index::MemoryIndex::open_or_create(
+                &db_path,
+                storage.clone(),
+                xai_grok_config_types::MemoryIndexConfig::default(),
+                dimensions,
+            ) {
+                Ok(index) => index,
+                Err(error) => {
+                    tracing::warn!(
+                        target: xai_grok_telemetry::memory_log::TARGET,
+                        %error,
+                        "local embedding backfill could not open its index"
+                    );
+                    finish_embedding_backfill(&db_path, pending.len(), true);
+                    return;
+                }
+            };
+            for batch in pending.chunks(32) {
+                let texts = batch
+                    .iter()
+                    .map(|(_, text)| text.as_str())
+                    .collect::<Vec<_>>();
+                let mut retries = 0_u8;
+                let embeddings = loop {
+                    match provider.embed_batch(&texts).await {
+                        Ok(embeddings) => break Some(embeddings),
+                        Err(error) if retries < 3 => {
+                            retries += 1;
+                            tracing::debug!(
+                                target: xai_grok_telemetry::memory_log::TARGET,
+                                %error,
+                                retries,
+                                "local embedding backfill deferred"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: xai_grok_telemetry::memory_log::TARGET,
+                                %error,
+                                "local embedding backfill skipped; FTS remains authoritative"
+                            );
+                            break None;
+                        }
+                    }
+                };
+                let Some(embeddings) = embeddings else {
+                    finish_embedding_backfill(&db_path, pending.len(), true);
+                    return;
+                };
+                let mut embedded = 0_u64;
+                for ((chunk_id, _), embedding) in batch.iter().zip(embeddings) {
+                    if index.upsert_embedding(chunk_id, &embedding).is_ok() {
+                        embedded = embedded.saturating_add(1);
+                    }
+                }
+                update_embedding_backfill(&db_path, batch.len(), embedded);
+                if embedded != u64::try_from(batch.len()).unwrap_or(u64::MAX) {
+                    finish_embedding_backfill(&db_path, pending.len(), true);
+                    return;
+                }
+            }
+            pending = index.chunks_without_embeddings().unwrap_or_default();
+            if pending.is_empty() {
+                finish_embedding_backfill(&db_path, 0, false);
+                return;
+            }
+            let mut backfills = embedding_backfills()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(state) = backfills.get_mut(&db_path) {
+                state.pending_chunks = pending.len();
+            }
         }
     });
+}
+
+fn update_embedding_backfill(db_path: &PathBuf, attempted: usize, embedded: u64) {
+    let mut backfills = embedding_backfills()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(state) = backfills.get_mut(db_path) {
+        state.pending_chunks = state.pending_chunks.saturating_sub(attempted);
+        state.embedded_chunks = state.embedded_chunks.saturating_add(embedded);
+        state.update_sequence = next_backfill_sequence();
+    }
+}
+
+fn finish_embedding_backfill(db_path: &PathBuf, pending_chunks: usize, failed: bool) {
+    let mut backfills = embedding_backfills()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(state) = backfills.get_mut(db_path) {
+        state.active = false;
+        state.pending_chunks = if failed {
+            state.pending_chunks.max(pending_chunks)
+        } else {
+            pending_chunks
+        };
+        if failed {
+            state.failed_batches = state.failed_batches.saturating_add(1);
+        }
+        state.update_sequence = next_backfill_sequence();
+    }
+    prune_backfill_statuses(&mut backfills, MAX_BACKFILL_STATUS_INDEXES);
 }
 
 #[cfg(test)]
@@ -690,8 +844,36 @@ mod factory_tests {
     use super::*;
     use crate::index::{MemoryIndex, init_sqlite_vec};
     use crate::storage::MemoryStorage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     use xai_grok_config_types::{MemoryEmbeddingConfig, MemorySearchConfig};
+
+    struct BlockingEmbeddingProvider {
+        calls: AtomicUsize,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::embedding::EmbeddingProvider for BlockingEmbeddingProvider {
+        async fn embed_batch(
+            &self,
+            texts: &[&str],
+        ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(vec![vec![0.25; 4]; texts.len()])
+        }
+
+        fn model_name(&self) -> &str {
+            "blocking-test-provider"
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
 
     fn make_storage(tmp: &TempDir) -> MemoryStorage {
         let global = tmp.path().join("memory");
@@ -711,6 +893,74 @@ mod factory_tests {
             search_source: "tool",
             embedding_credentials: EndpointScopedCredentials::none(),
         }
+    }
+
+    #[tokio::test]
+    async fn embedding_backfill_is_singleflight_and_reports_real_progress() {
+        let tmp = TempDir::new().unwrap();
+        init_sqlite_vec();
+        let storage = make_storage(&tmp);
+        std::fs::create_dir_all(storage.workspace_dir()).unwrap();
+        let file = storage.workspace_memory_file();
+        std::fs::write(&file, "# Evidence\n\nA durable finding for the workspace.").unwrap();
+        let db_path = storage.workspace_dir().join("index.sqlite");
+        let mut index = MemoryIndex::open_or_create(
+            &db_path,
+            storage.clone(),
+            xai_grok_config_types::MemoryIndexConfig::default(),
+            4,
+        )
+        .unwrap();
+        index.reindex_file(&file, "workspace").unwrap();
+        let chunks = index.chunks_without_embeddings().unwrap();
+        assert_eq!(chunks.len(), 1);
+        drop(index);
+
+        let provider = Arc::new(BlockingEmbeddingProvider {
+            calls: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        schedule_embedding_backfill(
+            db_path.clone(),
+            storage.clone(),
+            4,
+            chunks.clone(),
+            provider.clone(),
+        );
+        provider.started.notified().await;
+        schedule_embedding_backfill(db_path.clone(), storage, 4, chunks, provider.clone());
+        let active = embedding_backfill_status();
+        let active = active
+            .indexes
+            .iter()
+            .find(|index| index.database == db_path)
+            .unwrap();
+        assert!(active.active);
+        assert_eq!(active.pending_chunks, 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        provider.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = embedding_backfill_status();
+                let status = status
+                    .indexes
+                    .iter()
+                    .find(|index| index.database == db_path)
+                    .unwrap();
+                if !status.active {
+                    assert_eq!(status.pending_chunks, 0);
+                    assert_eq!(status.embedded_chunks, 1);
+                    assert_eq!(status.failed_batches, 0);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
