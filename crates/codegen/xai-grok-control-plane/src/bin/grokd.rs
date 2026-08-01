@@ -118,6 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provider_config
             .environment
             .insert("GROK_EXECUTION_BACKEND".to_owned(), "daemon".to_owned());
+        provider_config
+            .environment
+            .insert("GROK_MEMORY".to_owned(), "1".to_owned());
         provider_config.environment.insert(
             "GROKD_SOCKET".to_owned(),
             socket_path.to_string_lossy().into_owned(),

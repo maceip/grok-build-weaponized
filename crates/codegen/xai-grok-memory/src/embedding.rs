@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
@@ -19,6 +19,7 @@ use xai_grok_runtime::{ResourceClass, ResourceGovernor, ResourceLease};
 const MAX_RETRIES: usize = 3;
 /// Initial backoff delay in milliseconds (doubles on each retry: 1s, 2s, 4s).
 const INITIAL_BACKOFF_MS: u64 = 1000;
+const LOCAL_LOAD_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// Trait for generating text embeddings.
 ///
@@ -131,6 +132,7 @@ struct LocalEmbeddingInner {
     dimensions: usize,
     state: Mutex<LocalModelState>,
     busy: AtomicBool,
+    next_load_attempt: Mutex<Instant>,
 }
 
 /// Process-shared, non-blocking local embedding provider.
@@ -164,13 +166,16 @@ impl LocalEmbeddingProvider {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(inner) = registry.get(&key).and_then(Weak::upgrade) {
-            return Some(Self { inner });
+            let provider = Self { inner };
+            provider.schedule_reload_if_needed();
+            return Some(provider);
         }
         let inner = Arc::new(LocalEmbeddingInner {
             profile,
             dimensions,
             state: Mutex::new(LocalModelState::Loading),
             busy: AtomicBool::new(false),
+            next_load_attempt: Mutex::new(Instant::now()),
         });
         let weak = Arc::downgrade(&inner);
         ResourceGovernor::global().register_reclaimer(
@@ -194,6 +199,10 @@ impl LocalEmbeddingProvider {
                 );
                 match previous {
                     LocalModelState::Ready { _lease: lease, .. } => {
+                        *inner
+                            .next_load_attempt
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
                         let bytes = lease.bytes();
                         drop(lease);
                         bytes
@@ -209,6 +218,31 @@ impl LocalEmbeddingProvider {
         drop(registry);
         start_local_model_load(Arc::clone(&inner));
         Some(Self { inner })
+    }
+
+    /// Schedule a non-blocking reload after pressure eviction or a transient
+    /// local model-load failure. Interactive retrieval still returns FTS-only
+    /// immediately while this transition is in progress.
+    fn schedule_reload_if_needed(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(*state, LocalModelState::Failed(_)) {
+            return;
+        }
+        let next_attempt = *self
+            .inner
+            .next_load_attempt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Instant::now() < next_attempt {
+            return;
+        }
+        *state = LocalModelState::Loading;
+        drop(state);
+        start_local_model_load(Arc::clone(&self.inner));
     }
 
     pub fn is_ready(&self) -> bool {
@@ -241,6 +275,7 @@ impl LocalEmbeddingProvider {
     pub async fn wait_ready(&self, timeout: Duration) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            self.schedule_reload_if_needed();
             match self.status() {
                 LocalEmbeddingStatus::Ready => return Ok(()),
                 LocalEmbeddingStatus::Failed(error) => return Err(error),
@@ -282,6 +317,7 @@ impl LocalEmbeddingProvider {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        self.schedule_reload_if_needed();
         if self
             .inner
             .busy
@@ -326,7 +362,11 @@ impl LocalEmbeddingProvider {
 /// Start the configured local embedding model load without waiting for model
 /// materialization. Returns `false` for non-local/off profiles.
 pub fn prewarm_local(config: &xai_grok_config_types::MemoryEmbeddingConfig) -> bool {
-    LocalEmbeddingProvider::from_config(config).is_some()
+    let Some(provider) = LocalEmbeddingProvider::from_config(config) else {
+        return false;
+    };
+    provider.schedule_reload_if_needed();
+    true
 }
 
 fn start_local_model_load(inner: Arc<LocalEmbeddingInner>) {
@@ -352,10 +392,17 @@ fn start_local_model_load(inner: Arc<LocalEmbeddingInner>) {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *state = match result {
-            Ok(ready) => ready,
-            Err(error) => LocalModelState::Failed(error),
-        };
+        match result {
+            Ok(ready) => *state = ready,
+            Err(error) => {
+                *inner
+                    .next_load_attempt
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Instant::now() + LOCAL_LOAD_RETRY_DELAY;
+                *state = LocalModelState::Failed(error);
+            }
+        }
     };
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn_blocking(load);
@@ -667,6 +714,29 @@ impl EmbeddingProvider for MockEmbeddingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "downloads/materializes the real EmbeddingGemma model for the release-host proof"]
+    async fn live_embeddinggemma_materializes_and_generates_normalized_vectors() {
+        let config = xai_grok_config_types::MemoryEmbeddingConfig::default();
+        let provider = LocalEmbeddingProvider::from_config(&config)
+            .expect("default memory embedding profile must resolve locally");
+        provider
+            .wait_ready(Duration::from_secs(10 * 60))
+            .await
+            .expect("EmbeddingGemma must become ready");
+        let embedding = provider
+            .embed_query("open ports and service banners observed in the workspace")
+            .await
+            .expect("real local query embedding must succeed");
+        assert_eq!(embedding.len(), config.dimensions);
+        let norm = embedding
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        assert!((norm - 1.0).abs() < 1e-4, "embedding norm was {norm}");
+    }
 
     #[tokio::test]
     async fn test_mock_embedding_deterministic() {
