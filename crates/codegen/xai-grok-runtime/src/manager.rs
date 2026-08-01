@@ -926,20 +926,49 @@ impl RuntimeManager {
             return Ok((measured, Vec::new()));
         }
 
+        let tools = serde_json::from_str::<Vec<serde_json::Value>>(&request.conversation.tools)
+            .map_err(|error| {
+                runtime_error(
+                    "local_runtime_context_admission",
+                    format!("tool schema payload is not a JSON array: {error}"),
+                )
+            })?;
+        let mut admitted_tools = vec![true; tools.len()];
         let mut groups = atomic_history_groups(
             &request.conversation.messages,
             &request.conversation.current_message,
         )?;
-        let mut candidates = groups
-            .iter()
-            .enumerate()
-            .filter(|(_, group)| !group.required)
-            .map(|(index, group)| StrictEvictionCandidate::History {
-                index,
-                kind: group.kind,
-                id: group.id.clone(),
-            })
-            .collect::<Vec<_>>();
+        let mut candidates = if request.stage == RuntimeStage::Executor {
+            Vec::new()
+        } else {
+            tools
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, tool)| StrictEvictionCandidate::OptionalToolSchema {
+                        index,
+                        id: tool
+                            .pointer("/function/name")
+                            .and_then(serde_json::Value::as_str)
+                            .map_or_else(
+                                || format!("tool_schema_{index}"),
+                                |name| format!("tool_schema:{name}"),
+                            ),
+                    },
+                )
+                .collect::<Vec<_>>()
+        };
+        candidates.extend(
+            groups
+                .iter()
+                .enumerate()
+                .filter(|(_, group)| !group.required)
+                .map(|(index, group)| StrictEvictionCandidate::History {
+                    index,
+                    kind: group.kind,
+                    id: group.id.clone(),
+                }),
+        );
         if request.conversation.retrieved_memory.is_some() {
             candidates.push(StrictEvictionCandidate::RetrievedMemory);
         }
@@ -948,6 +977,12 @@ impl RuntimeManager {
         let mut dropped = Vec::new();
         for candidate in candidates {
             let (id, kind) = match candidate {
+                StrictEvictionCandidate::OptionalToolSchema { index, id } => {
+                    admitted_tools[index] = false;
+                    request.conversation.tools =
+                        serialize_admitted_tool_schemas(&tools, &admitted_tools)?;
+                    (id, ContextComponentKind::OptionalToolSchema)
+                }
                 StrictEvictionCandidate::RetrievedMemory => {
                     request.conversation.retrieved_memory = None;
                     (
@@ -2279,6 +2314,10 @@ struct AtomicHistoryGroup {
 
 #[derive(Debug)]
 enum StrictEvictionCandidate {
+    OptionalToolSchema {
+        index: usize,
+        id: String,
+    },
     RetrievedMemory,
     History {
         index: usize,
@@ -2290,19 +2329,43 @@ enum StrictEvictionCandidate {
 impl StrictEvictionCandidate {
     fn sort_key(&self) -> (u8, usize) {
         match self {
-            Self::RetrievedMemory => (1, usize::MAX),
+            // Optional schemas are ranked most-to-least relevant in the
+            // prepared conversation. Drop the least relevant tail first.
+            Self::OptionalToolSchema { index, .. } => (0, usize::MAX.saturating_sub(*index)),
+            Self::RetrievedMemory => (2, usize::MAX),
             Self::History { index, kind, .. } => {
                 let priority = match kind {
-                    ContextComponentKind::OlderSummary => 0,
-                    ContextComponentKind::RetrievedMemory => 1,
-                    ContextComponentKind::RecentTurn => 2,
-                    ContextComponentKind::CurrentEvidence => 3,
-                    _ => 4,
+                    ContextComponentKind::OlderSummary => 1,
+                    ContextComponentKind::RetrievedMemory => 2,
+                    ContextComponentKind::RecentTurn => 3,
+                    ContextComponentKind::CurrentEvidence => 4,
+                    _ => 5,
                 };
                 (priority, *index)
             }
         }
     }
+}
+
+fn serialize_admitted_tool_schemas(
+    tools: &[serde_json::Value],
+    admitted: &[bool],
+) -> Result<String, SamplingError> {
+    if tools.len() != admitted.len() {
+        return Err(runtime_error(
+            "local_runtime_context_admission",
+            "tool schema admission bitmap length does not match the schema payload",
+        ));
+    }
+    serde_json::to_string(
+        &tools
+            .iter()
+            .zip(admitted)
+            .filter(|(_, admitted)| **admitted)
+            .map(|(tool, _)| tool)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(SamplingError::Serialization)
 }
 
 fn atomic_history_groups(
@@ -2572,7 +2635,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_eviction_order_is_summary_then_memory_then_complete_turns() {
+    fn strict_eviction_order_is_tools_then_summary_then_memory_then_complete_turns() {
         let mut candidates = [
             StrictEvictionCandidate::History {
                 index: 0,
@@ -2580,6 +2643,14 @@ mod tests {
                 id: "turn".to_string(),
             },
             StrictEvictionCandidate::RetrievedMemory,
+            StrictEvictionCandidate::OptionalToolSchema {
+                index: 0,
+                id: "tool-a".to_string(),
+            },
+            StrictEvictionCandidate::OptionalToolSchema {
+                index: 1,
+                id: "tool-b".to_string(),
+            },
             StrictEvictionCandidate::History {
                 index: 1,
                 kind: ContextComponentKind::OlderSummary,
@@ -2589,21 +2660,40 @@ mod tests {
         candidates.sort_by_key(StrictEvictionCandidate::sort_key);
         assert!(matches!(
             candidates[0],
+            StrictEvictionCandidate::OptionalToolSchema { index: 1, .. }
+        ));
+        assert!(matches!(
+            candidates[1],
+            StrictEvictionCandidate::OptionalToolSchema { index: 0, .. }
+        ));
+        assert!(matches!(
+            candidates[2],
             StrictEvictionCandidate::History {
                 kind: ContextComponentKind::OlderSummary,
                 ..
             }
         ));
         assert!(matches!(
-            candidates[1],
+            candidates[3],
             StrictEvictionCandidate::RetrievedMemory
         ));
         assert!(matches!(
-            candidates[2],
+            candidates[4],
             StrictEvictionCandidate::History {
                 kind: ContextComponentKind::RecentTurn,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn optional_tool_schema_eviction_keeps_complete_json_objects() {
+        let tools = vec![
+            serde_json::json!({"function": {"name": "first", "parameters": {"type": "object"}}}),
+            serde_json::json!({"function": {"name": "second", "parameters": {"type": "object"}}}),
+        ];
+        let serialized = serialize_admitted_tool_schemas(&tools, &[true, false]).unwrap();
+        let retained: Vec<serde_json::Value> = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(retained, vec![tools[0].clone()]);
     }
 }

@@ -409,7 +409,9 @@ pub fn prepare_conversation(
             .collect::<Vec<_>>();
         ranked_tools.sort_by_key(|(score, index, _)| (std::cmp::Reverse(*score), *index));
         ranked_tools.truncate(6);
-        ranked_tools.sort_by_key(|(_, index, _)| *index);
+        // Preserve relevance order in the prepared payload. Strict context
+        // admission can then evict complete optional schemas from the tail
+        // without reparsing or splitting any schema object.
         ranked_tools
             .into_iter()
             .map(|(_, _, tool)| tool)
