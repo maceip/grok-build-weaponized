@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 use tokio::sync::RwLock;
 use xai_grok_protocol::{
-    ClientId, EngagementId, Event, EventEnvelope, ProjectionQuery, ProjectionSnapshot, ProviderId,
-    ServiceHealth, ServiceId, TaskId, TaskStatus, TeamId,
+    ClientId, EngagementId, Event, EventEnvelope, Exercise, ExerciseId, OperationRun,
+    OperationRunId, OperatorCatalog, OperatorSession, OperatorSessionId, ProjectionQuery,
+    ProjectionSnapshot, ProviderId, ServiceHealth, ServiceId, TaskId, TaskStatus, TeamId,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -11,6 +12,9 @@ pub struct EngagementProjection {
     pub engagement_id: EngagementId,
     pub workspace_id: Option<String>,
     pub session_id: Option<String>,
+    pub exercise_id: Option<ExerciseId>,
+    pub operation_run_id: Option<OperationRunId>,
+    pub operator_session_id: Option<OperatorSessionId>,
     pub team_id: Option<TeamId>,
     pub client_id: Option<ClientId>,
     pub plan_revision: Option<u32>,
@@ -34,6 +38,9 @@ pub struct ProviderProjection {
 struct ProjectionState {
     as_of_sequence: u64,
     engagements: HashMap<EngagementId, EngagementProjection>,
+    exercises: HashMap<ExerciseId, Exercise>,
+    operation_runs: HashMap<OperationRunId, OperationRun>,
+    sessions: HashMap<OperatorSessionId, OperatorSession>,
     providers: HashMap<ProviderId, ProviderProjection>,
     overloads: HashMap<String, (u32, u32)>,
 }
@@ -63,9 +70,28 @@ impl ProjectionStore {
         }
         state.as_of_sequence = envelope.sequence;
         match &envelope.event {
+            Event::ExerciseCreated { exercise } => {
+                state
+                    .exercises
+                    .insert(exercise.exercise_id.clone(), exercise.clone());
+            }
+            Event::OperationRunCreated { operation_run } => {
+                state.operation_runs.insert(
+                    operation_run.operation_run_id.clone(),
+                    operation_run.clone(),
+                );
+            }
+            Event::OperatorSessionCreated { session } => {
+                state
+                    .sessions
+                    .insert(session.session_id.clone(), session.clone());
+            }
             Event::EngagementAccepted {
                 workspace_id,
                 session_id,
+                exercise_id,
+                operation_run_id,
+                operator_session_id,
                 team_id,
                 client_id,
             } => {
@@ -73,6 +99,11 @@ impl ProjectionStore {
                     let projection = engagement(&mut state, engagement_id);
                     projection.workspace_id = Some(workspace_id.clone());
                     projection.session_id = Some(session_id.clone());
+                    projection.exercise_id.clone_from(exercise_id);
+                    projection.operation_run_id.clone_from(operation_run_id);
+                    projection
+                        .operator_session_id
+                        .clone_from(operator_session_id);
                     projection.team_id.clone_from(team_id);
                     projection.client_id.clone_from(client_id);
                     projection.last_sequence = envelope.sequence;
@@ -154,6 +185,55 @@ impl ProjectionStore {
                 serde_json::to_value(state.engagements.get(&engagement_id))
                     .unwrap_or(serde_json::Value::Null)
             }
+            ProjectionQuery::OperatorCatalog { workspace_id } => {
+                let mut exercises = state
+                    .exercises
+                    .values()
+                    .filter(|exercise| {
+                        workspace_id
+                            .as_ref()
+                            .is_none_or(|expected| &exercise.workspace_id == expected)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                exercises.sort_by(|left, right| {
+                    left.created_unix_ms
+                        .cmp(&right.created_unix_ms)
+                        .then_with(|| left.exercise_id.cmp(&right.exercise_id))
+                });
+                let exercise_ids = exercises
+                    .iter()
+                    .map(|exercise| exercise.exercise_id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                let mut operation_runs = state
+                    .operation_runs
+                    .values()
+                    .filter(|run| exercise_ids.contains(&run.exercise_id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                operation_runs.sort_by(|left, right| {
+                    left.created_unix_ms
+                        .cmp(&right.created_unix_ms)
+                        .then_with(|| left.operation_run_id.cmp(&right.operation_run_id))
+                });
+                let mut sessions = state
+                    .sessions
+                    .values()
+                    .filter(|session| exercise_ids.contains(&session.exercise_id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                sessions.sort_by(|left, right| {
+                    left.created_unix_ms
+                        .cmp(&right.created_unix_ms)
+                        .then_with(|| left.session_id.cmp(&right.session_id))
+                });
+                serde_json::to_value(OperatorCatalog {
+                    exercises,
+                    operation_runs,
+                    sessions,
+                })
+                .unwrap_or(serde_json::Value::Null)
+            }
             ProjectionQuery::Providers => {
                 let mut providers = state.providers.values().cloned().collect::<Vec<_>>();
                 providers.sort_by(|left, right| left.provider_id.cmp(&right.provider_id));
@@ -171,6 +251,26 @@ impl ProjectionStore {
 
     pub async fn as_of_sequence(&self) -> u64 {
         self.state.read().await.as_of_sequence
+    }
+
+    pub async fn contains_exercise(&self, exercise_id: &ExerciseId) -> bool {
+        self.state.read().await.exercises.contains_key(exercise_id)
+    }
+
+    pub async fn operation_run(&self, operation_run_id: &OperationRunId) -> Option<OperationRun> {
+        self.state
+            .read()
+            .await
+            .operation_runs
+            .get(operation_run_id)
+            .cloned()
+    }
+
+    pub async fn operator_session(
+        &self,
+        session_id: &OperatorSessionId,
+    ) -> Option<OperatorSession> {
+        self.state.read().await.sessions.get(session_id).cloned()
     }
 }
 

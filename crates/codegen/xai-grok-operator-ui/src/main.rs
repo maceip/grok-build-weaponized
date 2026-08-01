@@ -1,18 +1,14 @@
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::thread;
 use std::time::Duration;
 
 use eframe::egui;
-use xai_grok_control_client::{ClientIdentity, ControlPlaneClient};
-use xai_grok_protocol::{
-    ClientId, Command, CommandId, EventEnvelope, EventReadRequest, IngressEnvelope, IngressSource,
-    ProjectionQuery, Response, TeamClient, TeamId, WorkspaceId,
+use xai_grok_operator_core::{
+    OperatorClientConfig, OperatorCommand, OperatorState, OperatorUpdate, event_name,
+    parse_scope_targets, spawn_client_worker,
 };
-
-const MAX_VISIBLE_EVENTS: usize = 2_000;
+use xai_grok_protocol::{ClientId, IngressSource, TeamId};
 
 #[derive(Clone, Debug)]
 struct Arguments {
@@ -22,40 +18,24 @@ struct Arguments {
     display_name: Option<String>,
 }
 
-#[derive(Debug)]
-enum UiUpdate {
-    Connection(String),
-    Events {
-        events: Vec<EventEnvelope>,
-        cursor: u64,
-    },
-    Capacity(serde_json::Value),
-    Providers(serde_json::Value),
-    Submission(String),
-}
-
-#[derive(Debug)]
-enum UiCommand {
-    Submit {
-        workspace_id: String,
-        session_id: String,
-        request: String,
-    },
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialogKind {
+    Exercise,
+    Run,
+    Session,
 }
 
 struct OperatorApp {
-    updates: mpsc::Receiver<UiUpdate>,
-    commands: mpsc::SyncSender<UiCommand>,
+    state: OperatorState,
+    updates: mpsc::Receiver<OperatorUpdate>,
+    commands: mpsc::SyncSender<OperatorCommand>,
     stop: Arc<AtomicBool>,
-    connection: String,
-    cursor: u64,
-    capacity: serde_json::Value,
-    providers: serde_json::Value,
-    events: VecDeque<EventEnvelope>,
-    workspace_id: String,
-    session_id: String,
+    dialog: Option<DialogKind>,
+    workspace: String,
+    name: String,
+    objective: String,
+    scope: String,
     request: String,
-    submission: String,
 }
 
 impl OperatorApp {
@@ -63,39 +43,352 @@ impl OperatorApp {
         let (updates_tx, updates) = mpsc::sync_channel(128);
         let (commands, command_rx) = mpsc::sync_channel(16);
         let stop = Arc::new(AtomicBool::new(false));
-        spawn_client_worker(arguments, updates_tx, command_rx, stop.clone());
+        spawn_client_worker(
+            OperatorClientConfig {
+                socket: arguments.socket,
+                team_id: arguments.team_id,
+                client_id: arguments.client_id,
+                display_name: arguments.display_name,
+                client_name: "grok-ui".to_owned(),
+                source: IngressSource::Gui,
+                workspace_filter: None,
+            },
+            updates_tx,
+            command_rx,
+            stop.clone(),
+        );
         Self {
+            state: OperatorState::default(),
             updates,
             commands,
             stop,
-            connection: "connecting".to_owned(),
-            cursor: 0,
-            capacity: serde_json::Value::Null,
-            providers: serde_json::Value::Null,
-            events: VecDeque::new(),
-            workspace_id: "default".to_owned(),
-            session_id: format!("gui-{}", std::process::id()),
+            dialog: None,
+            workspace: "default".to_owned(),
+            name: String::new(),
+            objective: String::new(),
+            scope: String::new(),
             request: String::new(),
-            submission: "idle".to_owned(),
         }
     }
 
     fn receive_updates(&mut self) {
         while let Ok(update) = self.updates.try_recv() {
-            match update {
-                UiUpdate::Connection(connection) => self.connection = connection,
-                UiUpdate::Events { events, cursor } => {
-                    self.cursor = cursor;
-                    self.events.extend(events);
-                    while self.events.len() > MAX_VISIBLE_EVENTS {
-                        self.events.pop_front();
-                    }
-                }
-                UiUpdate::Capacity(capacity) => self.capacity = capacity,
-                UiUpdate::Providers(providers) => self.providers = providers,
-                UiUpdate::Submission(submission) => self.submission = submission,
+            self.state.apply(update);
+        }
+        if self.state.first_run() && self.dialog.is_none() {
+            self.dialog = Some(DialogKind::Exercise);
+        }
+        if !self.state.first_run() && self.dialog == Some(DialogKind::Exercise) {
+            self.dialog = None;
+            self.clear_dialog();
+        }
+    }
+
+    fn queue(&mut self, command: OperatorCommand) -> bool {
+        match self.commands.try_send(command) {
+            Ok(()) => {
+                self.state.notice = "queued".to_owned();
+                true
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.state.notice = "local command queue is full".to_owned();
+                false
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.state.notice = "operator client stopped".to_owned();
+                false
             }
         }
+    }
+
+    fn clear_dialog(&mut self) {
+        self.name.clear();
+        self.objective.clear();
+        self.scope.clear();
+    }
+
+    fn show_catalog(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Exercises");
+            if ui.small_button("+").on_hover_text("New exercise").clicked() {
+                self.dialog = Some(DialogKind::Exercise);
+            }
+        });
+        ui.separator();
+        let exercises = self.state.catalog.exercises.clone();
+        for exercise in exercises {
+            let selected = self.state.selection.exercise_id.as_ref() == Some(&exercise.exercise_id);
+            if ui
+                .selectable_label(selected, format!("◆ {}", exercise.name))
+                .clicked()
+            {
+                self.state.select_exercise(exercise.exercise_id.clone());
+            }
+            let runs = self
+                .state
+                .catalog
+                .operation_runs
+                .iter()
+                .filter(|run| run.exercise_id == exercise.exercise_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            for run in runs {
+                let selected =
+                    self.state.selection.operation_run_id.as_ref() == Some(&run.operation_run_id);
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    if ui
+                        .selectable_label(selected, format!("├─ {}", run.name))
+                        .clicked()
+                    {
+                        self.state
+                            .select_operation_run(run.operation_run_id.clone());
+                    }
+                });
+                let sessions = self
+                    .state
+                    .catalog
+                    .sessions
+                    .iter()
+                    .filter(|session| {
+                        session.operation_run_id.as_ref() == Some(&run.operation_run_id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for session in sessions {
+                    self.session_row(ui, &session);
+                }
+            }
+            let unbound_sessions = self
+                .state
+                .catalog
+                .sessions
+                .iter()
+                .filter(|session| {
+                    session.exercise_id == exercise.exercise_id
+                        && session.operation_run_id.is_none()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for session in unbound_sessions {
+                self.session_row(ui, &session);
+            }
+        }
+        if self.state.catalog.exercises.is_empty() {
+            ui.label("No exercises yet.");
+        }
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    self.state.selected_exercise().is_some(),
+                    egui::Button::new("New run"),
+                )
+                .clicked()
+            {
+                self.dialog = Some(DialogKind::Run);
+            }
+            if ui
+                .add_enabled(
+                    self.state.selected_exercise().is_some(),
+                    egui::Button::new("New session"),
+                )
+                .clicked()
+            {
+                self.dialog = Some(DialogKind::Session);
+            }
+        });
+    }
+
+    fn session_row(&mut self, ui: &mut egui::Ui, session: &xai_grok_protocol::OperatorSession) {
+        let selected = self.state.selection.session_id.as_ref() == Some(&session.session_id);
+        ui.horizontal(|ui| {
+            ui.add_space(28.0);
+            if ui
+                .selectable_label(selected, format!("└─ {}", session.name))
+                .clicked()
+            {
+                self.state.select_session(session.session_id.clone());
+            }
+        });
+    }
+
+    fn show_activity(&mut self, ui: &mut egui::Ui) {
+        if let Some(session) = self.state.selected_session() {
+            ui.heading(format!("Session: {}", session.name));
+            ui.label(&session.purpose);
+            ui.add(
+                egui::TextEdit::multiline(&mut self.request)
+                    .desired_rows(4)
+                    .hint_text("Give the agent work within this session"),
+            );
+            let can_submit = !self.request.trim().is_empty();
+            if ui
+                .add_enabled(can_submit, egui::Button::new("Send to session"))
+                .clicked()
+            {
+                let session = session.clone();
+                let exercise = self
+                    .state
+                    .selected_exercise()
+                    .expect("selected session has an exercise")
+                    .clone();
+                let command = OperatorCommand::SubmitTurn {
+                    workspace_id: exercise.workspace_id,
+                    exercise_id: exercise.exercise_id,
+                    operation_run_id: session.operation_run_id,
+                    session_id: session.session_id,
+                    request: self.request.trim().to_owned(),
+                };
+                if self.queue(command) {
+                    self.request.clear();
+                }
+            }
+        } else {
+            ui.heading("Choose an execution lane");
+            ui.label(
+                "Create or select a session. Sessions are separate model/context lanes inside an exercise; they are not new engagements.",
+            );
+        }
+        ui.separator();
+        ui.heading("Live activity");
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for event in &self.state.events {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.monospace(format!("{:>8}", event.sequence));
+                        ui.label(event_name(event));
+                        if let Some(engagement_id) = &event.engagement_id {
+                            ui.monospace(engagement_id.as_str());
+                        }
+                    });
+                }
+            });
+    }
+
+    fn show_context(&self, ui: &mut egui::Ui) {
+        ui.heading("Operational context");
+        if let Some(exercise) = self.state.selected_exercise() {
+            ui.strong(&exercise.name);
+            ui.label(&exercise.objective);
+            ui.monospace(exercise.exercise_id.as_str());
+        }
+        if let Some(run) = self.state.selected_operation_run() {
+            ui.separator();
+            ui.strong(format!("Run: {}", run.name));
+            ui.label(&run.objective);
+            ui.monospace(run.operation_run_id.as_str());
+        }
+        if let Some(session) = self.state.selected_session() {
+            ui.separator();
+            ui.strong(format!("Session: {}", session.name));
+            ui.label(&session.purpose);
+            ui.monospace(session.session_id.as_str());
+        }
+        ui.separator();
+        ui.heading("Capacity");
+        ui.monospace(pretty_json(&self.state.capacity));
+        ui.separator();
+        ui.heading("Providers");
+        ui.monospace(pretty_json(&self.state.providers));
+    }
+
+    fn show_dialog(&mut self, context: &egui::Context) {
+        let Some(kind) = self.dialog else {
+            return;
+        };
+        let first_run = self.state.first_run();
+        let title = match kind {
+            DialogKind::Exercise if first_run => "Create the first exercise",
+            DialogKind::Exercise => "Create exercise",
+            DialogKind::Run => "Create operation run",
+            DialogKind::Session => "Create operator session",
+        };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(context, |ui| {
+                if kind == DialogKind::Exercise {
+                    ui.label("Workspace");
+                    ui.text_edit_singleline(&mut self.workspace);
+                }
+                ui.label(match kind {
+                    DialogKind::Exercise => "Exercise name",
+                    DialogKind::Run => "Run name",
+                    DialogKind::Session => "Session name",
+                });
+                ui.text_edit_singleline(&mut self.name);
+                ui.label(match kind {
+                    DialogKind::Session => "Purpose",
+                    _ => "Objective",
+                });
+                ui.add(egui::TextEdit::multiline(&mut self.objective).desired_rows(3));
+                if kind == DialogKind::Exercise {
+                    ui.label("Initial scope (comma/newline separated; prefix ! to exclude)");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.scope)
+                            .desired_rows(2)
+                            .hint_text("10.10.4.0/24, !10.10.4.9, portal.internal"),
+                    );
+                }
+                let fields_valid = !self.name.trim().is_empty()
+                    && !self.objective.trim().is_empty()
+                    && (kind != DialogKind::Exercise
+                        || (!self.workspace.trim().is_empty() && !self.scope.trim().is_empty()));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(fields_valid, egui::Button::new("Create"))
+                        .clicked()
+                    {
+                        let command = match kind {
+                            DialogKind::Exercise => OperatorCommand::CreateExercise {
+                                workspace_id: self.workspace.trim().to_owned(),
+                                name: self.name.trim().to_owned(),
+                                objective: self.objective.trim().to_owned(),
+                                scope: parse_scope_targets(&self.scope),
+                            },
+                            DialogKind::Run => {
+                                let exercise = self
+                                    .state
+                                    .selected_exercise()
+                                    .expect("run dialog requires an exercise");
+                                OperatorCommand::CreateOperationRun {
+                                    exercise_id: exercise.exercise_id.clone(),
+                                    name: self.name.trim().to_owned(),
+                                    objective: self.objective.trim().to_owned(),
+                                }
+                            }
+                            DialogKind::Session => {
+                                let exercise = self
+                                    .state
+                                    .selected_exercise()
+                                    .expect("session dialog requires an exercise");
+                                OperatorCommand::CreateSession {
+                                    exercise_id: exercise.exercise_id.clone(),
+                                    operation_run_id: self.state.selection.operation_run_id.clone(),
+                                    name: self.name.trim().to_owned(),
+                                    purpose: self.objective.trim().to_owned(),
+                                }
+                            }
+                        };
+                        if self.queue(command) {
+                            self.dialog = None;
+                            self.clear_dialog();
+                        }
+                    }
+                    if !first_run && ui.button("Cancel").clicked() {
+                        self.dialog = None;
+                        self.clear_dialog();
+                    }
+                });
+                if first_run {
+                    ui.small(
+                        "An exercise is the long-lived assessment boundary. Runs and sessions are created inside it.",
+                    );
+                }
+            });
     }
 }
 
@@ -112,265 +405,26 @@ impl eframe::App for OperatorApp {
             ui.horizontal(|ui| {
                 ui.heading("Grok operator");
                 ui.separator();
-                ui.label(&self.connection);
+                ui.label(&self.state.connection);
                 ui.separator();
-                ui.monospace(format!("event cursor {}", self.cursor));
+                ui.monospace(format!("event cursor {}", self.state.cursor));
+                ui.separator();
+                ui.label(&self.state.notice);
             });
         });
-        egui::Panel::left("projections")
+        egui::Panel::left("catalog")
             .resizable(true)
-            .default_size(320.0)
+            .default_size(280.0)
+            .show(ui, |ui| self.show_catalog(ui));
+        egui::Panel::right("context")
+            .resizable(true)
+            .default_size(300.0)
             .show(ui, |ui| {
-                ui.heading("Capacity");
-                ui.monospace(pretty_json(&self.capacity));
-                ui.separator();
-                ui.heading("Providers");
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.monospace(pretty_json(&self.providers));
-                });
+                egui::ScrollArea::vertical().show(ui, |ui| self.show_context(ui));
             });
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Submit engagement");
-            ui.horizontal(|ui| {
-                ui.label("Workspace");
-                ui.text_edit_singleline(&mut self.workspace_id);
-                ui.label("Session");
-                ui.text_edit_singleline(&mut self.session_id);
-            });
-            ui.add(
-                egui::TextEdit::multiline(&mut self.request)
-                    .desired_rows(3)
-                    .hint_text("Request"),
-            );
-            ui.horizontal(|ui| {
-                if ui.button("Submit").clicked() {
-                    if self.workspace_id.trim().is_empty()
-                        || self.session_id.trim().is_empty()
-                        || self.request.trim().is_empty()
-                    {
-                        self.submission = "workspace, session, and request are required".to_owned();
-                    } else {
-                        let command = UiCommand::Submit {
-                            workspace_id: self.workspace_id.clone(),
-                            session_id: self.session_id.clone(),
-                            request: self.request.clone(),
-                        };
-                        match self.commands.try_send(command) {
-                            Ok(()) => self.submission = "queued".to_owned(),
-                            Err(mpsc::TrySendError::Full(_)) => {
-                                self.submission = "local submission queue is full".to_owned();
-                            }
-                            Err(mpsc::TrySendError::Disconnected(_)) => {
-                                self.submission = "client worker stopped".to_owned();
-                            }
-                        }
-                    }
-                }
-                ui.label(&self.submission);
-            });
-            ui.separator();
-            ui.heading("Durable event stream");
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for event in &self.events {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.monospace(format!("{:>8}", event.sequence));
-                            ui.label(event_name(event));
-                            if let Some(engagement_id) = &event.engagement_id {
-                                ui.monospace(engagement_id.as_str());
-                            }
-                        });
-                    }
-                });
-        });
+        egui::CentralPanel::default().show(ui, |ui| self.show_activity(ui));
+        self.show_dialog(ui.ctx());
         ui.ctx().request_repaint_after(Duration::from_millis(100));
-    }
-}
-
-fn spawn_client_worker(
-    arguments: Arguments,
-    updates: mpsc::SyncSender<UiUpdate>,
-    commands: mpsc::Receiver<UiCommand>,
-    stop: Arc<AtomicBool>,
-) {
-    thread::Builder::new()
-        .name("grok-ui-client".to_owned())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            match runtime {
-                Ok(runtime) => runtime.block_on(client_worker(arguments, updates, commands, stop)),
-                Err(error) => {
-                    let _ = updates.send(UiUpdate::Connection(format!("runtime error: {error}")));
-                }
-            }
-        })
-        .expect("failed to start the bounded GUI client worker");
-}
-
-async fn client_worker(
-    arguments: Arguments,
-    updates: mpsc::SyncSender<UiUpdate>,
-    commands: mpsc::Receiver<UiCommand>,
-    stop: Arc<AtomicBool>,
-) {
-    let mut cursor = 0_u64;
-    while !stop.load(Ordering::Acquire) {
-        let mut identity = ClientIdentity::new("grok-ui", env!("CARGO_PKG_VERSION"));
-        identity.team = Some(TeamClient {
-            team_id: arguments.team_id.clone(),
-            client_id: arguments.client_id.clone(),
-            display_name: arguments.display_name.clone(),
-        });
-        let control = match ControlPlaneClient::connect(&arguments.socket, identity).await {
-            Ok(control) => control,
-            Err(error) => {
-                if updates
-                    .send(UiUpdate::Connection(format!("reconnecting: {error}")))
-                    .is_err()
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-        };
-        if updates
-            .send(UiUpdate::Connection(format!(
-                "connected to {}",
-                arguments.socket.display()
-            )))
-            .is_err()
-        {
-            return;
-        }
-        if refresh_projections(&control, &updates).await.is_err() {
-            continue;
-        }
-        let mut next_projection = tokio::time::Instant::now() + Duration::from_secs(2);
-        'connected: loop {
-            if stop.load(Ordering::Acquire) {
-                return;
-            }
-            while let Ok(command) = commands.try_recv() {
-                if let Err(error) = submit_command(&control, command, &updates).await {
-                    let _ = updates.send(UiUpdate::Submission(format!("failed: {error}")));
-                    let _ = updates.send(UiUpdate::Connection(format!("reconnecting: {error}")));
-                    break 'connected;
-                }
-            }
-            match control
-                .read_events(EventReadRequest {
-                    after_sequence: cursor,
-                    maximum_events: 128,
-                    wait_ms: 250,
-                    engagement_id: None,
-                })
-                .await
-            {
-                Ok(batch) => {
-                    if updates
-                        .send(UiUpdate::Events {
-                            events: batch.events,
-                            cursor: batch.next_sequence,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                    cursor = batch.next_sequence;
-                }
-                Err(error) => {
-                    let _ = updates.send(UiUpdate::Connection(format!("reconnecting: {error}")));
-                    break;
-                }
-            }
-            if tokio::time::Instant::now() >= next_projection {
-                if let Err(error) = refresh_projections(&control, &updates).await {
-                    let _ = updates.send(UiUpdate::Connection(format!("reconnecting: {error}")));
-                    break;
-                }
-                next_projection = tokio::time::Instant::now() + Duration::from_secs(2);
-            }
-        }
-    }
-}
-
-async fn submit_command(
-    control: &ControlPlaneClient,
-    command: UiCommand,
-    updates: &mpsc::SyncSender<UiUpdate>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let UiCommand::Submit {
-        workspace_id,
-        session_id,
-        request,
-    } = command;
-    let source_id = CommandId::new();
-    let response = control
-        .send(
-            Command::SubmitIngress(IngressEnvelope {
-                command_id: CommandId::new(),
-                source: IngressSource::Gui,
-                source_event_id: source_id.to_string(),
-                workspace_id: WorkspaceId::from_string(workspace_id),
-                session_id,
-                prompt_id: source_id.to_string(),
-                request,
-                team: None,
-                metadata: serde_json::Map::new(),
-            }),
-            Duration::from_secs(5),
-        )
-        .await?;
-    match response {
-        Response::Accepted { engagement_id, .. } => {
-            updates.send(UiUpdate::Submission(format!(
-                "accepted as {}",
-                engagement_id.as_str()
-            )))?;
-            Ok(())
-        }
-        _ => Err("daemon returned an unexpected submission response".into()),
-    }
-}
-
-async fn refresh_projections(
-    control: &ControlPlaneClient,
-    updates: &mpsc::SyncSender<UiUpdate>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let capacity = control
-        .send(
-            Command::QueryProjection(ProjectionQuery::Capacity),
-            Duration::from_secs(2),
-        )
-        .await?;
-    let providers = control
-        .send(
-            Command::QueryProjection(ProjectionQuery::Providers),
-            Duration::from_secs(2),
-        )
-        .await?;
-    if let Response::Projection(snapshot) = capacity {
-        updates.send(UiUpdate::Capacity(snapshot.value))?;
-    }
-    if let Response::Projection(snapshot) = providers {
-        updates.send(UiUpdate::Providers(snapshot.value))?;
-    }
-    Ok(())
-}
-
-fn event_name(event: &EventEnvelope) -> &'static str {
-    match &event.event {
-        xai_grok_protocol::Event::EngagementAccepted { .. } => "engagement accepted",
-        xai_grok_protocol::Event::PlanAccepted { .. } => "plan accepted",
-        xai_grok_protocol::Event::TaskStatus { .. } => "task status",
-        xai_grok_protocol::Event::Observation { .. } => "observation",
-        xai_grok_protocol::Event::ProviderState { .. } => "provider state",
-        xai_grok_protocol::Event::ArtifactAvailable { .. } => "artifact available",
-        xai_grok_protocol::Event::Overload { .. } => "overload",
     }
 }
 
@@ -419,8 +473,8 @@ fn main() -> eframe::Result {
         parse_arguments().map_err(|message| eframe::Error::AppCreation(message.into()))?;
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1_100.0, 720.0])
-            .with_min_inner_size([800.0, 500.0]),
+            .with_inner_size([1_240.0, 780.0])
+            .with_min_inner_size([900.0, 560.0]),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };

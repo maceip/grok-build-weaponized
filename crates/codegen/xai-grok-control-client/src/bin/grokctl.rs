@@ -6,17 +6,22 @@ use std::time::Duration;
 
 use xai_grok_control_client::{ClientIdentity, ControlPlaneClient};
 use xai_grok_protocol::{
-    ClientId, Command, CommandId, EventReadRequest, IngressEnvelope, IngressSource,
-    ProjectionQuery, RuntimeProfile, TeamClient, TeamId, WorkspaceId,
+    ClientId, Command, CommandId, CreateExercise, CreateOperationRun, CreateOperatorSession,
+    EventReadRequest, ExerciseId, IngressEnvelope, IngressSource, OperationRunId,
+    OperatorSessionId, ProjectionQuery, RuntimeProfile, TeamClient, TeamId, WorkspaceId,
+    parse_scope_targets,
 };
 
 const USAGE: &str = "\
 grokctl [--socket PATH] [--team ID --client ID] COMMAND
 
 Commands:
-  status [capacity|providers|engagement ID]
+  status [capacity|providers|catalog [WORKSPACE]|engagement ID]
   events [--after N] [--limit N] [--wait-ms N] [--engagement ID] [--follow]
-  submit --workspace ID --session ID --request TEXT|-
+  exercise create --workspace ID --name NAME --objective TEXT --scope SELECTORS
+  run create --exercise ID --name NAME --objective TEXT
+  session create --exercise ID [--run ID] --name NAME --purpose TEXT
+  submit --workspace ID [--exercise ID] [--run ID] --session ID --request TEXT|-
   profile lint FILE
 ";
 
@@ -70,6 +75,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match command.as_str() {
         "status" => status(&control, arguments).await,
         "events" => events(&control, arguments).await,
+        "exercise" => create_exercise(&control, arguments).await,
+        "run" => create_run(&control, arguments).await,
+        "session" => create_session(&control, arguments).await,
         "submit" => submit(&control, arguments).await,
         _ => Err(format!("unknown command {command:?}\n{USAGE}").into()),
     }
@@ -82,6 +90,9 @@ async fn status(
     let query = match arguments.pop_front().as_deref() {
         None | Some("capacity") => ProjectionQuery::Capacity,
         Some("providers") => ProjectionQuery::Providers,
+        Some("catalog") => ProjectionQuery::OperatorCatalog {
+            workspace_id: arguments.pop_front().map(WorkspaceId::from_string),
+        },
         Some("engagement") => ProjectionQuery::Engagement {
             engagement_id: arguments
                 .pop_front()
@@ -93,6 +104,106 @@ async fn status(
     reject_remaining(&arguments)?;
     let response = control
         .send(Command::QueryProjection(query), Duration::from_secs(5))
+        .await?;
+    write_json(&response)
+}
+
+async fn create_exercise(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    require_create(&mut arguments, "exercise")?;
+    let mut workspace = None;
+    let mut name = None;
+    let mut objective = None;
+    let mut scope = None;
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--workspace" => workspace = Some(value(&mut arguments, "--workspace")?),
+            "--name" => name = Some(value(&mut arguments, "--name")?),
+            "--objective" => objective = Some(value(&mut arguments, "--objective")?),
+            "--scope" => scope = Some(value(&mut arguments, "--scope")?),
+            other => return Err(format!("unknown exercise create option {other:?}").into()),
+        }
+    }
+    let response = control
+        .send(
+            Command::CreateExercise(CreateExercise {
+                workspace_id: WorkspaceId::from_string(
+                    workspace.ok_or("exercise create requires --workspace")?,
+                ),
+                name: name.ok_or("exercise create requires --name")?,
+                objective: objective.ok_or("exercise create requires --objective")?,
+                scope: parse_scope_targets(&scope.ok_or("exercise create requires --scope")?),
+            }),
+            Duration::from_secs(5),
+        )
+        .await?;
+    write_json(&response)
+}
+
+async fn create_run(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    require_create(&mut arguments, "run")?;
+    let mut exercise = None;
+    let mut name = None;
+    let mut objective = None;
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--exercise" => exercise = Some(value(&mut arguments, "--exercise")?),
+            "--name" => name = Some(value(&mut arguments, "--name")?),
+            "--objective" => objective = Some(value(&mut arguments, "--objective")?),
+            other => return Err(format!("unknown run create option {other:?}").into()),
+        }
+    }
+    let response = control
+        .send(
+            Command::CreateOperationRun(CreateOperationRun {
+                exercise_id: ExerciseId::from_string(
+                    exercise.ok_or("run create requires --exercise")?,
+                ),
+                name: name.ok_or("run create requires --name")?,
+                objective: objective.ok_or("run create requires --objective")?,
+                playbook_id: None,
+            }),
+            Duration::from_secs(5),
+        )
+        .await?;
+    write_json(&response)
+}
+
+async fn create_session(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    require_create(&mut arguments, "session")?;
+    let mut exercise = None;
+    let mut operation_run = None;
+    let mut name = None;
+    let mut purpose = None;
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--exercise" => exercise = Some(value(&mut arguments, "--exercise")?),
+            "--run" => operation_run = Some(value(&mut arguments, "--run")?),
+            "--name" => name = Some(value(&mut arguments, "--name")?),
+            "--purpose" => purpose = Some(value(&mut arguments, "--purpose")?),
+            other => return Err(format!("unknown session create option {other:?}").into()),
+        }
+    }
+    let response = control
+        .send(
+            Command::CreateOperatorSession(CreateOperatorSession {
+                exercise_id: ExerciseId::from_string(
+                    exercise.ok_or("session create requires --exercise")?,
+                ),
+                operation_run_id: operation_run.map(OperationRunId::from_string),
+                name: name.ok_or("session create requires --name")?,
+                purpose: purpose.ok_or("session create requires --purpose")?,
+            }),
+            Duration::from_secs(5),
+        )
         .await?;
     write_json(&response)
 }
@@ -146,11 +257,15 @@ async fn submit(
     mut arguments: VecDeque<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut workspace = None;
+    let mut exercise = None;
+    let mut operation_run = None;
     let mut session = None;
     let mut request = None;
     while let Some(argument) = arguments.pop_front() {
         match argument.as_str() {
             "--workspace" => workspace = Some(value(&mut arguments, "--workspace")?),
+            "--exercise" => exercise = Some(value(&mut arguments, "--exercise")?),
+            "--run" => operation_run = Some(value(&mut arguments, "--run")?),
             "--session" => session = Some(value(&mut arguments, "--session")?),
             "--request" => request = Some(value(&mut arguments, "--request")?),
             other => return Err(format!("unknown submit option {other:?}").into()),
@@ -161,6 +276,13 @@ async fn submit(
         request.clear();
         std::io::stdin().read_to_string(&mut request)?;
     }
+    let session = session.ok_or("submit requires --session")?;
+    if operation_run.is_some() && exercise.is_none() {
+        return Err("submit --run requires --exercise".into());
+    }
+    let operator_session_id = exercise
+        .as_ref()
+        .map(|_| OperatorSessionId::from_string(session.clone()));
     let response = control
         .send(
             Command::SubmitIngress(IngressEnvelope {
@@ -170,7 +292,10 @@ async fn submit(
                 workspace_id: WorkspaceId::from_string(
                     workspace.ok_or("submit requires --workspace")?,
                 ),
-                session_id: session.ok_or("submit requires --session")?,
+                exercise_id: exercise.map(ExerciseId::from_string),
+                operation_run_id: operation_run.map(OperationRunId::from_string),
+                operator_session_id,
+                session_id: session,
                 prompt_id: CommandId::new().to_string(),
                 request,
                 team: None,
@@ -180,6 +305,17 @@ async fn submit(
         )
         .await?;
     write_json(&response)
+}
+
+fn require_create(
+    arguments: &mut VecDeque<String>,
+    resource: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.pop_front().as_deref() == Some("create") {
+        Ok(())
+    } else {
+        Err(format!("{resource} requires `create`").into())
+    }
 }
 
 fn lint_profile(mut arguments: VecDeque<String>) -> Result<(), Box<dyn std::error::Error>> {

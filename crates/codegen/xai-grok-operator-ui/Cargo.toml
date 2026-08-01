@@ -7,8 +7,7 @@ description = "Optional compact egui operator client for grokd"
 
 [dependencies]
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["net", "rt", "time"] }
-xai-grok-control-client = { workspace = true }
+xai-grok-operator-core = { workspace = true }
 xai-grok-protocol = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

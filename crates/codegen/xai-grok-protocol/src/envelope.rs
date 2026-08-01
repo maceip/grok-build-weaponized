@@ -1,14 +1,17 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CapabilityManifest, CommandId, EngagementId, EventBatch, EventId, EventReadRequest,
-    ExecutionReceipt, IngressEnvelope, ProtocolError, ProviderDispatch, ProviderId, RequestId,
-    ServiceHealth, ServiceId, TaskId, TaskingPlan, TeamClient,
+    CapabilityManifest, CommandId, CreateExercise, CreateOperationRun, CreateOperatorSession,
+    EngagementId, EventBatch, EventId, EventReadRequest, ExecutionReceipt, Exercise, ExerciseId,
+    IngressEnvelope, OperationRun, OperationRunId, OperatorSession, OperatorSessionId,
+    ProtocolError, ProviderDispatch, ProviderId, RequestId, ServiceHealth, ServiceId, TaskId,
+    TaskingPlan, TeamClient, WorkspaceId,
 };
 
-/// Protocol v2 adds collaborative client identity, durable event cursors, and
-/// mode-specific execution receipts. These are not wire-compatible with v1.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Protocol v3 adds durable exercise, operation-run, and operator-session
+/// aggregates. It is not wire-compatible with the former prompt-as-engagement
+/// model used by v2 clients.
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +36,9 @@ pub struct HelloAck {
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
     Hello(Hello),
+    CreateExercise(CreateExercise),
+    CreateOperationRun(CreateOperationRun),
+    CreateOperatorSession(CreateOperatorSession),
     SubmitIngress(IngressEnvelope),
     SubmitPlan(TaskingPlan),
     Dispatch(ProviderDispatch),
@@ -96,6 +102,15 @@ pub enum Response {
         engagement_id: EngagementId,
         accepted: bool,
     },
+    ExerciseCreated {
+        exercise: Exercise,
+    },
+    OperationRunCreated {
+        operation_run: OperationRun,
+    },
+    OperatorSessionCreated {
+        session: OperatorSession,
+    },
     PlanAccepted {
         engagement_id: EngagementId,
         revision: u32,
@@ -130,9 +145,24 @@ pub struct ResponseEnvelope {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    ExerciseCreated {
+        exercise: Exercise,
+    },
+    OperationRunCreated {
+        operation_run: OperationRun,
+    },
+    OperatorSessionCreated {
+        session: OperatorSession,
+    },
     EngagementAccepted {
         workspace_id: String,
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exercise_id: Option<ExerciseId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_run_id: Option<OperationRunId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operator_session_id: Option<OperatorSessionId>,
         team_id: Option<crate::TeamId>,
         client_id: Option<crate::ClientId>,
     },
@@ -182,7 +212,13 @@ pub struct EventEnvelope {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "query", rename_all = "snake_case")]
 pub enum ProjectionQuery {
-    Engagement { engagement_id: EngagementId },
+    Engagement {
+        engagement_id: EngagementId,
+    },
+    OperatorCatalog {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<WorkspaceId>,
+    },
     Providers,
     Capacity,
 }
@@ -213,9 +249,9 @@ mod tests {
     }
 
     #[test]
-    fn version_one_is_rejected_after_team_cursor_upgrade() {
+    fn older_versions_are_rejected_after_exercise_upgrade() {
         let envelope = CommandEnvelope {
-            protocol_version: 1,
+            protocol_version: 2,
             command_id: CommandId::new(),
             causation_id: None,
             deadline_unix_ms: 20,

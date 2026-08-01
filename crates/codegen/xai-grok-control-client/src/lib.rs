@@ -136,6 +136,15 @@ impl ControlPlaneClient {
             Response::Events(batch) => Ok(batch),
             Response::Hello(_) => Err(ClientError::ExpectedEvents("hello")),
             Response::Accepted { .. } => Err(ClientError::ExpectedEvents("accepted")),
+            Response::ExerciseCreated { .. } => {
+                Err(ClientError::ExpectedEvents("exercise_created"))
+            }
+            Response::OperationRunCreated { .. } => {
+                Err(ClientError::ExpectedEvents("operation_run_created"))
+            }
+            Response::OperatorSessionCreated { .. } => {
+                Err(ClientError::ExpectedEvents("operator_session_created"))
+            }
             Response::PlanAccepted { .. } => Err(ClientError::ExpectedEvents("plan_accepted")),
             Response::DispatchAccepted { .. } => {
                 Err(ClientError::ExpectedEvents("dispatch_accepted"))

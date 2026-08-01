@@ -12,9 +12,10 @@ use xai_grok_engagement::{
 };
 use xai_grok_protocol::{
     Command, CommandEnvelope, CommandId, EngagementId, Event, EventBatch, EventEnvelope, EventId,
-    EventReadRequest, EvidenceObservation, ExecutionReceipt, PROTOCOL_VERSION, ProtocolError,
-    ProtocolErrorCode, ProviderDispatch, ProviderId, Response, ResponseEnvelope, ServiceHealth,
-    TaskStatus, TaskingPlan,
+    EventReadRequest, EvidenceObservation, ExecutionReceipt, Exercise, ExerciseId, ExerciseStatus,
+    OperationRun, OperationRunId, OperationRunStatus, OperatorSession, OperatorSessionId,
+    OperatorSessionStatus, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ProviderDispatch,
+    ProviderId, Response, ResponseEnvelope, ServiceHealth, TaskStatus, TaskingPlan,
 };
 
 use crate::SERVER_NAME;
@@ -420,12 +421,174 @@ impl ControlPlaneCore {
                         "bounded_event_long_poll".to_owned(),
                         "team_client_reconnect".to_owned(),
                         "typed_execution_receipts".to_owned(),
+                        "exercise_catalog".to_owned(),
+                        "operation_runs".to_owned(),
+                        "operator_sessions".to_owned(),
                     ],
                 }))
             }
+            Command::CreateExercise(create) => {
+                create.validate()?;
+                let now = now_unix_ms();
+                let exercise = Exercise {
+                    exercise_id: ExerciseId::new(),
+                    workspace_id: create.workspace_id,
+                    name: create.name,
+                    objective: create.objective,
+                    status: ExerciseStatus::Active,
+                    scope: create.scope,
+                    created_unix_ms: now,
+                    updated_unix_ms: now,
+                };
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::ExerciseCreated {
+                        exercise: exercise.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::ExerciseCreated { exercise })
+            }
+            Command::CreateOperationRun(create) => {
+                create.validate()?;
+                if !self
+                    .projections
+                    .contains_exercise(&create.exercise_id)
+                    .await
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::NotFound,
+                        format!("exercise {} does not exist", create.exercise_id),
+                    ));
+                }
+                let now = now_unix_ms();
+                let operation_run = OperationRun {
+                    operation_run_id: OperationRunId::new(),
+                    exercise_id: create.exercise_id,
+                    name: create.name,
+                    objective: create.objective,
+                    playbook_id: create.playbook_id,
+                    status: OperationRunStatus::Planned,
+                    created_unix_ms: now,
+                    updated_unix_ms: now,
+                };
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::OperationRunCreated {
+                        operation_run: operation_run.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::OperationRunCreated { operation_run })
+            }
+            Command::CreateOperatorSession(create) => {
+                create.validate()?;
+                if !self
+                    .projections
+                    .contains_exercise(&create.exercise_id)
+                    .await
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::NotFound,
+                        format!("exercise {} does not exist", create.exercise_id),
+                    ));
+                }
+                if let Some(operation_run_id) = &create.operation_run_id {
+                    let operation_run = self
+                        .projections
+                        .operation_run(operation_run_id)
+                        .await
+                        .ok_or_else(|| {
+                            ProtocolError::new(
+                                ProtocolErrorCode::NotFound,
+                                format!("operation run {operation_run_id} does not exist"),
+                            )
+                        })?;
+                    if operation_run.exercise_id != create.exercise_id {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::Conflict,
+                            "operation run belongs to a different exercise",
+                        ));
+                    }
+                }
+                let now = now_unix_ms();
+                let session = OperatorSession {
+                    session_id: OperatorSessionId::new(),
+                    exercise_id: create.exercise_id,
+                    operation_run_id: create.operation_run_id,
+                    name: create.name,
+                    purpose: create.purpose,
+                    status: OperatorSessionStatus::Active,
+                    created_unix_ms: now,
+                    last_active_unix_ms: now,
+                };
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::OperatorSessionCreated {
+                        session: session.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::OperatorSessionCreated { session })
+            }
             Command::SubmitIngress(ingress) => {
                 ingress.validate()?;
+                if let Some(exercise_id) = &ingress.exercise_id
+                    && !self.projections.contains_exercise(exercise_id).await
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::NotFound,
+                        format!("exercise {exercise_id} does not exist"),
+                    ));
+                }
+                if let Some(operation_run_id) = &ingress.operation_run_id {
+                    let run = self
+                        .projections
+                        .operation_run(operation_run_id)
+                        .await
+                        .ok_or_else(|| {
+                            ProtocolError::new(
+                                ProtocolErrorCode::NotFound,
+                                format!("operation run {operation_run_id} does not exist"),
+                            )
+                        })?;
+                    if ingress.exercise_id.as_ref() != Some(&run.exercise_id) {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::Conflict,
+                            "operation run belongs to a different exercise",
+                        ));
+                    }
+                }
+                if let Some(operator_session_id) = &ingress.operator_session_id {
+                    let session = self
+                        .projections
+                        .operator_session(operator_session_id)
+                        .await
+                        .ok_or_else(|| {
+                            ProtocolError::new(
+                                ProtocolErrorCode::NotFound,
+                                format!("operator session {operator_session_id} does not exist"),
+                            )
+                        })?;
+                    if ingress.exercise_id.as_ref() != Some(&session.exercise_id)
+                        || ingress.operation_run_id != session.operation_run_id
+                    {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::Conflict,
+                            "operator session does not belong to the selected exercise/run",
+                        ));
+                    }
+                }
                 let ingress_team = ingress.team.clone();
+                let exercise_id = ingress.exercise_id.clone();
+                let operation_run_id = ingress.operation_run_id.clone();
+                let operator_session_id = ingress.operator_session_id.clone();
                 let outcome = self
                     .engagement
                     .accept(NewEngagement {
@@ -448,6 +611,9 @@ impl ControlPlaneCore {
                         Event::EngagementAccepted {
                             workspace_id: outcome.record.workspace_id,
                             session_id: outcome.record.session_id,
+                            exercise_id,
+                            operation_run_id,
+                            operator_session_id,
                             team_id: ingress_team.as_ref().map(|team| team.team_id.clone()),
                             client_id: ingress_team.as_ref().map(|team| team.client_id.clone()),
                         },
@@ -1358,9 +1524,10 @@ mod tests {
 
     use xai_grok_protocol::{
         ArtifactContract, CancellationSemantics, CapabilityManifest, CapabilityRequirement,
-        Command, CommandEnvelope, CommandId, ConcurrencyProfile, ExecutionMode, ExecutionTask,
-        IngressEnvelope, IngressSource, OperationDescriptor, ProviderKind, RecoverySemantics,
-        RequestId, TaskId, VersionRange, WorkspaceId,
+        Command, CommandEnvelope, CommandId, ConcurrencyProfile, CreateExercise,
+        CreateOperationRun, CreateOperatorSession, ExecutionMode, ExecutionTask, IngressEnvelope,
+        IngressSource, OperationDescriptor, OperatorCatalog, ProjectionQuery, ProviderKind,
+        RecoverySemantics, RequestId, TaskId, VersionRange, WorkspaceId,
     };
 
     use super::*;
@@ -1377,6 +1544,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exercise_run_and_session_survive_event_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().to_path_buf();
+        let (exercise_id, run_id, session_id) = {
+            let control_plane = ControlPlane::open(ControlPlaneConfig::new(&state_path))
+                .await
+                .unwrap();
+            let handle = control_plane.handle();
+            let created = handle
+                .submit(envelope(Command::CreateExercise(CreateExercise {
+                    workspace_id: WorkspaceId::from_string("workspace-a"),
+                    name: "Internal assessment".to_owned(),
+                    objective: "Validate internal segmentation".to_owned(),
+                    scope: Vec::new(),
+                })))
+                .await
+                .unwrap()
+                .response
+                .unwrap();
+            let Response::ExerciseCreated { exercise } = created else {
+                panic!("expected created exercise");
+            };
+            let created = handle
+                .submit(envelope(Command::CreateOperationRun(CreateOperationRun {
+                    exercise_id: exercise.exercise_id.clone(),
+                    name: "Discovery wave".to_owned(),
+                    objective: "Inventory reachable services".to_owned(),
+                    playbook_id: None,
+                })))
+                .await
+                .unwrap()
+                .response
+                .unwrap();
+            let Response::OperationRunCreated { operation_run } = created else {
+                panic!("expected created operation run");
+            };
+            let created = handle
+                .submit(envelope(Command::CreateOperatorSession(
+                    CreateOperatorSession {
+                        exercise_id: exercise.exercise_id.clone(),
+                        operation_run_id: Some(operation_run.operation_run_id.clone()),
+                        name: "Primary operator".to_owned(),
+                        purpose: "Execute discovery tasks".to_owned(),
+                    },
+                )))
+                .await
+                .unwrap()
+                .response
+                .unwrap();
+            let Response::OperatorSessionCreated { session } = created else {
+                panic!("expected created operator session");
+            };
+            handle.shutdown_token().cancel();
+            control_plane.wait().await;
+            (
+                exercise.exercise_id,
+                operation_run.operation_run_id,
+                session.session_id,
+            )
+        };
+
+        let reopened = ControlPlane::open(ControlPlaneConfig::new(&state_path))
+            .await
+            .unwrap();
+        let handle = reopened.handle();
+        let response = handle
+            .submit(envelope(Command::QueryProjection(
+                ProjectionQuery::OperatorCatalog {
+                    workspace_id: Some(WorkspaceId::from_string("workspace-a")),
+                },
+            )))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Projection(snapshot) = response else {
+            panic!("expected operator catalog projection");
+        };
+        let catalog: OperatorCatalog = serde_json::from_value(snapshot.value).unwrap();
+        assert_eq!(catalog.exercises[0].exercise_id, exercise_id);
+        assert_eq!(catalog.operation_runs[0].operation_run_id, run_id);
+        assert_eq!(catalog.sessions[0].session_id, session_id);
+        handle.shutdown_token().cancel();
+        reopened.wait().await;
+    }
+
+    #[tokio::test]
     async fn duplicate_ingress_is_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let control_plane = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
@@ -1387,6 +1641,9 @@ mod tests {
             source: IngressSource::Cli,
             source_event_id: "event-1".to_owned(),
             workspace_id: WorkspaceId::from_string("workspace"),
+            exercise_id: None,
+            operation_run_id: None,
+            operator_session_id: None,
             session_id: "session".to_owned(),
             prompt_id: "prompt".to_owned(),
             request: "test".to_owned(),
@@ -1418,6 +1675,9 @@ mod tests {
                     source: IngressSource::Cli,
                     source_event_id: format!("cursor-event-{index}"),
                     workspace_id: WorkspaceId::from_string("workspace"),
+                    exercise_id: None,
+                    operation_run_id: None,
+                    operator_session_id: None,
                     session_id: format!("session-{index}"),
                     prompt_id: format!("prompt-{index}"),
                     request: "test".to_owned(),
@@ -1495,6 +1755,9 @@ mod tests {
                 source: IngressSource::Cli,
                 source_event_id: "wake-reader".to_owned(),
                 workspace_id: WorkspaceId::from_string("workspace"),
+                exercise_id: None,
+                operation_run_id: None,
+                operator_session_id: None,
                 session_id: "session".to_owned(),
                 prompt_id: "prompt".to_owned(),
                 request: "test".to_owned(),
@@ -1540,6 +1803,9 @@ mod tests {
                 source: IngressSource::Cli,
                 source_event_id: "unrelated-event".to_owned(),
                 workspace_id: WorkspaceId::from_string("workspace"),
+                exercise_id: None,
+                operation_run_id: None,
+                operator_session_id: None,
                 session_id: "session".to_owned(),
                 prompt_id: "prompt".to_owned(),
                 request: "test".to_owned(),
@@ -1626,6 +1892,9 @@ mod tests {
                     source: IngressSource::Cli,
                     source_event_id: "event-dispatch".to_owned(),
                     workspace_id: WorkspaceId::from_string("workspace"),
+                    exercise_id: None,
+                    operation_run_id: None,
+                    operator_session_id: None,
                     session_id: "session-dispatch".to_owned(),
                     prompt_id: "prompt-dispatch".to_owned(),
                     request: "execute once".to_owned(),

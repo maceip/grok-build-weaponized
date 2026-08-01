@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{CommandId, ProtocolError, ProtocolErrorCode, TeamClient, WorkspaceId};
+use crate::{
+    CommandId, ExerciseId, OperationRunId, OperatorSessionId, ProtocolError, ProtocolErrorCode,
+    TeamClient, WorkspaceId,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -19,6 +22,16 @@ pub struct IngressEnvelope {
     pub source: IngressSource,
     pub source_event_id: String,
     pub workspace_id: WorkspaceId,
+    /// Long-lived client assessment containing scope and objectives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exercise_id: Option<ExerciseId>,
+    /// One playbook/phase execution inside the exercise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_run_id: Option<OperationRunId>,
+    /// Stable conversational lane. `session_id` remains for v2 source
+    /// compatibility and must equal this value when both are present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_session_id: Option<OperatorSessionId>,
     pub session_id: String,
     pub prompt_id: String,
     pub request: String,
@@ -45,6 +58,20 @@ impl IngressEnvelope {
                 ));
             }
         }
+        if let Some(operator_session_id) = &self.operator_session_id
+            && operator_session_id.as_str() != self.session_id
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidEnvelope,
+                "ingress session_id must equal operator_session_id",
+            ));
+        }
+        if self.operation_run_id.is_some() && self.exercise_id.is_none() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidEnvelope,
+                "ingress operation_run_id requires exercise_id",
+            ));
+        }
         Ok(())
     }
 }
@@ -69,6 +96,9 @@ impl BuzzIngress {
             source: IngressSource::Buzz,
             source_event_id: self.event_id.clone(),
             workspace_id: WorkspaceId::from_string(format!("buzz:{}", self.channel_id)),
+            exercise_id: None,
+            operation_run_id: None,
+            operator_session_id: None,
             session_id: format!("buzz:{}", self.channel_id),
             prompt_id: self.event_id,
             request: self.content,
@@ -97,6 +127,9 @@ impl QmIngress {
             source: IngressSource::Qm,
             source_event_id: self.job_id.clone(),
             workspace_id: WorkspaceId::from_string(format!("qm:{}", self.scope_id)),
+            exercise_id: None,
+            operation_run_id: None,
+            operator_session_id: None,
             session_id: format!("qm:{}", self.scope_id),
             prompt_id: self.job_id,
             request: self.request,

@@ -15655,13 +15655,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-grok-operator-core"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tokio",
+ "xai-grok-control-client",
+ "xai-grok-protocol",
+]
+
+[[package]]
+name = "xai-grok-operator-tui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "serde_json",
+ "xai-grok-operator-core",
+ "xai-grok-protocol",
+]
+
+[[package]]
 name = "xai-grok-operator-ui"
 version = "0.1.0"
 dependencies = [
  "eframe",
  "serde_json",
- "tokio",
- "xai-grok-control-client",
+ "xai-grok-operator-core",
  "xai-grok-protocol",
 ]
 

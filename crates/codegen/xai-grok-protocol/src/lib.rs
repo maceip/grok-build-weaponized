@@ -8,6 +8,7 @@ mod capability;
 mod envelope;
 mod error;
 mod execution;
+mod exercise;
 mod ids;
 mod ingress;
 mod profile;
@@ -24,9 +25,16 @@ pub use envelope::{
 };
 pub use error::{ProtocolError, ProtocolErrorCode};
 pub use execution::{DeferredTask, DetachedJob, ExecutionReceipt, InteractiveSession};
+pub use exercise::{
+    CreateExercise, CreateOperationRun, CreateOperatorSession, Exercise, ExerciseEvidence,
+    ExerciseObjective, ExerciseStatus, Finding, FindingStatus, OperationRun, OperationRunStatus,
+    OperatorCatalog, OperatorSession, OperatorSessionStatus, Playbook, PlaybookStep, ScopeTarget,
+    TargetKind, parse_scope_targets,
+};
 pub use ids::{
-    ArtifactId, ClientId, CommandId, EngagementId, EventId, OperationId, ProfileId, ProviderId,
-    RequestId, ServiceId, TaskId, TeamId, WorkspaceId,
+    ArtifactId, ClientId, CommandId, EngagementId, EventId, EvidenceId, ExerciseId, FindingId,
+    OperationId, OperationRunId, OperatorSessionId, PlaybookId, ProfileId, ProviderId, RequestId,
+    ServiceId, TargetId, TaskId, TeamId, TurnId, WorkspaceId,
 };
 pub use ingress::{BuzzIngress, IngressEnvelope, IngressSource, QmIngress};
 pub use profile::{
