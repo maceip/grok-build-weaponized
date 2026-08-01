@@ -305,6 +305,7 @@ struct StartRecord<'a> {
     baseline: AggregateResources,
     adapter_selection_p95_micros: u128,
     adapter_isolation: &'a AdapterIsolationEvidence,
+    adapter_reclamation: &'a AdapterReclamationEvidence,
     context_window: u32,
     lora_context_window: u32,
     cancellation_tokens: u32,
@@ -489,6 +490,7 @@ async fn run() -> Result<()> {
         args.adapter_probe_tokens,
     )
     .await?;
+    let adapter_reclamation = qualify_adapter_reclamation(&manager, &lora_config, &second).await?;
 
     let memory = initialize_memory(&args, &state_dir).await?;
     qualify_busy_embedding_fallback(&memory, args.max_memory_query_ms).await?;
@@ -546,6 +548,7 @@ async fn run() -> Result<()> {
                 baseline,
                 adapter_selection_p95_micros: selection_p95.as_micros(),
                 adapter_isolation: &adapter_isolation,
+                adapter_reclamation: &adapter_reclamation,
                 context_window: args.context_window,
                 lora_context_window: args.lora_context_window,
                 cancellation_tokens: args.cancellation_tokens,
@@ -906,6 +909,21 @@ struct AdapterIsolationEvidence {
     second_output_hash: String,
 }
 
+#[derive(Debug, Serialize)]
+struct AdapterReclamationEvidence {
+    worker_key: String,
+    worker_process_id: u32,
+    resident_adapters_before: u32,
+    resident_adapters_after_unload: u32,
+    resident_adapters_after_reload: u32,
+    resident_adapter_bytes_before: u64,
+    resident_adapter_bytes_after_unload: u64,
+    resident_adapter_bytes_after_reload: u64,
+    reclaimed_bytes: u64,
+    reload_completion_tokens: u32,
+    reload_output_hash: String,
+}
+
 fn probe_output_hash(output: &ProbeGeneration) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&(output.visible.len() as u64).to_le_bytes());
@@ -1090,6 +1108,134 @@ async fn qualify_adapter_isolation(
     bail!(
         "two real adapters did not produce distinct nonempty outputs across bounded probes: {evidence:?}"
     )
+}
+
+async fn qualify_adapter_reclamation(
+    manager: &RuntimeManager,
+    config: &LiteRtLmConfig,
+    descriptor: &AdapterDescriptor,
+) -> Result<AdapterReclamationEvidence> {
+    let before_workers = manager.worker_capacity().await?;
+    let (worker_key, before) = before_workers
+        .iter()
+        .max_by_key(|(_, stats)| stats.resident_adapters)
+        .ok_or_else(|| anyhow!("no resident worker exposes adapter memory counters"))?;
+    ensure!(
+        before.process_id != 0,
+        "resident LoRA worker did not report an operating-system process id"
+    );
+    ensure!(
+        before.resident_adapters >= 2,
+        "real adapter reclamation requires two resident adapters; observed {}",
+        before.resident_adapters
+    );
+    ensure!(
+        before.resident_adapter_bytes >= descriptor.byte_size,
+        "resident adapter byte counter {} is smaller than the adapter artifact {}",
+        before.resident_adapter_bytes,
+        descriptor.byte_size
+    );
+    let worker_key = worker_key.clone();
+    let before = before.clone();
+    let binding = binding(descriptor);
+
+    manager
+        .unload_adapter("soak-lora".to_owned(), config.clone(), binding.clone())
+        .await
+        .context("unload a real resident adapter")?;
+    ensure!(
+        manager.adapter_manager().state(&binding) == AdapterState::Absent,
+        "unloaded adapter remains present in manager residency state"
+    );
+    let after_unload = manager
+        .worker_capacity()
+        .await?
+        .remove(&worker_key)
+        .ok_or_else(|| anyhow!("LoRA worker disappeared during adapter unload"))?;
+    ensure!(
+        after_unload.process_id == before.process_id,
+        "adapter unload recreated the base engine worker: before={}, after={}",
+        before.process_id,
+        after_unload.process_id
+    );
+    ensure!(
+        after_unload.resident_adapters.saturating_add(1) == before.resident_adapters,
+        "resident adapter count did not decrease by one: before={}, after={}",
+        before.resident_adapters,
+        after_unload.resident_adapters
+    );
+    let reclaimed_bytes = before
+        .resident_adapter_bytes
+        .saturating_sub(after_unload.resident_adapter_bytes);
+    ensure!(
+        reclaimed_bytes == descriptor.byte_size,
+        "resident adapter bytes did not reclaim the unloaded artifact: expected={}, observed={reclaimed_bytes}",
+        descriptor.byte_size
+    );
+
+    manager
+        .prewarm_adapter("soak-lora".to_owned(), config.clone(), descriptor.clone())
+        .await
+        .context("reload and probe the reclaimed real adapter")?;
+    let after_reload = manager
+        .worker_capacity()
+        .await?
+        .remove(&worker_key)
+        .ok_or_else(|| anyhow!("LoRA worker disappeared during adapter reload"))?;
+    ensure!(
+        after_reload.process_id == before.process_id,
+        "adapter reload recreated the base engine worker: before={}, after={}",
+        before.process_id,
+        after_reload.process_id
+    );
+    ensure!(
+        after_reload.resident_adapters == before.resident_adapters,
+        "resident adapter count was not restored: before={}, reloaded={}",
+        before.resident_adapters,
+        after_reload.resident_adapters
+    );
+    ensure!(
+        after_reload.resident_adapter_bytes == before.resident_adapter_bytes,
+        "resident adapter byte counter was not restored: before={}, reloaded={}",
+        before.resident_adapter_bytes,
+        after_reload.resident_adapter_bytes
+    );
+
+    let reload_output = generate_maybe_empty(
+        manager,
+        "soak-lora",
+        config,
+        "adapter-reload-generation",
+        "adapter-reload-session",
+        Some(binding),
+        "/no_think\nState one concise fact from your specialist domain.",
+        128,
+    )
+    .await
+    .context("generate through the reloaded real adapter")?;
+    manager.release_session("adapter-reload-session").await?;
+    ensure!(
+        reload_output.completion_tokens > 0,
+        "reloaded adapter generation reported zero completion tokens"
+    );
+    ensure!(
+        !reload_output.visible.trim().is_empty() || !reload_output.reasoning.trim().is_empty(),
+        "reloaded adapter generation emitted neither visible nor reasoning output"
+    );
+
+    Ok(AdapterReclamationEvidence {
+        worker_key,
+        worker_process_id: before.process_id,
+        resident_adapters_before: before.resident_adapters,
+        resident_adapters_after_unload: after_unload.resident_adapters,
+        resident_adapters_after_reload: after_reload.resident_adapters,
+        resident_adapter_bytes_before: before.resident_adapter_bytes,
+        resident_adapter_bytes_after_unload: after_unload.resident_adapter_bytes,
+        resident_adapter_bytes_after_reload: after_reload.resident_adapter_bytes,
+        reclaimed_bytes,
+        reload_completion_tokens: reload_output.completion_tokens,
+        reload_output_hash: probe_output_hash(&reload_output),
+    })
 }
 
 async fn cancel_generation(

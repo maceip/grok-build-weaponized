@@ -60,6 +60,7 @@ impl WorkerState {
         let (resident_sessions, resident_context_tokens) =
             xai_grok_runtime::litert_lm::resident_session_stats();
         WorkerStats {
+            process_id: std::process::id(),
             resident_bytes: process_resident_bytes(),
             thread_count: process_thread_count(),
             file_descriptor_count: process_file_descriptor_count(),

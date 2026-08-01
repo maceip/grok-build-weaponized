@@ -113,6 +113,9 @@ pub enum WorkerMessage {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerStats {
+    /// Operating-system process identity for lifecycle and no-restart proofs.
+    #[serde(default)]
+    pub process_id: u32,
     /// Current resident set size of the isolated worker process.
     pub resident_bytes: u64,
     /// Live native threads in the isolated worker process when observable.
