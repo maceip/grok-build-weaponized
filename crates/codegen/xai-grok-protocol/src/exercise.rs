@@ -80,26 +80,64 @@ pub fn parse_scope_targets(input: &str) -> Vec<ScopeTarget> {
             if selector.is_empty() {
                 return None;
             }
-            let kind = if selector.starts_with("http://") || selector.starts_with("https://") {
-                TargetKind::Url
-            } else if selector.contains('/') {
-                TargetKind::Network
-            } else if selector.parse::<std::net::IpAddr>().is_ok() {
-                TargetKind::Host
-            } else if selector.contains('.') {
-                TargetKind::Domain
-            } else {
-                TargetKind::Other
-            };
+            let (kind, selector) = parse_typed_selector(selector);
             Some(ScopeTarget {
                 target_id: TargetId::new(),
                 kind,
-                selector: selector.to_owned(),
+                selector,
                 excluded,
                 labels: BTreeMap::new(),
             })
         })
         .collect()
+}
+
+fn parse_typed_selector(selector: &str) -> (TargetKind, String) {
+    let explicit = [
+        ("host:", TargetKind::Host),
+        ("network:", TargetKind::Network),
+        ("domain:", TargetKind::Domain),
+        ("url:", TargetKind::Url),
+        ("cloud:", TargetKind::CloudAccount),
+        ("identity:", TargetKind::Identity),
+        ("repo:", TargetKind::Repository),
+        ("path:", TargetKind::Repository),
+    ];
+    for (prefix, kind) in explicit {
+        if let Some(value) = selector.strip_prefix(prefix) {
+            return (kind, value.trim().to_owned());
+        }
+    }
+    let kind = if selector.starts_with("http://") || selector.starts_with("https://") {
+        TargetKind::Url
+    } else if selector.parse::<std::net::IpAddr>().is_ok() {
+        TargetKind::Host
+    } else if is_network_selector(selector) {
+        TargetKind::Network
+    } else if selector.starts_with('/') || selector.starts_with("./") {
+        TargetKind::Repository
+    } else if selector.contains('.') {
+        TargetKind::Domain
+    } else {
+        TargetKind::Other
+    };
+    (kind, selector.to_owned())
+}
+
+fn is_network_selector(selector: &str) -> bool {
+    let Some((address, prefix)) = selector.split_once('/') else {
+        return false;
+    };
+    let Ok(address) = address.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match address {
+        std::net::IpAddr::V4(_) => prefix <= 32,
+        std::net::IpAddr::V6(_) => prefix <= 128,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,10 +242,58 @@ pub struct OperatorSession {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Playbook {
     pub playbook_id: PlaybookId,
+    pub workspace_id: WorkspaceId,
     pub revision: u32,
     pub name: String,
     pub description: String,
     pub steps: Vec<PlaybookStep>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatePlaybook {
+    pub workspace_id: WorkspaceId,
+    pub name: String,
+    pub description: String,
+    pub steps: Vec<PlaybookStep>,
+}
+
+impl CreatePlaybook {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        required("playbook workspace_id", self.workspace_id.as_str())?;
+        required("playbook name", &self.name)?;
+        if self.steps.is_empty() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidEnvelope,
+                "playbook requires at least one step",
+            ));
+        }
+        let mut step_ids = std::collections::BTreeSet::new();
+        for step in &self.steps {
+            required("playbook step id", &step.step_id)?;
+            required("playbook step name", &step.name)?;
+            required("playbook step capability", &step.capability)?;
+            if !step_ids.insert(step.step_id.as_str()) {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidEnvelope,
+                    format!("duplicate playbook step id {}", step.step_id),
+                ));
+            }
+        }
+        for step in &self.steps {
+            for dependency in &step.depends_on {
+                if dependency == &step.step_id || !step_ids.contains(dependency.as_str()) {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::InvalidEnvelope,
+                        format!(
+                            "playbook step {} has invalid dependency {dependency}",
+                            step.step_id
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +323,32 @@ pub struct ExerciseEvidence {
     pub observed_unix_ms: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecordExerciseEvidence {
+    pub exercise_id: ExerciseId,
+    pub operation_run_id: Option<OperationRunId>,
+    pub session_id: Option<OperatorSessionId>,
+    pub task_id: Option<TaskId>,
+    pub finding: String,
+    pub confidence: f32,
+    pub artifact_id: Option<ArtifactId>,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+}
+
+impl RecordExerciseEvidence {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        required("evidence finding", &self.finding)?;
+        if !self.confidence.is_finite() || !(0.0..=1.0).contains(&self.confidence) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidEnvelope,
+                "evidence confidence must be a finite value from 0 to 1",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingStatus {
@@ -246,16 +358,51 @@ pub enum FindingStatus {
     Rejected,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingSeverity {
+    Informational,
+    Low,
+    Moderate,
+    High,
+    Critical,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateFinding {
+    pub exercise_id: ExerciseId,
+    pub operation_run_id: Option<OperationRunId>,
+    pub title: String,
+    pub summary: String,
+    pub severity: FindingSeverity,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_ids: Vec<EvidenceId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_ids: Vec<TargetId>,
+}
+
+impl CreateFinding {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        required("finding title", &self.title)?;
+        required("finding summary", &self.summary)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
     pub finding_id: FindingId,
     pub exercise_id: ExerciseId,
+    pub operation_run_id: Option<OperationRunId>,
     pub title: String,
+    pub summary: String,
+    pub severity: FindingSeverity,
     pub status: FindingStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_ids: Vec<EvidenceId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_ids: Vec<TargetId>,
+    pub created_unix_ms: u64,
+    pub updated_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +410,19 @@ pub struct OperatorCatalog {
     pub exercises: Vec<Exercise>,
     pub operation_runs: Vec<OperationRun>,
     pub sessions: Vec<OperatorSession>,
+    #[serde(default)]
+    pub playbooks: Vec<Playbook>,
+}
+
+/// Complete bounded read model for one exercise. Large raw outputs remain in
+/// the artifact store and are referenced by `ExerciseEvidence::artifact_id`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExerciseRecord {
+    pub exercise: Exercise,
+    pub operation_runs: Vec<OperationRun>,
+    pub sessions: Vec<OperatorSession>,
+    pub evidence: Vec<ExerciseEvidence>,
+    pub findings: Vec<Finding>,
 }
 
 fn required(field: &str, value: &str) -> Result<(), ProtocolError> {
@@ -318,5 +478,17 @@ mod tests {
         assert_eq!(targets[0].kind, TargetKind::Network);
         assert!(targets[1].excluded);
         assert_eq!(targets[2].kind, TargetKind::Url);
+    }
+
+    #[test]
+    fn compact_scope_distinguishes_repository_paths_from_networks() {
+        let targets = parse_scope_targets(
+            "path:/srv/assessment, ./workspace, network:10.10.4.0/24, host:10.10.4.8",
+        );
+        assert_eq!(targets[0].kind, TargetKind::Repository);
+        assert_eq!(targets[0].selector, "/srv/assessment");
+        assert_eq!(targets[1].kind, TargetKind::Repository);
+        assert_eq!(targets[2].kind, TargetKind::Network);
+        assert_eq!(targets[3].kind, TargetKind::Host);
     }
 }

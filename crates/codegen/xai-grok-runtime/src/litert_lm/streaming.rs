@@ -268,6 +268,15 @@ pub async fn run_prepared_request(
     let cached = session_cache_key
         .as_deref()
         .and_then(|key| take_cached_conversation(key, &prepared));
+    if cached.is_none() {
+        // The pinned LiteRT CPU executor supports exactly one native session
+        // per engine. A different logical session therefore has to release
+        // the inactive KV owner before a new conversation can be created.
+        // Same-session turns take their cached conversation above and retain
+        // KV continuity. Multi-session concurrency is provided by supervised
+        // engine replicas, not by violating the native executor contract.
+        evict_cached_conversations_for_engine(&engine);
+    }
     let previous_usage = cached
         .as_ref()
         .map_or((0, 0), |cached| cached.cumulative_usage);

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use eframe::egui;
 use xai_grok_operator_core::{
-    OperatorClientConfig, OperatorCommand, OperatorState, OperatorUpdate, event_name,
+    OperatorClientConfig, OperatorCommand, OperatorState, OperatorUpdate, event_summary,
     parse_scope_targets, spawn_client_worker,
 };
 use xai_grok_protocol::{ClientId, IngressSource, TeamId};
@@ -251,6 +251,25 @@ impl OperatorApp {
             );
         }
         ui.separator();
+        for output in self
+            .state
+            .outputs
+            .iter()
+            .filter(|output| self.state.output_is_in_selected_session(output))
+        {
+            ui.group(|ui| {
+                ui.strong("Agent");
+                ui.label(&output.text);
+                if output.truncated {
+                    ui.monospace(format!(
+                        "Preview truncated; artifact {}",
+                        output.artifact_id.as_str()
+                    ));
+                }
+            });
+            ui.add_space(8.0);
+        }
+        ui.separator();
         ui.heading("Live activity");
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
@@ -258,7 +277,7 @@ impl OperatorApp {
                 for event in &self.state.events {
                     ui.horizontal_wrapped(|ui| {
                         ui.monospace(format!("{:>8}", event.sequence));
-                        ui.label(event_name(event));
+                        ui.label(event_summary(event));
                         if let Some(engagement_id) = &event.engagement_id {
                             ui.monospace(engagement_id.as_str());
                         }

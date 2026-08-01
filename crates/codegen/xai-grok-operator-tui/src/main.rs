@@ -16,7 +16,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use xai_grok_operator_core::{
-    OperatorClientConfig, OperatorCommand, OperatorState, OperatorUpdate, event_name,
+    OperatorClientConfig, OperatorCommand, OperatorState, OperatorUpdate, event_summary,
     parse_scope_targets, spawn_client_worker,
 };
 use xai_grok_protocol::{
@@ -481,23 +481,41 @@ impl App {
 
     fn draw_activity(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let height = area.height.saturating_sub(2) as usize;
-        let rows = self
+        let mut rows = self
             .state
-            .events
+            .outputs
             .iter()
-            .rev()
-            .take(height.max(1))
-            .rev()
-            .map(|event| {
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{:>7} ", event.sequence),
-                        Style::default().fg(MUTED),
-                    ),
-                    Span::raw(event_name(event)),
-                ]))
+            .filter(|output| self.state.output_is_in_selected_session(output))
+            .flat_map(|output| {
+                output.text.lines().map(|line| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled("agent  ", Style::default().fg(ACCENT)),
+                        Span::raw(line.to_owned()),
+                    ]))
+                })
             })
             .collect::<Vec<_>>();
+        rows.extend(
+            self.state
+                .events
+                .iter()
+                .rev()
+                .take(height.max(1))
+                .rev()
+                .map(|event| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("{:>7} ", event.sequence),
+                            Style::default().fg(MUTED),
+                        ),
+                        Span::raw(event_summary(event)),
+                    ]))
+                })
+                .collect::<Vec<_>>(),
+        );
+        if rows.len() > height.max(1) {
+            rows.drain(0..rows.len() - height.max(1));
+        }
         frame.render_widget(
             List::new(rows).block(
                 Block::default()

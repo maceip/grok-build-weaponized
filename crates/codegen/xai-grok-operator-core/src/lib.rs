@@ -12,13 +12,15 @@ use std::time::Duration;
 
 use xai_grok_control_client::{ClientIdentity, ControlPlaneClient};
 use xai_grok_protocol::{
-    ClientId, Command, CommandId, CreateExercise, CreateOperationRun, CreateOperatorSession,
-    EventEnvelope, EventReadRequest, ExerciseId, IngressEnvelope, IngressSource, OperationRunId,
-    OperatorCatalog, OperatorSessionId, ProjectionQuery, Response, ScopeTarget, TeamClient, TeamId,
-    WorkspaceId,
+    ArtifactId, ClientId, Command, CommandId, CreateExercise, CreateOperationRun,
+    CreateOperatorSession, EngagementId, EventEnvelope, EventReadRequest, ExerciseId,
+    IngressEnvelope, IngressSource, OperationRunId, OperatorCatalog, OperatorSessionId,
+    ProjectionQuery, Response, ScopeTarget, TaskId, TeamClient, TeamId, WorkspaceId,
 };
 
 pub const MAX_VISIBLE_EVENTS: usize = 2_000;
+pub const MAX_VISIBLE_OUTPUTS: usize = 512;
+const OUTPUT_PREVIEW_BYTES: u32 = 1024 * 1024;
 pub use xai_grok_protocol::parse_scope_targets;
 
 #[derive(Clone, Debug)]
@@ -67,7 +69,17 @@ pub struct OperatorState {
     pub capacity: serde_json::Value,
     pub providers: serde_json::Value,
     pub events: VecDeque<EventEnvelope>,
+    pub outputs: VecDeque<OperatorOutput>,
     pub notice: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct OperatorOutput {
+    pub engagement_id: EngagementId,
+    pub task_id: TaskId,
+    pub artifact_id: ArtifactId,
+    pub text: String,
+    pub truncated: bool,
 }
 
 impl Default for OperatorState {
@@ -81,6 +93,7 @@ impl Default for OperatorState {
             capacity: serde_json::Value::Null,
             providers: serde_json::Value::Null,
             events: VecDeque::new(),
+            outputs: VecDeque::new(),
             notice: "idle".to_owned(),
         }
     }
@@ -113,6 +126,22 @@ impl OperatorState {
             .sessions
             .iter()
             .find(|session| &session.session_id == selected)
+    }
+
+    pub fn output_is_in_selected_session(&self, output: &OperatorOutput) -> bool {
+        let Some(selected) = self.selection.session_id.as_ref() else {
+            return false;
+        };
+        self.events.iter().any(|event| {
+            event.engagement_id.as_ref() == Some(&output.engagement_id)
+                && matches!(
+                    &event.event,
+                    xai_grok_protocol::Event::EngagementAccepted {
+                        operator_session_id: Some(session_id),
+                        ..
+                    } if session_id == selected
+                )
+        })
     }
 
     pub fn select_exercise(&mut self, exercise_id: ExerciseId) {
@@ -194,6 +223,12 @@ impl OperatorState {
             }
             OperatorUpdate::Capacity(capacity) => self.capacity = capacity,
             OperatorUpdate::Providers(providers) => self.providers = providers,
+            OperatorUpdate::Output(output) => {
+                self.outputs.push_back(output);
+                while self.outputs.len() > MAX_VISIBLE_OUTPUTS {
+                    self.outputs.pop_front();
+                }
+            }
             OperatorUpdate::Notice(notice) => self.notice = notice,
         }
     }
@@ -228,6 +263,16 @@ impl OperatorState {
                     .any(|known| known.session_id == session.session_id)
                 {
                     self.catalog.sessions.push(session.clone());
+                }
+            }
+            xai_grok_protocol::Event::PlaybookCreated { playbook } => {
+                if !self
+                    .catalog
+                    .playbooks
+                    .iter()
+                    .any(|known| known.playbook_id == playbook.playbook_id)
+                {
+                    self.catalog.playbooks.push(playbook.clone());
                 }
             }
             _ => {}
@@ -387,6 +432,7 @@ pub enum OperatorUpdate {
     },
     Capacity(serde_json::Value),
     Providers(serde_json::Value),
+    Output(OperatorOutput),
     Notice(String),
 }
 
@@ -491,6 +537,22 @@ async fn client_loop(
             {
                 Ok(batch) => {
                     cursor = batch.next_sequence;
+                    let provider_outputs = batch
+                        .events
+                        .iter()
+                        .filter_map(|event| match (&event.engagement_id, &event.event) {
+                            (
+                                Some(engagement_id),
+                                xai_grok_protocol::Event::ProviderOutput {
+                                    task_id,
+                                    artifact_id,
+                                },
+                            ) => {
+                                Some((engagement_id.clone(), task_id.clone(), artifact_id.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
                     if updates
                         .send(OperatorUpdate::Events {
                             events: batch.events,
@@ -499,6 +561,22 @@ async fn client_loop(
                         .is_err()
                     {
                         return;
+                    }
+                    for (engagement_id, task_id, artifact_id) in provider_outputs {
+                        match read_provider_output(&control, engagement_id, task_id, artifact_id)
+                            .await
+                        {
+                            Ok(output) => {
+                                if updates.send(OperatorUpdate::Output(output)).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = updates.send(OperatorUpdate::Notice(format!(
+                                    "failed to read provider output: {error}"
+                                )));
+                            }
+                        }
                     }
                 }
                 Err(error) => {
@@ -519,6 +597,51 @@ async fn client_loop(
             }
         }
     }
+}
+
+async fn read_provider_output(
+    control: &ControlPlaneClient,
+    engagement_id: EngagementId,
+    task_id: TaskId,
+    artifact_id: ArtifactId,
+) -> Result<OperatorOutput, Box<dyn std::error::Error>> {
+    let response = control
+        .send(
+            Command::ReadArtifact {
+                artifact_id: artifact_id.clone(),
+                cursor: 0,
+                limit: OUTPUT_PREVIEW_BYTES,
+            },
+            Duration::from_secs(5),
+        )
+        .await?;
+    let Response::ArtifactChunk {
+        bytes, next_cursor, ..
+    } = response
+    else {
+        return Err("daemon returned an unexpected artifact response".into());
+    };
+    let truncated = next_cursor.is_some();
+    let text = if !truncated {
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned())
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    Ok(OperatorOutput {
+        engagement_id,
+        task_id,
+        artifact_id,
+        text,
+        truncated,
+    })
 }
 
 async fn submit(
@@ -591,13 +714,67 @@ pub fn event_name(event: &EventEnvelope) -> &'static str {
         xai_grok_protocol::Event::ExerciseCreated { .. } => "exercise created",
         xai_grok_protocol::Event::OperationRunCreated { .. } => "operation run created",
         xai_grok_protocol::Event::OperatorSessionCreated { .. } => "session created",
+        xai_grok_protocol::Event::PlaybookCreated { .. } => "playbook created",
+        xai_grok_protocol::Event::EvidenceRecorded { .. } => "evidence recorded",
+        xai_grok_protocol::Event::FindingCreated { .. } => "finding created",
+        xai_grok_protocol::Event::FindingStatusSet { .. } => "finding status set",
         xai_grok_protocol::Event::EngagementAccepted { .. } => "turn accepted",
         xai_grok_protocol::Event::PlanAccepted { .. } => "plan accepted",
         xai_grok_protocol::Event::TaskStatus { .. } => "task status",
         xai_grok_protocol::Event::Observation { .. } => "observation",
         xai_grok_protocol::Event::ProviderState { .. } => "provider state",
         xai_grok_protocol::Event::ArtifactAvailable { .. } => "artifact available",
+        xai_grok_protocol::Event::ProviderOutput { .. } => "provider output",
         xai_grok_protocol::Event::Overload { .. } => "overload",
+    }
+}
+
+pub fn event_summary(event: &EventEnvelope) -> String {
+    match &event.event {
+        xai_grok_protocol::Event::TaskStatus {
+            task_id,
+            status,
+            provider_id,
+        } => format!(
+            "task {} {:?}{}",
+            task_id.as_str(),
+            status,
+            provider_id
+                .as_ref()
+                .map(|provider| format!(" via {}", provider.as_str()))
+                .unwrap_or_default()
+        ),
+        xai_grok_protocol::Event::Observation {
+            task_id,
+            observation,
+        } => format!("{}: {}", task_id.as_str(), observation.finding),
+        xai_grok_protocol::Event::ProviderOutput {
+            task_id,
+            artifact_id,
+        } => format!(
+            "task {} produced {}",
+            task_id.as_str(),
+            artifact_id.as_str()
+        ),
+        xai_grok_protocol::Event::ArtifactAvailable {
+            artifact_id,
+            byte_size,
+            ..
+        } => format!("artifact {} ({} bytes)", artifact_id.as_str(), byte_size),
+        xai_grok_protocol::Event::ProviderState {
+            provider_id,
+            health,
+            ..
+        } => format!("provider {} {:?}", provider_id.as_str(), health),
+        xai_grok_protocol::Event::EvidenceRecorded { evidence } => {
+            format!("evidence {}: {}", evidence.evidence_id, evidence.finding)
+        }
+        xai_grok_protocol::Event::FindingCreated { finding }
+        | xai_grok_protocol::Event::FindingStatusSet { finding } => format!(
+            "finding {} [{:?}/{:?}]: {}",
+            finding.finding_id, finding.severity, finding.status, finding.title
+        ),
+        _ => event_name(event).to_owned(),
     }
 }
 
@@ -644,6 +821,7 @@ mod tests {
                 created_unix_ms: 3,
                 last_active_unix_ms: 3,
             }],
+            playbooks: Vec::new(),
         }
     }
 

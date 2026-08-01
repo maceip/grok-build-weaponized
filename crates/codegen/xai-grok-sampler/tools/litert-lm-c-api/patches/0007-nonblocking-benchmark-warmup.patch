@@ -2,7 +2,7 @@ diff --git a/c/engine.cc b/c/engine.cc
 index d03ae27..15ce7b1 100644
 --- a/c/engine.cc
 +++ b/c/engine.cc
-@@ -391,6 +391,13 @@ void litert_lm_engine_settings_enable_benchmark(
+@@ -391,5 +391,12 @@ void litert_lm_engine_settings_enable_benchmark(
      LiteRtLmEngineSettings* settings) {
    if (settings && settings->settings) {
      settings->settings->GetMutableBenchmarkParams();

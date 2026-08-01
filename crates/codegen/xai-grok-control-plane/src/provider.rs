@@ -438,6 +438,14 @@ impl ProviderRegistry {
             .collect()
     }
 
+    pub async fn generation(&self, provider_id: &ProviderId) -> Option<u64> {
+        self.entries
+            .read()
+            .await
+            .get(provider_id)
+            .map(|entry| entry.generation)
+    }
+
     pub async fn health(&self, provider_id: &ProviderId) -> Result<ServiceHealth, ProtocolError> {
         let provider = self
             .entries

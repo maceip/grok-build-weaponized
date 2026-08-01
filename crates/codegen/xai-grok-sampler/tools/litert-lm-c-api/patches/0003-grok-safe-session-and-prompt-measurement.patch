@@ -82,7 +82,7 @@ diff --git a/c/engine.cc b/c/engine.cc
  void litert_lm_session_config_delete(LiteRtLmSessionConfig* config) {
    delete config;
  }
-@@ -835,6 +867,68 @@ void litert_lm_conversation_delete(LiteRtLmConversation* conversation) {
+@@ -835,6 +867,110 @@ void litert_lm_conversation_delete(LiteRtLmConversation* conversation) {
    delete conversation;
  }
 
@@ -103,18 +103,60 @@ diff --git a/c/engine.cc b/c/engine.cc
 +    return 1;
 +  }
 +
-+  std::unique_ptr<LiteRtLmConversation,
-+                  decltype(&litert_lm_conversation_delete)>
-+      conversation(litert_lm_conversation_create(engine, config),
-+                   &litert_lm_conversation_delete);
-+  if (conversation == nullptr || conversation->conversation == nullptr) {
-+    if (g_grok_last_error.empty()) {
-+      g_grok_last_error = "failed to create measurement conversation";
++  litert::lm::JsonPreface json_preface;
++  if (!config->system_message_json.empty()) {
++    nlohmann::ordered_json system_message;
++    system_message["role"] = "system";
++    auto content = nlohmann::ordered_json::parse(
++        config->system_message_json, nullptr, false);
++    system_message["content"] =
++        content.is_discarded()
++            ? nlohmann::ordered_json(config->system_message_json)
++            : std::move(content);
++    json_preface.messages = nlohmann::ordered_json::array({system_message});
++  }
++  if (!config->messages_json.empty()) {
++    auto messages = nlohmann::ordered_json::parse(config->messages_json,
++                                                  nullptr, false);
++    if (messages.is_discarded() || !messages.is_array()) {
++      g_grok_last_error = "failed to parse measurement history JSON";
++      if (error_message != nullptr) {
++        *error_message = g_grok_last_error.c_str();
++      }
++      return 2;
 +    }
++    if (json_preface.messages.is_array()) {
++      json_preface.messages.insert(json_preface.messages.end(),
++                                   messages.begin(), messages.end());
++    } else {
++      json_preface.messages = std::move(messages);
++    }
++  }
++  if (!config->tools_json.empty()) {
++    auto tools = nlohmann::ordered_json::parse(config->tools_json, nullptr,
++                                               false);
++    if (tools.is_discarded() || !tools.is_array()) {
++      g_grok_last_error = "failed to parse measurement tools JSON";
++      if (error_message != nullptr) {
++        *error_message = g_grok_last_error.c_str();
++      }
++      return 3;
++    }
++    json_preface.tools = std::move(tools);
++  }
++  auto builder = litert::lm::ConversationConfig::Builder();
++  if (config->session_config.has_value()) {
++    builder.SetSessionConfig(*config->session_config);
++  }
++  builder.SetPreface(json_preface);
++  builder.SetEnableConstrainedDecoding(config->enable_constrained_decoding);
++  auto native_config = builder.Build(*engine->engine);
++  if (!native_config.ok()) {
++    SetGrokLastError(native_config.status());
 +    if (error_message != nullptr) {
 +      *error_message = g_grok_last_error.c_str();
 +    }
-+    return 2;
++    return 4;
 +  }
 +
 +  nlohmann::json message = nlohmann::json::parse(
@@ -124,16 +166,16 @@ diff --git a/c/engine.cc b/c/engine.cc
 +    if (error_message != nullptr) {
 +      *error_message = g_grok_last_error.c_str();
 +    }
-+    return 3;
++    return 5;
 +  }
-+  auto rendered =
-+      conversation->conversation->RenderMessageIntoString(message, {});
++  auto rendered = litert::lm::Conversation::RenderMessageWithoutSession(
++      *engine->engine, *native_config, message, {});
 +  if (!rendered.ok()) {
 +    SetGrokLastError(rendered.status());
 +    if (error_message != nullptr) {
 +      *error_message = g_grok_last_error.c_str();
 +    }
-+    return 4;
++    return 6;
 +  }
 +  auto tokens = const_cast<litert::lm::Tokenizer&>(
 +      engine->engine->GetTokenizer()).TextToTokenIds(*rendered);
@@ -142,7 +184,7 @@ diff --git a/c/engine.cc b/c/engine.cc
 +    if (error_message != nullptr) {
 +      *error_message = g_grok_last_error.c_str();
 +    }
-+    return 5;
++    return 7;
 +  }
 +  *token_count = tokens->size();
 +  return 0;
@@ -151,3 +193,50 @@ diff --git a/c/engine.cc b/c/engine.cc
  LiteRtLmJsonResponse* litert_lm_conversation_send_message(
      LiteRtLmConversation* conversation, const char* message_json,
      const char* extra_context) {
+diff --git a/runtime/conversation/conversation.h b/runtime/conversation/conversation.h
+--- a/runtime/conversation/conversation.h
++++ b/runtime/conversation/conversation.h
+@@ -536,6 +536,13 @@ class Conversation {
+   absl::StatusOr<std::string> RenderMessageIntoString(
+       const Message& message, OptionalArgs optional_args);
+
++  // Renders with the exact model prompt template without allocating an
++  // inference session. This is safe while another conversation retains the
++  // engine's single native session and is used for strict prompt admission.
++  static absl::StatusOr<std::string> RenderMessageWithoutSession(
++      Engine& engine, const ConversationConfig& config,
++      const Message& message, OptionalArgs optional_args);
++
+  private:
+   explicit Conversation(
+       Engine& engine, std::unique_ptr<Engine::Session> session,
+diff --git a/runtime/conversation/conversation.cc b/runtime/conversation/conversation.cc
+--- a/runtime/conversation/conversation.cc
++++ b/runtime/conversation/conversation.cc
+@@ -295,6 +295,26 @@ absl::StatusOr<DecodeConfig> ConstraintProvider::CreateDecodeConfig(
+   return decode_config;
+ }
+
++absl::StatusOr<std::string> Conversation::RenderMessageWithoutSession(
++    Engine& engine, const ConversationConfig& config, const Message& message,
++    OptionalArgs optional_args) {
++  if (!std::holds_alternative<JsonPreface>(config.GetPreface())) {
++    return absl::InvalidArgumentError("Only JsonPreface is supported for now.");
++  }
++  ASSIGN_OR_RETURN(
++      std::unique_ptr<ModelDataProcessor> model_data_processor,
++      CreateModelDataProcessor(
++          config.GetProcessorConfig(), config.GetPreface(),
++          &engine.GetTokenizer(), config.GetSessionConfig().GetStopTokenIds(),
++          config.constrained_decoding_enabled(),
++          config.GetPromptTemplate().GetCapabilities()));
++  auto renderer = absl::WrapUnique(new Conversation(
++      engine, /*session=*/nullptr, std::move(model_data_processor),
++      config.GetPreface(), config.GetPromptTemplate(), config,
++      /*constraint_provider=*/nullptr));
++  return renderer->RenderMessageIntoString(message, std::move(optional_args));
++}
++
+ absl::StatusOr<std::unique_ptr<Conversation>> Conversation::Create(
+     Engine& engine, const ConversationConfig& config) {
+   absl::Time start_time = absl::Now();

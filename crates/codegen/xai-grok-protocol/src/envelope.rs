@@ -1,17 +1,17 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CapabilityManifest, CommandId, CreateExercise, CreateOperationRun, CreateOperatorSession,
-    EngagementId, EventBatch, EventId, EventReadRequest, ExecutionReceipt, Exercise, ExerciseId,
-    IngressEnvelope, OperationRun, OperationRunId, OperatorSession, OperatorSessionId,
-    ProtocolError, ProviderDispatch, ProviderId, RequestId, ServiceHealth, ServiceId, TaskId,
-    TaskingPlan, TeamClient, WorkspaceId,
+    CapabilityManifest, CommandId, CreateExercise, CreateFinding, CreateOperationRun,
+    CreateOperatorSession, CreatePlaybook, EngagementId, EventBatch, EventId, EventReadRequest,
+    ExecutionReceipt, Exercise, ExerciseEvidence, ExerciseId, Finding, FindingId, FindingStatus,
+    IngressEnvelope, OperationRun, OperationRunId, OperatorSession, OperatorSessionId, Playbook,
+    ProtocolError, ProviderDispatch, ProviderId, RecordExerciseEvidence, RequestId, ServiceHealth,
+    ServiceId, TaskId, TaskingPlan, TeamClient, WorkspaceId,
 };
 
-/// Protocol v3 adds durable exercise, operation-run, and operator-session
-/// aggregates. It is not wire-compatible with the former prompt-as-engagement
-/// model used by v2 clients.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// Protocol v5 adds durable playbook, evidence, and finding operations. It is
+/// not wire-compatible with older clients.
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +39,13 @@ pub enum Command {
     CreateExercise(CreateExercise),
     CreateOperationRun(CreateOperationRun),
     CreateOperatorSession(CreateOperatorSession),
+    CreatePlaybook(CreatePlaybook),
+    RecordEvidence(RecordExerciseEvidence),
+    CreateFinding(CreateFinding),
+    SetFindingStatus {
+        finding_id: FindingId,
+        status: FindingStatus,
+    },
     SubmitIngress(IngressEnvelope),
     SubmitPlan(TaskingPlan),
     Dispatch(ProviderDispatch),
@@ -58,6 +65,11 @@ pub enum Command {
     PutArtifact {
         media_type: String,
         bytes: Vec<u8>,
+    },
+    ReadArtifact {
+        artifact_id: crate::ArtifactId,
+        cursor: u64,
+        limit: u32,
     },
     ReadEvents(EventReadRequest),
     QueryProjection(ProjectionQuery),
@@ -111,6 +123,18 @@ pub enum Response {
     OperatorSessionCreated {
         session: OperatorSession,
     },
+    PlaybookCreated {
+        playbook: Playbook,
+    },
+    EvidenceRecorded {
+        evidence: ExerciseEvidence,
+    },
+    FindingCreated {
+        finding: Finding,
+    },
+    FindingStatusSet {
+        finding: Finding,
+    },
     PlanAccepted {
         engagement_id: EngagementId,
         revision: u32,
@@ -129,6 +153,15 @@ pub enum Response {
         artifact_id: crate::ArtifactId,
         content_hash: String,
         byte_size: u64,
+    },
+    ArtifactChunk {
+        artifact_id: crate::ArtifactId,
+        media_type: String,
+        content_hash: String,
+        byte_size: u64,
+        cursor: u64,
+        bytes: Vec<u8>,
+        next_cursor: Option<u64>,
     },
     Projection(ProjectionSnapshot),
     Events(EventBatch),
@@ -153,6 +186,18 @@ pub enum Event {
     },
     OperatorSessionCreated {
         session: OperatorSession,
+    },
+    PlaybookCreated {
+        playbook: Playbook,
+    },
+    EvidenceRecorded {
+        evidence: ExerciseEvidence,
+    },
+    FindingCreated {
+        finding: Finding,
+    },
+    FindingStatusSet {
+        finding: Finding,
     },
     EngagementAccepted {
         workspace_id: String,
@@ -187,8 +232,14 @@ pub enum Event {
     },
     ArtifactAvailable {
         artifact_id: crate::ArtifactId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<TaskId>,
         media_type: String,
         byte_size: u64,
+    },
+    ProviderOutput {
+        task_id: TaskId,
+        artifact_id: crate::ArtifactId,
     },
     Overload {
         component: String,
@@ -218,6 +269,9 @@ pub enum ProjectionQuery {
     OperatorCatalog {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_id: Option<WorkspaceId>,
+    },
+    ExerciseRecord {
+        exercise_id: ExerciseId,
     },
     Providers,
     Capacity,

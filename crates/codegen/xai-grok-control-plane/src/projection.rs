@@ -2,10 +2,27 @@ use std::collections::HashMap;
 
 use tokio::sync::RwLock;
 use xai_grok_protocol::{
-    ClientId, EngagementId, Event, EventEnvelope, Exercise, ExerciseId, OperationRun,
-    OperationRunId, OperatorCatalog, OperatorSession, OperatorSessionId, ProjectionQuery,
+    ArtifactId, ClientId, EngagementId, Event, EventEnvelope, EvidenceId, Exercise,
+    ExerciseEvidence, ExerciseId, ExerciseRecord, Finding, FindingId, OperationRun, OperationRunId,
+    OperatorCatalog, OperatorSession, OperatorSessionId, Playbook, PlaybookId, ProjectionQuery,
     ProjectionSnapshot, ProviderId, ServiceHealth, ServiceId, TaskId, TaskStatus, TeamId,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArtifactProjection {
+    pub artifact_id: ArtifactId,
+    pub task_id: Option<TaskId>,
+    pub media_type: String,
+    pub byte_size: u64,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderOutputProjection {
+    pub task_id: TaskId,
+    pub artifact_id: ArtifactId,
+    pub sequence: u64,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EngagementProjection {
@@ -22,6 +39,8 @@ pub struct EngagementProjection {
     pub task_status: HashMap<TaskId, TaskStatus>,
     pub observations: u64,
     pub artifacts: u64,
+    pub artifact_refs: Vec<ArtifactProjection>,
+    pub provider_outputs: Vec<ProviderOutputProjection>,
     pub last_sequence: u64,
 }
 
@@ -41,6 +60,9 @@ struct ProjectionState {
     exercises: HashMap<ExerciseId, Exercise>,
     operation_runs: HashMap<OperationRunId, OperationRun>,
     sessions: HashMap<OperatorSessionId, OperatorSession>,
+    playbooks: HashMap<PlaybookId, Playbook>,
+    evidence: HashMap<EvidenceId, ExerciseEvidence>,
+    findings: HashMap<FindingId, Finding>,
     providers: HashMap<ProviderId, ProviderProjection>,
     overloads: HashMap<String, (u32, u32)>,
 }
@@ -85,6 +107,21 @@ impl ProjectionStore {
                 state
                     .sessions
                     .insert(session.session_id.clone(), session.clone());
+            }
+            Event::PlaybookCreated { playbook } => {
+                state
+                    .playbooks
+                    .insert(playbook.playbook_id.clone(), playbook.clone());
+            }
+            Event::EvidenceRecorded { evidence } => {
+                state
+                    .evidence
+                    .insert(evidence.evidence_id.clone(), evidence.clone());
+            }
+            Event::FindingCreated { finding } | Event::FindingStatusSet { finding } => {
+                state
+                    .findings
+                    .insert(finding.finding_id.clone(), finding.clone());
             }
             Event::EngagementAccepted {
                 workspace_id,
@@ -136,10 +173,36 @@ impl ProjectionStore {
                     projection.last_sequence = envelope.sequence;
                 }
             }
-            Event::ArtifactAvailable { .. } => {
+            Event::ArtifactAvailable {
+                artifact_id,
+                task_id,
+                media_type,
+                byte_size,
+            } => {
                 if let Some(engagement_id) = &envelope.engagement_id {
                     let projection = engagement(&mut state, engagement_id);
                     projection.artifacts = projection.artifacts.saturating_add(1);
+                    projection.artifact_refs.push(ArtifactProjection {
+                        artifact_id: artifact_id.clone(),
+                        task_id: task_id.clone(),
+                        media_type: media_type.clone(),
+                        byte_size: *byte_size,
+                        sequence: envelope.sequence,
+                    });
+                    projection.last_sequence = envelope.sequence;
+                }
+            }
+            Event::ProviderOutput {
+                task_id,
+                artifact_id,
+            } => {
+                if let Some(engagement_id) = &envelope.engagement_id {
+                    let projection = engagement(&mut state, engagement_id);
+                    projection.provider_outputs.push(ProviderOutputProjection {
+                        task_id: task_id.clone(),
+                        artifact_id: artifact_id.clone(),
+                        sequence: envelope.sequence,
+                    });
                     projection.last_sequence = envelope.sequence;
                 }
             }
@@ -227,12 +290,68 @@ impl ProjectionStore {
                         .cmp(&right.created_unix_ms)
                         .then_with(|| left.session_id.cmp(&right.session_id))
                 });
+                let mut playbooks = state
+                    .playbooks
+                    .values()
+                    .filter(|playbook| {
+                        workspace_id
+                            .as_ref()
+                            .is_none_or(|expected| &playbook.workspace_id == expected)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                playbooks.sort_by(|left, right| {
+                    left.name
+                        .cmp(&right.name)
+                        .then_with(|| left.revision.cmp(&right.revision))
+                });
                 serde_json::to_value(OperatorCatalog {
                     exercises,
                     operation_runs,
                     sessions,
+                    playbooks,
                 })
                 .unwrap_or(serde_json::Value::Null)
+            }
+            ProjectionQuery::ExerciseRecord { exercise_id } => {
+                let value = state.exercises.get(&exercise_id).map(|exercise| {
+                    let mut operation_runs = state
+                        .operation_runs
+                        .values()
+                        .filter(|run| run.exercise_id == exercise_id)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    operation_runs.sort_by_key(|run| run.created_unix_ms);
+                    let mut sessions = state
+                        .sessions
+                        .values()
+                        .filter(|session| session.exercise_id == exercise_id)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    sessions.sort_by_key(|session| session.created_unix_ms);
+                    let mut evidence = state
+                        .evidence
+                        .values()
+                        .filter(|record| record.exercise_id == exercise_id)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    evidence.sort_by_key(|record| record.observed_unix_ms);
+                    let mut findings = state
+                        .findings
+                        .values()
+                        .filter(|finding| finding.exercise_id == exercise_id)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    findings.sort_by_key(|finding| finding.created_unix_ms);
+                    ExerciseRecord {
+                        exercise: exercise.clone(),
+                        operation_runs,
+                        sessions,
+                        evidence,
+                        findings,
+                    }
+                });
+                serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
             }
             ProjectionQuery::Providers => {
                 let mut providers = state.providers.values().cloned().collect::<Vec<_>>();
@@ -257,6 +376,38 @@ impl ProjectionStore {
         self.state.read().await.exercises.contains_key(exercise_id)
     }
 
+    pub async fn exercise(&self, exercise_id: &ExerciseId) -> Option<Exercise> {
+        self.state.read().await.exercises.get(exercise_id).cloned()
+    }
+
+    pub async fn playbook(&self, playbook_id: &PlaybookId) -> Option<Playbook> {
+        self.state.read().await.playbooks.get(playbook_id).cloned()
+    }
+
+    pub async fn evidence(&self, evidence_id: &EvidenceId) -> Option<ExerciseEvidence> {
+        self.state.read().await.evidence.get(evidence_id).cloned()
+    }
+
+    pub async fn finding(&self, finding_id: &FindingId) -> Option<Finding> {
+        self.state.read().await.findings.get(finding_id).cloned()
+    }
+
+    pub async fn task_belongs_to_exercise(
+        &self,
+        task_id: &TaskId,
+        exercise_id: &ExerciseId,
+    ) -> bool {
+        self.state
+            .read()
+            .await
+            .engagements
+            .values()
+            .any(|engagement| {
+                engagement.exercise_id.as_ref() == Some(exercise_id)
+                    && engagement.task_status.contains_key(task_id)
+            })
+    }
+
     pub async fn operation_run(&self, operation_run_id: &OperationRunId) -> Option<OperationRun> {
         self.state
             .read()
@@ -271,6 +422,16 @@ impl ProjectionStore {
         session_id: &OperatorSessionId,
     ) -> Option<OperatorSession> {
         self.state.read().await.sessions.get(session_id).cloned()
+    }
+
+    pub async fn task_statuses(&self, engagement_id: &EngagementId) -> HashMap<TaskId, TaskStatus> {
+        self.state
+            .read()
+            .await
+            .engagements
+            .get(engagement_id)
+            .map(|engagement| engagement.task_status.clone())
+            .unwrap_or_default()
     }
 }
 

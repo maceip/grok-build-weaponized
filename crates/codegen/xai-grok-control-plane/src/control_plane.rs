@@ -11,14 +11,17 @@ use xai_grok_engagement::{
     EngagementCheckpoint, EngagementCoordinator, NewEngagement, QueuePriority,
 };
 use xai_grok_protocol::{
-    Command, CommandEnvelope, CommandId, EngagementId, Event, EventBatch, EventEnvelope, EventId,
-    EventReadRequest, EvidenceObservation, ExecutionReceipt, Exercise, ExerciseId, ExerciseStatus,
-    OperationRun, OperationRunId, OperationRunStatus, OperatorSession, OperatorSessionId,
-    OperatorSessionStatus, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ProviderDispatch,
-    ProviderId, Response, ResponseEnvelope, ServiceHealth, TaskStatus, TaskingPlan,
+    CapabilityRequirement, Command, CommandEnvelope, CommandId, EngagementId, Event, EventBatch,
+    EventEnvelope, EventId, EventReadRequest, EvidenceId, EvidenceObservation, ExecutionMode,
+    ExecutionReceipt, ExecutionTask, Exercise, ExerciseEvidence, ExerciseId, ExerciseStatus,
+    Finding, FindingId, FindingStatus, OperationRun, OperationRunId, OperationRunStatus,
+    OperatorSession, OperatorSessionId, OperatorSessionStatus, PROTOCOL_VERSION, Playbook,
+    PlaybookId, ProtocolError, ProtocolErrorCode, ProviderDispatch, ProviderId, Response,
+    ResponseEnvelope, ServiceHealth, TaskId, TaskStatus, TaskingPlan,
 };
 
 use crate::SERVER_NAME;
+use crate::agent_provider::AGENT_TURN_OPERATION;
 use crate::artifact::{ArtifactStore, ArtifactStoreConfig};
 use crate::journal::{EventJournal, JournalError};
 use crate::projection::ProjectionStore;
@@ -43,6 +46,7 @@ pub struct ControlPlaneConfig {
     pub provider_registry: ProviderRegistryConfig,
     pub maximum_artifact_bytes: u64,
     pub maximum_artifact_store_bytes: u64,
+    pub auto_schedule_plans: bool,
 }
 
 impl ControlPlaneConfig {
@@ -56,6 +60,7 @@ impl ControlPlaneConfig {
             provider_registry: ProviderRegistryConfig::default(),
             maximum_artifact_bytes: 4 * 1024 * 1024 * 1024,
             maximum_artifact_store_bytes: 128 * 1024 * 1024 * 1024,
+            auto_schedule_plans: true,
         }
     }
 }
@@ -191,6 +196,26 @@ impl PlanStore {
             .to_hex()
             .to_string();
         self.root.join(format!("{engagement_hash}-{revision}.json"))
+    }
+
+    fn all_plans(&self) -> Result<Vec<TaskingPlan>, ProtocolError> {
+        let mut plans: Vec<TaskingPlan> = Vec::new();
+        for entry in std::fs::read_dir(&self.root).map_err(internal_error)? {
+            let entry = entry.map_err(internal_error)?;
+            if !entry.file_type().map_err(internal_error)?.is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let bytes = std::fs::read(entry.path()).map_err(internal_error)?;
+            plans.push(serde_json::from_slice(&bytes).map_err(internal_error)?);
+        }
+        plans.sort_by(|left, right| {
+            left.engagement_id
+                .cmp(&right.engagement_id)
+                .then_with(|| left.revision.cmp(&right.revision))
+        });
+        Ok(plans)
     }
 
     fn claim_dispatch(
@@ -366,6 +391,7 @@ struct ControlPlaneCore {
     event_cache_capacity: usize,
     responses: Mutex<ResponseCache>,
     owner_epoch: String,
+    auto_schedule_plans: bool,
     shutdown: CancellationToken,
 }
 
@@ -424,6 +450,9 @@ impl ControlPlaneCore {
                         "exercise_catalog".to_owned(),
                         "operation_runs".to_owned(),
                         "operator_sessions".to_owned(),
+                        "workspace_playbooks".to_owned(),
+                        "normalized_exercise_evidence".to_owned(),
+                        "finding_lifecycle".to_owned(),
                     ],
                 }))
             }
@@ -453,15 +482,33 @@ impl ControlPlaneCore {
             }
             Command::CreateOperationRun(create) => {
                 create.validate()?;
-                if !self
+                let exercise = self
                     .projections
-                    .contains_exercise(&create.exercise_id)
+                    .exercise(&create.exercise_id)
                     .await
-                {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::NotFound,
-                        format!("exercise {} does not exist", create.exercise_id),
-                    ));
+                    .ok_or_else(|| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::NotFound,
+                            format!("exercise {} does not exist", create.exercise_id),
+                        )
+                    })?;
+                if let Some(playbook_id) = &create.playbook_id {
+                    let playbook =
+                        self.projections
+                            .playbook(playbook_id)
+                            .await
+                            .ok_or_else(|| {
+                                ProtocolError::new(
+                                    ProtocolErrorCode::NotFound,
+                                    format!("playbook {playbook_id} does not exist"),
+                                )
+                            })?;
+                    if playbook.workspace_id != exercise.workspace_id {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::Conflict,
+                            "playbook belongs to a different workspace",
+                        ));
+                    }
                 }
                 let now = now_unix_ms();
                 let operation_run = OperationRun {
@@ -537,6 +584,171 @@ impl ControlPlaneCore {
                 .await?;
                 Ok(Response::OperatorSessionCreated { session })
             }
+            Command::CreatePlaybook(create) => {
+                create.validate()?;
+                let playbook = Playbook {
+                    playbook_id: PlaybookId::new(),
+                    workspace_id: create.workspace_id,
+                    revision: 1,
+                    name: create.name,
+                    description: create.description,
+                    steps: create.steps,
+                };
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::PlaybookCreated {
+                        playbook: playbook.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::PlaybookCreated { playbook })
+            }
+            Command::RecordEvidence(record) => {
+                record.validate()?;
+                self.validate_exercise_links(
+                    &record.exercise_id,
+                    record.operation_run_id.as_ref(),
+                    record.session_id.as_ref(),
+                )
+                .await?;
+                if let Some(task_id) = &record.task_id
+                    && !self
+                        .projections
+                        .task_belongs_to_exercise(task_id, &record.exercise_id)
+                        .await
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::Conflict,
+                        format!("task {task_id} is not associated with the exercise"),
+                    ));
+                }
+                if let Some(artifact_id) = &record.artifact_id {
+                    let artifacts = self.artifacts.clone();
+                    let artifact_id = artifact_id.clone();
+                    tokio::task::spawn_blocking(move || artifacts.descriptor(&artifact_id))
+                        .await
+                        .map_err(|error| internal_error(error.to_string()))?
+                        .map_err(|error| match error {
+                            crate::artifact::ArtifactError::NotFound(id) => ProtocolError::new(
+                                ProtocolErrorCode::NotFound,
+                                format!("artifact {id} does not exist"),
+                            ),
+                            other => internal_error(other.to_string()),
+                        })?;
+                }
+                let evidence = ExerciseEvidence {
+                    evidence_id: EvidenceId::new(),
+                    exercise_id: record.exercise_id,
+                    operation_run_id: record.operation_run_id,
+                    session_id: record.session_id,
+                    task_id: record.task_id,
+                    finding: record.finding,
+                    confidence: record.confidence,
+                    artifact_id: record.artifact_id,
+                    attributes: record.attributes,
+                    observed_unix_ms: now_unix_ms(),
+                };
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::EvidenceRecorded {
+                        evidence: evidence.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::EvidenceRecorded { evidence })
+            }
+            Command::CreateFinding(create) => {
+                create.validate()?;
+                self.validate_exercise_links(
+                    &create.exercise_id,
+                    create.operation_run_id.as_ref(),
+                    None,
+                )
+                .await?;
+                for evidence_id in &create.evidence_ids {
+                    let evidence =
+                        self.projections
+                            .evidence(evidence_id)
+                            .await
+                            .ok_or_else(|| {
+                                ProtocolError::new(
+                                    ProtocolErrorCode::NotFound,
+                                    format!("evidence {evidence_id} does not exist"),
+                                )
+                            })?;
+                    if evidence.exercise_id != create.exercise_id {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::Conflict,
+                            format!("evidence {evidence_id} belongs to a different exercise"),
+                        ));
+                    }
+                }
+                let exercise = self
+                    .projections
+                    .exercise(&create.exercise_id)
+                    .await
+                    .expect("validated exercise is present");
+                for target_id in &create.target_ids {
+                    if !exercise
+                        .scope
+                        .iter()
+                        .any(|target| &target.target_id == target_id)
+                    {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::Conflict,
+                            format!("target {target_id} is not in the exercise scope"),
+                        ));
+                    }
+                }
+                let now = now_unix_ms();
+                let finding = Finding {
+                    finding_id: FindingId::new(),
+                    exercise_id: create.exercise_id,
+                    operation_run_id: create.operation_run_id,
+                    title: create.title,
+                    summary: create.summary,
+                    severity: create.severity,
+                    status: FindingStatus::Candidate,
+                    evidence_ids: create.evidence_ids,
+                    target_ids: create.target_ids,
+                    created_unix_ms: now,
+                    updated_unix_ms: now,
+                };
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::FindingCreated {
+                        finding: finding.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::FindingCreated { finding })
+            }
+            Command::SetFindingStatus { finding_id, status } => {
+                let mut finding = self.projections.finding(&finding_id).await.ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::NotFound,
+                        format!("finding {finding_id} does not exist"),
+                    )
+                })?;
+                finding.status = status;
+                finding.updated_unix_ms = now_unix_ms();
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::FindingStatusSet {
+                        finding: finding.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::FindingStatusSet { finding })
+            }
             Command::SubmitIngress(ingress) => {
                 ingress.validate()?;
                 if let Some(exercise_id) = &ingress.exercise_id
@@ -589,6 +801,13 @@ impl ControlPlaneCore {
                 let exercise_id = ingress.exercise_id.clone();
                 let operation_run_id = ingress.operation_run_id.clone();
                 let operator_session_id = ingress.operator_session_id.clone();
+                let turn_request = ingress.request.clone();
+                let turn_session_key = ingress
+                    .operator_session_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| ingress.session_id.clone());
+                let turn_task_id = scheduled_turn_task_id(&ingress.prompt_id);
                 let outcome = self
                     .engagement
                     .accept(NewEngagement {
@@ -606,7 +825,7 @@ impl ControlPlaneCore {
                 if outcome.accepted {
                     self.emit(
                         Some(engagement_id.clone()),
-                        causation_id,
+                        causation_id.clone(),
                         0,
                         Event::EngagementAccepted {
                             workspace_id: outcome.record.workspace_id,
@@ -619,6 +838,60 @@ impl ControlPlaneCore {
                         },
                     )
                     .await?;
+                    if self.auto_schedule_plans {
+                        let plan = TaskingPlan {
+                            engagement_id: engagement_id.clone(),
+                            revision: 1,
+                            objective: turn_request.clone(),
+                            tasks: vec![ExecutionTask {
+                                task_id: turn_task_id,
+                                objective: "Execute the submitted operator turn".to_owned(),
+                                mode: ExecutionMode::Interactive,
+                                capability: CapabilityRequirement {
+                                    operation_id: AGENT_TURN_OPERATION.into(),
+                                    preferred_provider: Some("agent-runtime".into()),
+                                    required_features: vec![
+                                        "session_continuity".to_owned(),
+                                        "tool_loop".to_owned(),
+                                    ],
+                                },
+                                input: serde_json::json!({
+                                    "request": turn_request,
+                                    "session_key": turn_session_key,
+                                }),
+                                deadline_unix_ms: now_unix_ms().saturating_add(30 * 60 * 1_000),
+                                completion_tests: Vec::new(),
+                                depends_on: Vec::new(),
+                            }],
+                        };
+                        let stored = plan.clone();
+                        let plans = self.plans.clone();
+                        tokio::task::spawn_blocking(move || plans.put(&stored))
+                            .await
+                            .map_err(|error| internal_error(error.to_string()))??;
+                        self.emit(
+                            Some(engagement_id.clone()),
+                            causation_id.clone(),
+                            0,
+                            Event::PlanAccepted {
+                                revision: plan.revision,
+                                task_count: plan.tasks.len() as u32,
+                            },
+                        )
+                        .await?;
+                        self.emit(
+                            Some(engagement_id.clone()),
+                            causation_id.clone(),
+                            0,
+                            Event::TaskStatus {
+                                task_id: plan.tasks[0].task_id.clone(),
+                                status: TaskStatus::Prepared,
+                                provider_id: None,
+                            },
+                        )
+                        .await?;
+                        self.spawn_schedule_plan(plan, causation_id.clone());
+                    }
                 }
                 Ok(Response::Accepted {
                     engagement_id,
@@ -650,7 +923,7 @@ impl ControlPlaneCore {
                     .map_err(|error| internal_error(error.to_string()))??;
                 self.emit(
                     Some(plan.engagement_id.clone()),
-                    causation_id,
+                    causation_id.clone(),
                     0,
                     Event::PlanAccepted {
                         revision: plan.revision,
@@ -658,10 +931,28 @@ impl ControlPlaneCore {
                     },
                 )
                 .await?;
-                Ok(Response::PlanAccepted {
-                    engagement_id: plan.engagement_id,
+                let existing = self.projections.task_statuses(&plan.engagement_id).await;
+                for task in &plan.tasks {
+                    if !existing.contains_key(&task.task_id) {
+                        self.emit(
+                            Some(plan.engagement_id.clone()),
+                            causation_id.clone(),
+                            0,
+                            Event::TaskStatus {
+                                task_id: task.task_id.clone(),
+                                status: TaskStatus::Prepared,
+                                provider_id: None,
+                            },
+                        )
+                        .await?;
+                    }
+                }
+                let response = Response::PlanAccepted {
+                    engagement_id: plan.engagement_id.clone(),
                     revision: plan.revision,
-                })
+                };
+                self.spawn_schedule_plan(plan, causation_id);
+                Ok(response)
             }
             Command::Dispatch(mut dispatch) => {
                 let plans = self.plans.clone();
@@ -833,6 +1124,7 @@ impl ControlPlaneCore {
                     0,
                     Event::ArtifactAvailable {
                         artifact_id: descriptor.artifact_id.clone(),
+                        task_id: None,
                         media_type: descriptor.media_type,
                         byte_size: descriptor.byte_size,
                     },
@@ -842,6 +1134,35 @@ impl ControlPlaneCore {
                     artifact_id: descriptor.artifact_id,
                     content_hash: descriptor.content_hash,
                     byte_size: descriptor.byte_size,
+                })
+            }
+            Command::ReadArtifact {
+                artifact_id,
+                cursor,
+                limit,
+            } => {
+                let artifacts = self.artifacts.clone();
+                let requested_artifact_id = artifact_id.clone();
+                let (descriptor, bytes, next_cursor) = tokio::task::spawn_blocking(move || {
+                    let descriptor = artifacts.descriptor(&requested_artifact_id)?;
+                    let (bytes, next_cursor) = artifacts.read_range(
+                        &requested_artifact_id,
+                        cursor,
+                        usize::try_from(limit).unwrap_or(usize::MAX),
+                    )?;
+                    Ok::<_, crate::artifact::ArtifactError>((descriptor, bytes, next_cursor))
+                })
+                .await
+                .map_err(|error| internal_error(error.to_string()))?
+                .map_err(|error| internal_error(error.to_string()))?;
+                Ok(Response::ArtifactChunk {
+                    artifact_id,
+                    media_type: descriptor.media_type,
+                    content_hash: descriptor.content_hash,
+                    byte_size: descriptor.byte_size,
+                    cursor,
+                    bytes,
+                    next_cursor,
                 })
             }
             Command::ReadEvents(request) => Ok(Response::Events(self.read_events(&request).await?)),
@@ -855,13 +1176,68 @@ impl ControlPlaneCore {
         }
     }
 
+    async fn validate_exercise_links(
+        &self,
+        exercise_id: &ExerciseId,
+        operation_run_id: Option<&OperationRunId>,
+        session_id: Option<&OperatorSessionId>,
+    ) -> Result<(), ProtocolError> {
+        if !self.projections.contains_exercise(exercise_id).await {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::NotFound,
+                format!("exercise {exercise_id} does not exist"),
+            ));
+        }
+        if let Some(operation_run_id) = operation_run_id {
+            let run = self
+                .projections
+                .operation_run(operation_run_id)
+                .await
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::NotFound,
+                        format!("operation run {operation_run_id} does not exist"),
+                    )
+                })?;
+            if &run.exercise_id != exercise_id {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::Conflict,
+                    "operation run belongs to a different exercise",
+                ));
+            }
+        }
+        if let Some(session_id) = session_id {
+            let session = self
+                .projections
+                .operator_session(session_id)
+                .await
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::NotFound,
+                        format!("operator session {session_id} does not exist"),
+                    )
+                })?;
+            if &session.exercise_id != exercise_id
+                || session.operation_run_id.as_ref() != operation_run_id
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::Conflict,
+                    "operator session does not belong to the selected exercise/run",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn spawn_dispatch(self: &Arc<Self>, dispatch: ProviderDispatch, causation_id: Option<String>) {
         let core = self.clone();
         tokio::spawn(async move {
             let engagement_id = dispatch.engagement_id.clone();
+            let schedule_engagement_id = engagement_id.clone();
             let task_id = dispatch.task.task_id.clone();
             let provider_id = dispatch.provider_id.clone();
             let request_id = dispatch.request_id.clone();
+            let plan_revision = dispatch.plan_revision;
             let generation = dispatch.lease_epoch;
             if let Err(error) = core
                 .emit(
@@ -970,7 +1346,180 @@ impl ControlPlaneCore {
                         .await;
                 }
             }
+            let plans = core.plans.clone();
+            let engagement_for_plan = schedule_engagement_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                plans.get(&engagement_for_plan, plan_revision)
+            })
+            .await
+            {
+                Ok(Ok(Some(plan))) => {
+                    if let Err(error) = core.schedule_plan(plan, None).await {
+                        tracing::error!(%error, "failed to advance durable task graph");
+                    }
+                }
+                Ok(Ok(None)) => {
+                    tracing::error!(engagement_id = %schedule_engagement_id, plan_revision, "completed dispatch lost its plan");
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "failed to reload plan after dispatch");
+                }
+                Err(error) => {
+                    tracing::error!(%error, "plan reload task failed after dispatch");
+                }
+            }
         });
+    }
+
+    fn spawn_schedule_plan(self: &Arc<Self>, plan: TaskingPlan, causation_id: Option<String>) {
+        if !self.auto_schedule_plans {
+            return;
+        }
+        let core = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = core.schedule_plan(plan, causation_id).await {
+                tracing::error!(%error, "durable plan scheduling failed");
+            }
+        });
+    }
+
+    async fn resume_all_plans(self: &Arc<Self>) -> Result<(), ProtocolError> {
+        if !self.auto_schedule_plans {
+            return Ok(());
+        }
+        let plans = self.plans.clone();
+        let plans = tokio::task::spawn_blocking(move || plans.all_plans())
+            .await
+            .map_err(|error| internal_error(error.to_string()))??;
+        for plan in plans {
+            self.schedule_plan(plan, None).await?;
+        }
+        Ok(())
+    }
+
+    async fn schedule_plan(
+        self: &Arc<Self>,
+        plan: TaskingPlan,
+        causation_id: Option<String>,
+    ) -> Result<(), ProtocolError> {
+        let statuses = self.projections.task_statuses(&plan.engagement_id).await;
+        for task in &plan.tasks {
+            if matches!(
+                statuses.get(&task.task_id),
+                Some(
+                    TaskStatus::Dispatched
+                        | TaskStatus::Running
+                        | TaskStatus::Completed
+                        | TaskStatus::Failed
+                        | TaskStatus::Cancelled
+                        | TaskStatus::Lost
+                        | TaskStatus::Suspended
+                )
+            ) {
+                continue;
+            }
+            let dependencies_complete = task
+                .depends_on
+                .iter()
+                .all(|dependency| statuses.get(dependency) == Some(&TaskStatus::Completed));
+            if !dependencies_complete {
+                let dependency_failed = task.depends_on.iter().any(|dependency| {
+                    matches!(
+                        statuses.get(dependency),
+                        Some(TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Lost)
+                    )
+                });
+                if dependency_failed {
+                    self.emit(
+                        Some(plan.engagement_id.clone()),
+                        causation_id.clone(),
+                        0,
+                        Event::TaskStatus {
+                            task_id: task.task_id.clone(),
+                            status: TaskStatus::Suspended,
+                            provider_id: None,
+                        },
+                    )
+                    .await?;
+                }
+                continue;
+            }
+            let provider_id = match self
+                .providers
+                .resolve_requirement(
+                    &task.capability,
+                    task.capability.preferred_provider.as_ref(),
+                    task.mode,
+                )
+                .await
+            {
+                Ok(provider_id) => provider_id,
+                Err(error)
+                    if matches!(
+                        error.code,
+                        ProtocolErrorCode::UnknownProvider
+                            | ProtocolErrorCode::UnsupportedOperation
+                            | ProtocolErrorCode::ServiceUnavailable
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let generation = self
+                .providers
+                .generation(&provider_id)
+                .await
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::ServiceUnavailable,
+                        format!("provider {provider_id} disappeared during scheduling"),
+                    )
+                })?;
+            let dispatch = ProviderDispatch {
+                request_id: scheduled_request_id(&plan.engagement_id, plan.revision, &task.task_id),
+                engagement_id: plan.engagement_id.clone(),
+                plan_revision: plan.revision,
+                task: task.clone(),
+                provider_id: provider_id.clone(),
+                lease_epoch: generation,
+            };
+            let plans = self.plans.clone();
+            let owner_epoch = self.owner_epoch.clone();
+            let dispatch_for_claim = dispatch.clone();
+            let claim = tokio::task::spawn_blocking(move || {
+                plans.claim_dispatch(&dispatch_for_claim, &owner_epoch)
+            })
+            .await
+            .map_err(|error| internal_error(error.to_string()))??;
+            if matches!(claim, DispatchClaim::Existing(_)) {
+                continue;
+            }
+            if let Err(error) = self
+                .emit(
+                    Some(plan.engagement_id.clone()),
+                    causation_id.clone(),
+                    generation,
+                    Event::TaskStatus {
+                        task_id: task.task_id.clone(),
+                        status: TaskStatus::Dispatched,
+                        provider_id: Some(provider_id),
+                    },
+                )
+                .await
+            {
+                let plans = self.plans.clone();
+                let request_id = dispatch.request_id.clone();
+                let owner_epoch = self.owner_epoch.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    plans.release_unstarted(&request_id, &owner_epoch)
+                })
+                .await;
+                return Err(error);
+            }
+            self.spawn_dispatch(dispatch, causation_id.clone());
+        }
+        Ok(())
     }
 
     async fn record_provider_output(
@@ -995,6 +1544,7 @@ impl ControlPlaneCore {
                 generation,
                 Event::ArtifactAvailable {
                     artifact_id: descriptor.artifact_id,
+                    task_id: Some(task_id.clone()),
                     media_type: descriptor.media_type,
                     byte_size: descriptor.byte_size,
                 },
@@ -1014,9 +1564,20 @@ impl ControlPlaneCore {
             causation_id.clone(),
             generation,
             Event::ArtifactAvailable {
-                artifact_id: descriptor.artifact_id,
+                artifact_id: descriptor.artifact_id.clone(),
+                task_id: Some(task_id.clone()),
                 media_type: descriptor.media_type,
                 byte_size: descriptor.byte_size,
+            },
+        )
+        .await?;
+        self.emit(
+            Some(engagement_id.clone()),
+            causation_id.clone(),
+            generation,
+            Event::ProviderOutput {
+                task_id: task_id.clone(),
+                artifact_id: descriptor.artifact_id,
             },
         )
         .await?;
@@ -1296,6 +1857,7 @@ impl ControlPlaneHandle {
                 },
             )
             .await?;
+        self.core.resume_all_plans().await?;
         Ok((registry_generation, manifest_hash))
     }
 
@@ -1360,6 +1922,7 @@ impl ControlPlane {
             event_cache_capacity: config.event_capacity.max(1),
             responses: Mutex::new(ResponseCache::new(config.response_cache_capacity)),
             owner_epoch: uuid::Uuid::new_v4().simple().to_string(),
+            auto_schedule_plans: config.auto_schedule_plans,
             shutdown: CancellationToken::new(),
         });
         let (command_tx, mut command_rx) =
@@ -1484,6 +2047,25 @@ fn internal_error(error: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::Internal, error.to_string())
 }
 
+fn scheduled_request_id(
+    engagement_id: &EngagementId,
+    revision: u32,
+    task_id: &xai_grok_protocol::TaskId,
+) -> xai_grok_protocol::RequestId {
+    let mut identity = blake3::Hasher::new();
+    identity.update(engagement_id.as_str().as_bytes());
+    identity.update(&revision.to_le_bytes());
+    identity.update(task_id.as_str().as_bytes());
+    xai_grok_protocol::RequestId::from_string(format!("req_{}", identity.finalize().to_hex()))
+}
+
+fn scheduled_turn_task_id(prompt_id: &str) -> TaskId {
+    TaskId::from_string(format!(
+        "turn_{}",
+        blake3::hash(prompt_id.as_bytes()).to_hex()
+    ))
+}
+
 fn canonical_json_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
     let mut value = serde_json::to_value(value).map_err(internal_error)?;
     canonicalize_json(&mut value);
@@ -1524,10 +2106,12 @@ mod tests {
 
     use xai_grok_protocol::{
         ArtifactContract, CancellationSemantics, CapabilityManifest, CapabilityRequirement,
-        Command, CommandEnvelope, CommandId, ConcurrencyProfile, CreateExercise,
-        CreateOperationRun, CreateOperatorSession, ExecutionMode, ExecutionTask, IngressEnvelope,
-        IngressSource, OperationDescriptor, OperatorCatalog, ProjectionQuery, ProviderKind,
-        RecoverySemantics, RequestId, TaskId, VersionRange, WorkspaceId,
+        Command, CommandEnvelope, CommandId, ConcurrencyProfile, CreateExercise, CreateFinding,
+        CreateOperationRun, CreateOperatorSession, CreatePlaybook, ExecutionMode, ExecutionTask,
+        FindingSeverity, FindingStatus, IngressEnvelope, IngressSource, OperationDescriptor,
+        OperatorCatalog, PlaybookStep, ProjectionQuery, ProviderKind, RecordExerciseEvidence,
+        RecoverySemantics, RequestId, ScopeTarget, TargetId, TargetKind, TaskId, VersionRange,
+        WorkspaceId,
     };
 
     use super::*;
@@ -1631,6 +2215,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn playbook_evidence_and_findings_are_durable_real_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().to_path_buf();
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(&state_path))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        let target_id = TargetId::from_string("target-web");
+        let Response::ExerciseCreated { exercise } = handle
+            .submit(envelope(Command::CreateExercise(CreateExercise {
+                workspace_id: WorkspaceId::from_string("workspace-a"),
+                name: "Web assessment".to_owned(),
+                objective: "Validate exposed services".to_owned(),
+                scope: vec![ScopeTarget {
+                    target_id: target_id.clone(),
+                    kind: TargetKind::Host,
+                    selector: "10.10.4.8".to_owned(),
+                    excluded: false,
+                    labels: Default::default(),
+                }],
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected exercise");
+        };
+        let Response::PlaybookCreated { playbook } = handle
+            .submit(envelope(Command::CreatePlaybook(CreatePlaybook {
+                workspace_id: exercise.workspace_id.clone(),
+                name: "Web discovery".to_owned(),
+                description: "Collect and normalize exposed services".to_owned(),
+                steps: vec![PlaybookStep {
+                    step_id: "scan".to_owned(),
+                    name: "Scan web ports".to_owned(),
+                    capability: "native.nmap".to_owned(),
+                    depends_on: Vec::new(),
+                    completion_tests: vec!["scan completed".to_owned()],
+                }],
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected playbook");
+        };
+        let Response::OperationRunCreated { operation_run } = handle
+            .submit(envelope(Command::CreateOperationRun(CreateOperationRun {
+                exercise_id: exercise.exercise_id.clone(),
+                name: "Discovery run".to_owned(),
+                objective: "Run the web discovery playbook".to_owned(),
+                playbook_id: Some(playbook.playbook_id.clone()),
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected run");
+        };
+        let Response::OperatorSessionCreated { session } = handle
+            .submit(envelope(Command::CreateOperatorSession(
+                CreateOperatorSession {
+                    exercise_id: exercise.exercise_id.clone(),
+                    operation_run_id: Some(operation_run.operation_run_id.clone()),
+                    name: "Operator one".to_owned(),
+                    purpose: "Collect discovery evidence".to_owned(),
+                },
+            )))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected session");
+        };
+        let Response::ArtifactStored { artifact_id, .. } = handle
+            .submit(envelope(Command::PutArtifact {
+                media_type: "application/xml".to_owned(),
+                bytes: br#"<host><port protocol="tcp" portid="443"><state state="open"/></port></host>"#
+                    .to_vec(),
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected artifact");
+        };
+        let Response::EvidenceRecorded { evidence } = handle
+            .submit(envelope(Command::RecordEvidence(RecordExerciseEvidence {
+                exercise_id: exercise.exercise_id.clone(),
+                operation_run_id: Some(operation_run.operation_run_id.clone()),
+                session_id: Some(session.session_id.clone()),
+                task_id: None,
+                finding: "TCP 443 is open".to_owned(),
+                confidence: 1.0,
+                artifact_id: Some(artifact_id.clone()),
+                attributes: [("port".to_owned(), "443".to_owned())]
+                    .into_iter()
+                    .collect(),
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected evidence");
+        };
+        let Response::FindingCreated { finding } = handle
+            .submit(envelope(Command::CreateFinding(CreateFinding {
+                exercise_id: exercise.exercise_id.clone(),
+                operation_run_id: Some(operation_run.operation_run_id.clone()),
+                title: "Exposed TLS service".to_owned(),
+                summary: "A TLS listener is reachable on TCP 443.".to_owned(),
+                severity: FindingSeverity::Moderate,
+                evidence_ids: vec![evidence.evidence_id.clone()],
+                target_ids: vec![target_id],
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected finding");
+        };
+        let Response::FindingStatusSet { finding } = handle
+            .submit(envelope(Command::SetFindingStatus {
+                finding_id: finding.finding_id,
+                status: FindingStatus::Confirmed,
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected finding status update");
+        };
+        assert_eq!(finding.status, FindingStatus::Confirmed);
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+
+        let reopened = ControlPlane::open(ControlPlaneConfig::new(&state_path))
+            .await
+            .unwrap();
+        let handle = reopened.handle();
+        let Response::Projection(snapshot) = handle
+            .submit(envelope(Command::QueryProjection(
+                ProjectionQuery::ExerciseRecord {
+                    exercise_id: exercise.exercise_id,
+                },
+            )))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected exercise record");
+        };
+        let record: xai_grok_protocol::ExerciseRecord =
+            serde_json::from_value(snapshot.value).unwrap();
+        assert_eq!(record.evidence.len(), 1);
+        assert_eq!(record.evidence[0].artifact_id.as_ref(), Some(&artifact_id));
+        assert_eq!(record.findings.len(), 1);
+        assert_eq!(record.findings[0].status, FindingStatus::Confirmed);
+        assert_eq!(
+            record.operation_runs[0].playbook_id,
+            Some(playbook.playbook_id)
+        );
+        handle.shutdown_token().cancel();
+        reopened.wait().await;
+    }
+
+    #[tokio::test]
     async fn duplicate_ingress_is_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let control_plane = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
@@ -1666,6 +2426,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut config = ControlPlaneConfig::new(directory.path());
         config.event_capacity = 1;
+        config.auto_schedule_plans = false;
         let control_plane = ControlPlane::open(config).await.unwrap();
         let handle = control_plane.handle();
         for index in 0..3 {
@@ -1778,9 +2539,9 @@ mod tests {
     #[tokio::test]
     async fn filtered_long_poll_advances_past_unrelated_events() {
         let directory = tempfile::tempdir().unwrap();
-        let control_plane = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
-            .await
-            .unwrap();
+        let mut config = ControlPlaneConfig::new(directory.path());
+        config.auto_schedule_plans = false;
+        let control_plane = ControlPlane::open(config).await.unwrap();
         let handle = control_plane.handle();
         let reader = {
             let handle = handle.clone();
@@ -1854,6 +2615,239 @@ mod tests {
         }
     }
 
+    fn agent_provider_manifest() -> CapabilityManifest {
+        let mut manifest = provider_manifest();
+        manifest.provider_id = ProviderId::from_string("agent-runtime");
+        manifest.kind = ProviderKind::ModelRuntime;
+        manifest.features = ["session_continuity", "tool_loop"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        manifest.operations[0].operation_id = AGENT_TURN_OPERATION.into();
+        manifest.operations[0].display_name = "Agent turn".to_owned();
+        manifest
+    }
+
+    async fn all_events(handle: &ControlPlaneHandle) -> Vec<EventEnvelope> {
+        let response = handle
+            .submit(envelope(Command::ReadEvents(EventReadRequest {
+                after_sequence: 0,
+                maximum_events: 512,
+                wait_ms: 0,
+                engagement_id: None,
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Events(batch) = response else {
+            panic!("expected event batch");
+        };
+        batch.events
+    }
+
+    #[tokio::test]
+    async fn accepted_ingress_executes_and_exposes_provider_output_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        handle
+            .register_provider(Arc::new(FunctionProvider::new(
+                agent_provider_manifest(),
+                |dispatch| async move {
+                    let request = dispatch.task.input["request"].as_str().unwrap();
+                    Ok(ProviderOutput {
+                        output: serde_json::json!({"text": format!("executed: {request}")}),
+                        ..ProviderOutput::default()
+                    })
+                },
+                |_| async { Ok(()) },
+            )))
+            .await
+            .unwrap();
+
+        let accepted = handle
+            .submit(envelope(Command::SubmitIngress(IngressEnvelope {
+                command_id: CommandId::new(),
+                source: IngressSource::Gui,
+                source_event_id: "real-ingress-event".to_owned(),
+                workspace_id: WorkspaceId::from_string("workspace"),
+                exercise_id: None,
+                operation_run_id: None,
+                operator_session_id: None,
+                session_id: "operator-session".to_owned(),
+                prompt_id: "real-prompt".to_owned(),
+                request: "inspect the supplied evidence".to_owned(),
+                team: None,
+                metadata: serde_json::Map::new(),
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Accepted { engagement_id, .. } = accepted else {
+            panic!("expected accepted ingress");
+        };
+
+        let (task_id, artifact_id) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let events = all_events(&handle).await;
+                let completed = events.iter().any(|event| {
+                    event.engagement_id.as_ref() == Some(&engagement_id)
+                        && matches!(
+                            &event.event,
+                            Event::TaskStatus {
+                                status: TaskStatus::Completed,
+                                ..
+                            }
+                        )
+                });
+                let output = events.iter().find_map(|event| match &event.event {
+                    Event::ProviderOutput {
+                        task_id,
+                        artifact_id,
+                    } if event.engagement_id.as_ref() == Some(&engagement_id) => {
+                        Some((task_id.clone(), artifact_id.clone()))
+                    }
+                    _ => None,
+                });
+                if completed && let Some(output) = output {
+                    break output;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(task_id, scheduled_turn_task_id("real-prompt"));
+
+        let artifact = handle
+            .submit(envelope(Command::ReadArtifact {
+                artifact_id: artifact_id.clone(),
+                cursor: 0,
+                limit: 1024,
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::ArtifactChunk {
+            artifact_id: read_id,
+            bytes,
+            next_cursor,
+            ..
+        } = artifact
+        else {
+            panic!("expected provider output artifact");
+        };
+        assert_eq!(read_id, artifact_id);
+        assert!(next_cursor.is_none());
+        let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(output["text"], "executed: inspect the supplied evidence");
+
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+    }
+
+    #[tokio::test]
+    async fn scheduler_runs_dependencies_in_order_without_manual_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        let executed = Arc::new(StdMutex::new(Vec::<TaskId>::new()));
+        handle
+            .register_provider(Arc::new(FunctionProvider::new(
+                provider_manifest(),
+                {
+                    let executed = executed.clone();
+                    move |dispatch| {
+                        let executed = executed.clone();
+                        async move {
+                            executed.lock().unwrap().push(dispatch.task.task_id);
+                            Ok(ProviderOutput {
+                                output: serde_json::json!({"ok": true}),
+                                ..ProviderOutput::default()
+                            })
+                        }
+                    }
+                },
+                |_| async { Ok(()) },
+            )))
+            .await
+            .unwrap();
+        let accepted = handle
+            .submit(envelope(Command::SubmitIngress(IngressEnvelope {
+                command_id: CommandId::new(),
+                source: IngressSource::Cli,
+                source_event_id: "dependency-ingress".to_owned(),
+                workspace_id: WorkspaceId::from_string("workspace"),
+                exercise_id: None,
+                operation_run_id: None,
+                operator_session_id: None,
+                session_id: "dependency-session".to_owned(),
+                prompt_id: "dependency-prompt".to_owned(),
+                request: "run the dependency plan".to_owned(),
+                team: None,
+                metadata: serde_json::Map::new(),
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Accepted { engagement_id, .. } = accepted else {
+            panic!("expected accepted ingress");
+        };
+        let first_id = TaskId::from_string("first");
+        let second_id = TaskId::from_string("second");
+        let task = |task_id: TaskId, depends_on: Vec<TaskId>| ExecutionTask {
+            task_id,
+            objective: "execute".to_owned(),
+            mode: ExecutionMode::Interactive,
+            capability: CapabilityRequirement {
+                operation_id: "test.execute".into(),
+                preferred_provider: Some("test-provider".into()),
+                required_features: Vec::new(),
+            },
+            input: serde_json::json!({}),
+            deadline_unix_ms: now_unix_ms() + 10_000,
+            completion_tests: Vec::new(),
+            depends_on,
+        };
+        handle
+            .submit(envelope(Command::SubmitPlan(TaskingPlan {
+                engagement_id,
+                revision: 2,
+                objective: "ordered execution".to_owned(),
+                tasks: vec![
+                    task(first_id.clone(), Vec::new()),
+                    task(second_id.clone(), vec![first_id.clone()]),
+                ],
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if executed.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*executed.lock().unwrap(), vec![first_id, second_id]);
+
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+    }
+
     async fn register_counting_provider(handle: &ControlPlaneHandle, executions: Arc<AtomicUsize>) {
         handle
             .register_provider(Arc::new(FunctionProvider::new(
@@ -1881,9 +2875,9 @@ mod tests {
         let executions = Arc::new(AtomicUsize::new(0));
         let dispatch;
         {
-            let control_plane = ControlPlane::open(ControlPlaneConfig::new(&state))
-                .await
-                .unwrap();
+            let mut config = ControlPlaneConfig::new(&state);
+            config.auto_schedule_plans = false;
+            let control_plane = ControlPlane::open(config).await.unwrap();
             let handle = control_plane.handle();
             register_counting_provider(&handle, executions.clone()).await;
             let accepted = handle
@@ -1978,9 +2972,9 @@ mod tests {
             control_plane.wait().await;
         }
 
-        let control_plane = ControlPlane::open(ControlPlaneConfig::new(&state))
-            .await
-            .unwrap();
+        let mut config = ControlPlaneConfig::new(&state);
+        config.auto_schedule_plans = false;
+        let control_plane = ControlPlane::open(config).await.unwrap();
         let handle = control_plane.handle();
         register_counting_provider(&handle, executions.clone()).await;
         handle

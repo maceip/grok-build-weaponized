@@ -15440,6 +15440,7 @@ dependencies = [
 name = "xai-grok-control-plane"
 version = "0.1.0"
 dependencies = [
+ "agent-client-protocol",
  "async-trait",
  "blake3",
  "clap",
@@ -15453,6 +15454,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "xai-acp-lib",
  "xai-grok-control-client",
  "xai-grok-engagement",
  "xai-grok-protocol",

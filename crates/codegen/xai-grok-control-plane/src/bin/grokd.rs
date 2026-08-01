@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use xai_grok_control_plane::{ControlPlane, ControlPlaneConfig, ControlPlaneServer, ServerConfig};
+use xai_grok_control_plane::{
+    AgentExecutionProvider, AgentProviderConfig, ControlPlane, ControlPlaneConfig,
+    ControlPlaneServer, ServerConfig,
+};
 use xai_grok_protocol::{PROTOCOL_VERSION, RuntimeProfile};
 
 #[derive(Debug, Parser)]
@@ -29,6 +32,24 @@ struct Arguments {
     /// Maximum simultaneous local socket clients.
     #[arg(long)]
     maximum_connections: Option<usize>,
+
+    /// Persistent Grok ACP worker executable. Defaults to a sibling
+    /// `xai-grok-pager` or `grok` binary.
+    #[arg(long, env = "GROK_AGENT_BINARY")]
+    agent_binary: Option<PathBuf>,
+
+    /// Workspace used when an ingress request does not provide one.
+    #[arg(long, env = "GROK_AGENT_WORKSPACE")]
+    agent_workspace: Option<PathBuf>,
+
+    /// Model selected for new daemon-owned agent sessions.
+    #[arg(long, env = "GROK_AGENT_MODEL")]
+    agent_model: Option<String>,
+
+    /// Start only the durable protocol/state service. This mode deliberately
+    /// does not advertise or accept executable agent work.
+    #[arg(long)]
+    control_only: bool,
 }
 
 #[tokio::main]
@@ -65,6 +86,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let control_plane = ControlPlane::open(control_config).await?;
     let handle = control_plane.handle();
+    let agent_provider = if arguments.control_only {
+        None
+    } else {
+        let binary = resolve_agent_binary(arguments.agent_binary.as_ref())?;
+        let workspace = arguments
+            .agent_workspace
+            .unwrap_or(std::env::current_dir()?)
+            .canonicalize()?;
+        let mut provider_config = AgentProviderConfig::new(binary, workspace);
+        provider_config.model_id = arguments.agent_model;
+        let provider = AgentExecutionProvider::start(provider_config).await?;
+        handle.register_provider(provider.clone()).await?;
+        Some(provider)
+    };
     let mut server_config = ServerConfig::new(&socket_path);
     server_config.maximum_connections = arguments
         .maximum_connections
@@ -83,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         profile = profile.as_ref().map(|profile| profile.profile_id.as_str()).unwrap_or("default"),
         profile_revision = profile.as_ref().map_or(0, |profile| profile.revision),
         profile_hash = profile.as_ref().map(RuntimeProfile::content_hash).unwrap_or_default(),
+        agent_provider = agent_provider.is_some(),
         "grokd ready"
     );
 
@@ -98,6 +134,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     control_plane.wait().await;
     server_result?;
     Ok(())
+}
+
+fn resolve_agent_binary(explicit: Option<&PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(explicit) = explicit {
+        return Ok(explicit.canonicalize()?);
+    }
+    let current_executable = std::env::current_exe()?;
+    let directory = current_executable.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "grokd executable has no parent directory",
+        )
+    })?;
+    for name in ["xai-grok-pager", "grok"] {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!(
+            "no persistent agent worker found beside {}; pass --agent-binary or use --control-only",
+            current_executable.display()
+        ),
+    )
+    .into())
 }
 
 fn load_profile(path: &PathBuf) -> Result<RuntimeProfile, Box<dyn std::error::Error>> {

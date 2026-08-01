@@ -145,6 +145,16 @@ impl ControlPlaneClient {
             Response::OperatorSessionCreated { .. } => {
                 Err(ClientError::ExpectedEvents("operator_session_created"))
             }
+            Response::PlaybookCreated { .. } => {
+                Err(ClientError::ExpectedEvents("playbook_created"))
+            }
+            Response::EvidenceRecorded { .. } => {
+                Err(ClientError::ExpectedEvents("evidence_recorded"))
+            }
+            Response::FindingCreated { .. } => Err(ClientError::ExpectedEvents("finding_created")),
+            Response::FindingStatusSet { .. } => {
+                Err(ClientError::ExpectedEvents("finding_status_set"))
+            }
             Response::PlanAccepted { .. } => Err(ClientError::ExpectedEvents("plan_accepted")),
             Response::DispatchAccepted { .. } => {
                 Err(ClientError::ExpectedEvents("dispatch_accepted"))
@@ -153,6 +163,7 @@ impl ControlPlaneClient {
                 Err(ClientError::ExpectedEvents("provider_registered"))
             }
             Response::ArtifactStored { .. } => Err(ClientError::ExpectedEvents("artifact_stored")),
+            Response::ArtifactChunk { .. } => Err(ClientError::ExpectedEvents("artifact_chunk")),
             Response::Projection(_) => Err(ClientError::ExpectedEvents("projection")),
             Response::Ack => Err(ClientError::ExpectedEvents("ack")),
         }

@@ -26,10 +26,11 @@ pub use envelope::{
 pub use error::{ProtocolError, ProtocolErrorCode};
 pub use execution::{DeferredTask, DetachedJob, ExecutionReceipt, InteractiveSession};
 pub use exercise::{
-    CreateExercise, CreateOperationRun, CreateOperatorSession, Exercise, ExerciseEvidence,
-    ExerciseObjective, ExerciseStatus, Finding, FindingStatus, OperationRun, OperationRunStatus,
-    OperatorCatalog, OperatorSession, OperatorSessionStatus, Playbook, PlaybookStep, ScopeTarget,
-    TargetKind, parse_scope_targets,
+    CreateExercise, CreateFinding, CreateOperationRun, CreateOperatorSession, CreatePlaybook,
+    Exercise, ExerciseEvidence, ExerciseObjective, ExerciseRecord, ExerciseStatus, Finding,
+    FindingSeverity, FindingStatus, OperationRun, OperationRunStatus, OperatorCatalog,
+    OperatorSession, OperatorSessionStatus, Playbook, PlaybookStep, RecordExerciseEvidence,
+    ScopeTarget, TargetKind, parse_scope_targets,
 };
 pub use ids::{
     ArtifactId, ClientId, CommandId, EngagementId, EventId, EvidenceId, ExerciseId, FindingId,
