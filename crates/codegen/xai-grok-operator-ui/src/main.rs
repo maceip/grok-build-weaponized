@@ -306,6 +306,58 @@ impl OperatorApp {
             ui.monospace(session.session_id.as_str());
         }
         ui.separator();
+        ui.heading("Team");
+        if self.state.team.presence.is_empty() {
+            ui.label("No connected team clients");
+        }
+        for presence in &self.state.team.presence {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(
+                    presence
+                        .client
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(presence.client.client_id.as_str()),
+                );
+                ui.label(format!("{:?}", presence.state));
+            });
+        }
+        for work_item in self.state.team.work_items.iter().filter(|item| {
+            self.state
+                .selection
+                .exercise_id
+                .as_ref()
+                .is_none_or(|selected| item.exercise_id.as_ref() == Some(selected))
+        }) {
+            ui.label(format!(
+                "{:?}: {}{}",
+                work_item.status,
+                work_item.title,
+                work_item
+                    .assignee
+                    .as_ref()
+                    .map(|assignee| format!(" → {}", assignee.as_str()))
+                    .unwrap_or_default()
+            ));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        for claim in self
+            .state
+            .team
+            .resource_claims
+            .iter()
+            .filter(|claim| claim.released_unix_ms.is_none() && claim.expires_unix_ms > now)
+        {
+            ui.monospace(format!(
+                "claim {} by {}",
+                claim.resource_key,
+                claim.owner.as_str()
+            ));
+        }
+        ui.separator();
         ui.heading("Capacity");
         ui.monospace(pretty_json(&self.state.capacity));
         ui.separator();

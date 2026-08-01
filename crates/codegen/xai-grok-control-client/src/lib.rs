@@ -155,6 +155,24 @@ impl ControlPlaneClient {
             Response::FindingStatusSet { .. } => {
                 Err(ClientError::ExpectedEvents("finding_status_set"))
             }
+            Response::TeamPresenceSet { .. } => {
+                Err(ClientError::ExpectedEvents("team_presence_set"))
+            }
+            Response::TeamWorkItemCreated { .. } => {
+                Err(ClientError::ExpectedEvents("team_work_item_created"))
+            }
+            Response::TeamWorkItemUpdated { .. } => {
+                Err(ClientError::ExpectedEvents("team_work_item_updated"))
+            }
+            Response::TeamMessagePosted { .. } => {
+                Err(ClientError::ExpectedEvents("team_message_posted"))
+            }
+            Response::TeamResourceClaimed { .. } => {
+                Err(ClientError::ExpectedEvents("team_resource_claimed"))
+            }
+            Response::TeamResourceReleased { .. } => {
+                Err(ClientError::ExpectedEvents("team_resource_released"))
+            }
             Response::PlanAccepted { .. } => Err(ClientError::ExpectedEvents("plan_accepted")),
             Response::DispatchAccepted { .. } => {
                 Err(ClientError::ExpectedEvents("dispatch_accepted"))

@@ -48,6 +48,7 @@ macro_rules! string_id {
 
 string_id!(ArtifactId, "art");
 string_id!(ClientId, "client");
+string_id!(ChannelId, "channel");
 string_id!(CommandId, "cmd");
 string_id!(EvidenceId, "evidence");
 string_id!(EngagementId, "eng");
@@ -55,15 +56,18 @@ string_id!(ExerciseId, "exercise");
 string_id!(EventId, "evt");
 string_id!(FindingId, "finding");
 string_id!(OperationId, "op");
+string_id!(MessageId, "message");
 string_id!(OperationRunId, "run");
 string_id!(OperatorSessionId, "session");
 string_id!(PlaybookId, "playbook");
 string_id!(ProfileId, "profile");
 string_id!(ProviderId, "provider");
 string_id!(RequestId, "req");
+string_id!(ResourceClaimId, "claim");
 string_id!(ServiceId, "service");
 string_id!(TaskId, "task");
 string_id!(TeamId, "team");
+string_id!(TeamWorkItemId, "work");
 string_id!(TargetId, "target");
 string_id!(WorkspaceId, "workspace");
 

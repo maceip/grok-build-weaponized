@@ -14,10 +14,11 @@ use xai_grok_protocol::{
     CapabilityRequirement, Command, CommandEnvelope, CommandId, EngagementId, Event, EventBatch,
     EventEnvelope, EventId, EventReadRequest, EvidenceId, EvidenceObservation, ExecutionMode,
     ExecutionReceipt, ExecutionTask, Exercise, ExerciseEvidence, ExerciseId, ExerciseStatus,
-    Finding, FindingId, FindingStatus, OperationRun, OperationRunId, OperationRunStatus,
+    Finding, FindingId, FindingStatus, MessageId, OperationRun, OperationRunId, OperationRunStatus,
     OperatorSession, OperatorSessionId, OperatorSessionStatus, PROTOCOL_VERSION, Playbook,
-    PlaybookId, ProtocolError, ProtocolErrorCode, ProviderDispatch, ProviderId, Response,
-    ResponseEnvelope, ServiceHealth, TaskId, TaskStatus, TaskingPlan,
+    PlaybookId, ProtocolError, ProtocolErrorCode, ProviderDispatch, ProviderId, ResourceClaimId,
+    Response, ResponseEnvelope, ServiceHealth, TaskId, TaskStatus, TaskingPlan, TeamMessage,
+    TeamPresence, TeamResourceClaim, TeamWorkItem, TeamWorkItemId, TeamWorkItemStatus,
 };
 
 use crate::SERVER_NAME;
@@ -453,6 +454,10 @@ impl ControlPlaneCore {
                         "workspace_playbooks".to_owned(),
                         "normalized_exercise_evidence".to_owned(),
                         "finding_lifecycle".to_owned(),
+                        "team_presence".to_owned(),
+                        "team_work_handoff".to_owned(),
+                        "team_channels".to_owned(),
+                        "team_resource_leases".to_owned(),
                     ],
                 }))
             }
@@ -748,6 +753,300 @@ impl ControlPlaneCore {
                 )
                 .await?;
                 Ok(Response::FindingStatusSet { finding })
+            }
+            Command::SetTeamPresence(update) => {
+                update.validate()?;
+                if let Some(exercise_id) = &update.exercise_id {
+                    self.validate_exercise_links(
+                        exercise_id,
+                        update.operation_run_id.as_ref(),
+                        update.session_id.as_ref(),
+                    )
+                    .await?;
+                    if let Some(workspace_id) = &update.workspace_id {
+                        let exercise = self
+                            .projections
+                            .exercise(exercise_id)
+                            .await
+                            .expect("validated exercise exists");
+                        if &exercise.workspace_id != workspace_id {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::Conflict,
+                                "team presence workspace does not own the selected exercise",
+                            ));
+                        }
+                    }
+                }
+                let presence = TeamPresence {
+                    client: update.client,
+                    state: update.state,
+                    workspace_id: update.workspace_id,
+                    exercise_id: update.exercise_id,
+                    operation_run_id: update.operation_run_id,
+                    session_id: update.session_id,
+                    last_seen_unix_ms: now_unix_ms(),
+                };
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::TeamPresenceSet {
+                        presence: presence.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::TeamPresenceSet { presence })
+            }
+            Command::CreateTeamWorkItem(create) => {
+                create.validate()?;
+                if let Some(exercise_id) = &create.exercise_id {
+                    self.validate_exercise_links(
+                        exercise_id,
+                        create.operation_run_id.as_ref(),
+                        None,
+                    )
+                    .await?;
+                }
+                if let Some(assignee) = &create.assignee
+                    && !self
+                        .projections
+                        .team_member_exists(&create.team_id, assignee)
+                        .await
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::NotFound,
+                        format!("team member {assignee} has not announced presence"),
+                    ));
+                }
+                let now = now_unix_ms();
+                let work_item = TeamWorkItem {
+                    work_item_id: TeamWorkItemId::new(),
+                    team_id: create.team_id,
+                    exercise_id: create.exercise_id,
+                    operation_run_id: create.operation_run_id,
+                    title: create.title,
+                    objective: create.objective,
+                    assignee: create.assignee,
+                    status: TeamWorkItemStatus::Open,
+                    revision: 1,
+                    created_unix_ms: now,
+                    updated_unix_ms: now,
+                };
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::TeamWorkItemCreated {
+                        work_item: work_item.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::TeamWorkItemCreated { work_item })
+            }
+            Command::AssignTeamWorkItem {
+                work_item_id,
+                assignee,
+                expected_revision,
+            } => {
+                let mut work_item = self
+                    .team_work_item_at_revision(&work_item_id, expected_revision)
+                    .await?;
+                if let Some(assignee) = &assignee
+                    && !self
+                        .projections
+                        .team_member_exists(&work_item.team_id, assignee)
+                        .await
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::NotFound,
+                        format!("team member {assignee} has not announced presence"),
+                    ));
+                }
+                work_item.assignee = assignee;
+                work_item.revision = work_item.revision.saturating_add(1);
+                work_item.updated_unix_ms = now_unix_ms();
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::TeamWorkItemUpdated {
+                        work_item: work_item.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::TeamWorkItemUpdated { work_item })
+            }
+            Command::SetTeamWorkItemStatus {
+                work_item_id,
+                status,
+                expected_revision,
+            } => {
+                let mut work_item = self
+                    .team_work_item_at_revision(&work_item_id, expected_revision)
+                    .await?;
+                work_item.status = status;
+                work_item.revision = work_item.revision.saturating_add(1);
+                work_item.updated_unix_ms = now_unix_ms();
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::TeamWorkItemUpdated {
+                        work_item: work_item.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::TeamWorkItemUpdated { work_item })
+            }
+            Command::PostTeamMessage(post) => {
+                post.validate()?;
+                if !self
+                    .projections
+                    .team_member_exists(&post.team_id, &post.sender)
+                    .await
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::NotFound,
+                        format!("team member {} has not announced presence", post.sender),
+                    ));
+                }
+                if let Some(reply_to) = &post.reply_to {
+                    let parent =
+                        self.projections
+                            .team_message(reply_to)
+                            .await
+                            .ok_or_else(|| {
+                                ProtocolError::new(
+                                    ProtocolErrorCode::NotFound,
+                                    format!("team message {reply_to} does not exist"),
+                                )
+                            })?;
+                    if parent.team_id != post.team_id || parent.channel_id != post.channel_id {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::Conflict,
+                            "reply target belongs to a different team channel",
+                        ));
+                    }
+                }
+                let message = TeamMessage {
+                    message_id: MessageId::new(),
+                    team_id: post.team_id,
+                    channel_id: post.channel_id,
+                    sender: post.sender,
+                    body: post.body,
+                    reply_to: post.reply_to,
+                    sent_unix_ms: now_unix_ms(),
+                };
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::TeamMessagePosted {
+                        message: message.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::TeamMessagePosted { message })
+            }
+            Command::ClaimTeamResource(request) => {
+                request.validate()?;
+                if !self
+                    .projections
+                    .team_member_exists(&request.team_id, &request.owner)
+                    .await
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::NotFound,
+                        format!("team member {} has not announced presence", request.owner),
+                    ));
+                }
+                let now = now_unix_ms();
+                let claim = if let Some(mut claim) = self
+                    .projections
+                    .active_team_resource_claim(&request.team_id, &request.resource_key, now)
+                    .await
+                {
+                    if claim.owner != request.owner {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::Conflict,
+                            format!(
+                                "resource {} is claimed by {} until {}",
+                                request.resource_key, claim.owner, claim.expires_unix_ms
+                            ),
+                        ));
+                    }
+                    claim.revision = claim.revision.saturating_add(1);
+                    claim.expires_unix_ms = now.saturating_add(u64::from(request.lease_ms));
+                    claim
+                } else {
+                    TeamResourceClaim {
+                        claim_id: ResourceClaimId::new(),
+                        team_id: request.team_id,
+                        owner: request.owner,
+                        resource_key: request.resource_key,
+                        revision: 1,
+                        claimed_unix_ms: now,
+                        expires_unix_ms: now.saturating_add(u64::from(request.lease_ms)),
+                        released_unix_ms: None,
+                    }
+                };
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::TeamResourceClaimed {
+                        claim: claim.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::TeamResourceClaimed { claim })
+            }
+            Command::ReleaseTeamResource {
+                claim_id,
+                owner,
+                expected_revision,
+            } => {
+                let mut claim = self
+                    .projections
+                    .team_resource_claim(&claim_id)
+                    .await
+                    .ok_or_else(|| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::NotFound,
+                            format!("team resource claim {claim_id} does not exist"),
+                        )
+                    })?;
+                if claim.owner != owner {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::Conflict,
+                        "team resource claim belongs to a different owner",
+                    ));
+                }
+                if claim.revision != expected_revision {
+                    return Err(revision_conflict(
+                        "team resource claim",
+                        expected_revision,
+                        claim.revision,
+                    ));
+                }
+                if claim.released_unix_ms.is_some() {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::Conflict,
+                        "team resource claim is already released",
+                    ));
+                }
+                claim.revision = claim.revision.saturating_add(1);
+                claim.released_unix_ms = Some(now_unix_ms());
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::TeamResourceReleased {
+                        claim: claim.clone(),
+                    },
+                )
+                .await?;
+                Ok(Response::TeamResourceReleased { claim })
             }
             Command::SubmitIngress(ingress) => {
                 ingress.validate()?;
@@ -1174,6 +1473,31 @@ impl ControlPlaneCore {
                 Ok(Response::Ack)
             }
         }
+    }
+
+    async fn team_work_item_at_revision(
+        &self,
+        work_item_id: &TeamWorkItemId,
+        expected_revision: u64,
+    ) -> Result<TeamWorkItem, ProtocolError> {
+        let work_item = self
+            .projections
+            .team_work_item(work_item_id)
+            .await
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::NotFound,
+                    format!("team work item {work_item_id} does not exist"),
+                )
+            })?;
+        if work_item.revision != expected_revision {
+            return Err(revision_conflict(
+                "team work item",
+                expected_revision,
+                work_item.revision,
+            ));
+        }
+        Ok(work_item)
     }
 
     async fn validate_exercise_links(
@@ -2047,6 +2371,13 @@ fn internal_error(error: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::Internal, error.to_string())
 }
 
+fn revision_conflict(resource: &str, expected: u64, actual: u64) -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::Conflict,
+        format!("{resource} revision conflict: expected {expected}, current {actual}"),
+    )
+}
+
 fn scheduled_request_id(
     engagement_id: &EngagementId,
     revision: u32,
@@ -2106,12 +2437,14 @@ mod tests {
 
     use xai_grok_protocol::{
         ArtifactContract, CancellationSemantics, CapabilityManifest, CapabilityRequirement,
-        Command, CommandEnvelope, CommandId, ConcurrencyProfile, CreateExercise, CreateFinding,
-        CreateOperationRun, CreateOperatorSession, CreatePlaybook, ExecutionMode, ExecutionTask,
+        ChannelId, ClaimTeamResource, ClientId, Command, CommandEnvelope, CommandId,
+        ConcurrencyProfile, CreateExercise, CreateFinding, CreateOperationRun,
+        CreateOperatorSession, CreatePlaybook, CreateTeamWorkItem, ExecutionMode, ExecutionTask,
         FindingSeverity, FindingStatus, IngressEnvelope, IngressSource, OperationDescriptor,
-        OperatorCatalog, PlaybookStep, ProjectionQuery, ProviderKind, RecordExerciseEvidence,
-        RecoverySemantics, RequestId, ScopeTarget, TargetId, TargetKind, TaskId, VersionRange,
-        WorkspaceId,
+        OperatorCatalog, PlaybookStep, PostTeamMessage, ProjectionQuery, ProviderKind,
+        RecordExerciseEvidence, RecoverySemantics, RequestId, ScopeTarget, SetTeamPresence,
+        TargetId, TargetKind, TaskId, TeamClient, TeamId, TeamPresenceState, TeamWorkItemStatus,
+        VersionRange, WorkspaceId,
     };
 
     use super::*;
@@ -2386,6 +2719,193 @@ mod tests {
             record.operation_runs[0].playbook_id,
             Some(playbook.playbook_id)
         );
+        handle.shutdown_token().cancel();
+        reopened.wait().await;
+    }
+
+    #[tokio::test]
+    async fn team_handoffs_messages_and_resource_leases_are_coordinated_and_durable() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().to_path_buf();
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(&state_path))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        let team_id = TeamId::from_string("team-red");
+        let alice = ClientId::from_string("alice");
+        let bob = ClientId::from_string("bob");
+        for (client_id, display_name) in [(&alice, "Alice"), (&bob, "Bob")] {
+            let Response::TeamPresenceSet { .. } = handle
+                .submit(envelope(Command::SetTeamPresence(SetTeamPresence {
+                    client: TeamClient {
+                        team_id: team_id.clone(),
+                        client_id: client_id.clone(),
+                        display_name: Some(display_name.to_owned()),
+                    },
+                    state: TeamPresenceState::Online,
+                    workspace_id: None,
+                    exercise_id: None,
+                    operation_run_id: None,
+                    session_id: None,
+                })))
+                .await
+                .unwrap()
+                .response
+                .unwrap()
+            else {
+                panic!("expected presence response");
+            };
+        }
+        let Response::TeamWorkItemCreated { work_item } = handle
+            .submit(envelope(Command::CreateTeamWorkItem(CreateTeamWorkItem {
+                team_id: team_id.clone(),
+                exercise_id: None,
+                operation_run_id: None,
+                title: "Enumerate web surface".to_owned(),
+                objective: "Collect HTTP endpoints and banners".to_owned(),
+                assignee: Some(alice.clone()),
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected work item");
+        };
+        let Response::TeamWorkItemUpdated { work_item } = handle
+            .submit(envelope(Command::AssignTeamWorkItem {
+                work_item_id: work_item.work_item_id.clone(),
+                assignee: Some(bob.clone()),
+                expected_revision: 1,
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected work item handoff");
+        };
+        assert_eq!(work_item.assignee.as_ref(), Some(&bob));
+        let stale = handle
+            .submit(envelope(Command::SetTeamWorkItemStatus {
+                work_item_id: work_item.work_item_id.clone(),
+                status: TeamWorkItemStatus::InProgress,
+                expected_revision: 1,
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap_err();
+        assert_eq!(stale.code, ProtocolErrorCode::Conflict);
+        let Response::TeamWorkItemUpdated { work_item: _ } = handle
+            .submit(envelope(Command::SetTeamWorkItemStatus {
+                work_item_id: work_item.work_item_id.clone(),
+                status: TeamWorkItemStatus::InProgress,
+                expected_revision: 2,
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected work item status update");
+        };
+        let channel_id = ChannelId::from_string("channel-ops");
+        let Response::TeamMessagePosted { message } = handle
+            .submit(envelope(Command::PostTeamMessage(PostTeamMessage {
+                team_id: team_id.clone(),
+                channel_id: channel_id.clone(),
+                sender: alice.clone(),
+                body: "Handing web enumeration to Bob".to_owned(),
+                reply_to: None,
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected team message");
+        };
+        let Response::TeamMessagePosted { .. } = handle
+            .submit(envelope(Command::PostTeamMessage(PostTeamMessage {
+                team_id: team_id.clone(),
+                channel_id,
+                sender: bob.clone(),
+                body: "Accepted; starting now".to_owned(),
+                reply_to: Some(message.message_id),
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected team reply");
+        };
+        let Response::TeamResourceClaimed { claim } = handle
+            .submit(envelope(Command::ClaimTeamResource(ClaimTeamResource {
+                team_id: team_id.clone(),
+                owner: alice.clone(),
+                resource_key: "target:10.10.4.8".to_owned(),
+                lease_ms: 60_000,
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected team claim");
+        };
+        let conflict = handle
+            .submit(envelope(Command::ClaimTeamResource(ClaimTeamResource {
+                team_id: team_id.clone(),
+                owner: bob,
+                resource_key: "target:10.10.4.8".to_owned(),
+                lease_ms: 60_000,
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap_err();
+        assert_eq!(conflict.code, ProtocolErrorCode::Conflict);
+        let Response::TeamResourceReleased { claim } = handle
+            .submit(envelope(Command::ReleaseTeamResource {
+                claim_id: claim.claim_id,
+                owner: alice,
+                expected_revision: claim.revision,
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected team resource release");
+        };
+        assert!(claim.released_unix_ms.is_some());
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+
+        let reopened = ControlPlane::open(ControlPlaneConfig::new(&state_path))
+            .await
+            .unwrap();
+        let handle = reopened.handle();
+        let Response::Projection(snapshot) = handle
+            .submit(envelope(Command::QueryProjection(ProjectionQuery::Team {
+                team_id,
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+        else {
+            panic!("expected team projection");
+        };
+        let team: xai_grok_protocol::TeamProjection =
+            serde_json::from_value(snapshot.value).unwrap();
+        assert_eq!(team.presence.len(), 2);
+        assert_eq!(team.work_items[0].revision, 3);
+        assert_eq!(team.work_items[0].status, TeamWorkItemStatus::InProgress);
+        assert_eq!(team.messages.len(), 2);
+        assert!(team.resource_claims[0].released_unix_ms.is_some());
         handle.shutdown_token().cancel();
         reopened.wait().await;
     }

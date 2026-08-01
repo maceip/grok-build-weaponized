@@ -33,9 +33,10 @@ pub use exercise::{
     ScopeTarget, TargetKind, parse_scope_targets,
 };
 pub use ids::{
-    ArtifactId, ClientId, CommandId, EngagementId, EventId, EvidenceId, ExerciseId, FindingId,
-    OperationId, OperationRunId, OperatorSessionId, PlaybookId, ProfileId, ProviderId, RequestId,
-    ServiceId, TargetId, TaskId, TeamId, TurnId, WorkspaceId,
+    ArtifactId, ChannelId, ClientId, CommandId, EngagementId, EventId, EvidenceId, ExerciseId,
+    FindingId, MessageId, OperationId, OperationRunId, OperatorSessionId, PlaybookId, ProfileId,
+    ProviderId, RequestId, ResourceClaimId, ServiceId, TargetId, TaskId, TeamId, TeamWorkItemId,
+    TurnId, WorkspaceId,
 };
 pub use ingress::{BuzzIngress, IngressEnvelope, IngressSource, QmIngress};
 pub use profile::{
@@ -47,4 +48,8 @@ pub use tasking::{
     CapabilityRequirement, CompletionDecision, CompletionTest, EvidenceObservation, ExecutionMode,
     ExecutionTask, ProviderDispatch, TaskStatus, TaskingPlan,
 };
-pub use team::{EventBatch, EventReadRequest, MAX_EVENT_BATCH, MAX_EVENT_WAIT_MS, TeamClient};
+pub use team::{
+    ClaimTeamResource, CreateTeamWorkItem, EventBatch, EventReadRequest, MAX_EVENT_BATCH,
+    MAX_EVENT_WAIT_MS, PostTeamMessage, SetTeamPresence, TeamClient, TeamMessage, TeamPresence,
+    TeamPresenceState, TeamProjection, TeamResourceClaim, TeamWorkItem, TeamWorkItemStatus,
+};

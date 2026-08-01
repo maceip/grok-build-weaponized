@@ -15,7 +15,8 @@ use xai_grok_protocol::{
     ArtifactId, ClientId, Command, CommandId, CreateExercise, CreateOperationRun,
     CreateOperatorSession, EngagementId, EventEnvelope, EventReadRequest, ExerciseId,
     IngressEnvelope, IngressSource, OperationRunId, OperatorCatalog, OperatorSessionId,
-    ProjectionQuery, Response, ScopeTarget, TaskId, TeamClient, TeamId, WorkspaceId,
+    ProjectionQuery, Response, ScopeTarget, SetTeamPresence, TaskId, TeamClient, TeamId,
+    TeamPresenceState, TeamProjection, WorkspaceId,
 };
 
 pub const MAX_VISIBLE_EVENTS: usize = 2_000;
@@ -68,6 +69,7 @@ pub struct OperatorState {
     pub selection: OperatorSelection,
     pub capacity: serde_json::Value,
     pub providers: serde_json::Value,
+    pub team: TeamProjection,
     pub events: VecDeque<EventEnvelope>,
     pub outputs: VecDeque<OperatorOutput>,
     pub notice: String,
@@ -92,6 +94,10 @@ impl Default for OperatorState {
             selection: OperatorSelection::default(),
             capacity: serde_json::Value::Null,
             providers: serde_json::Value::Null,
+            team: TeamProjection {
+                team_id: TeamId::from_string("local-team"),
+                ..TeamProjection::default()
+            },
             events: VecDeque::new(),
             outputs: VecDeque::new(),
             notice: "idle".to_owned(),
@@ -223,6 +229,7 @@ impl OperatorState {
             }
             OperatorUpdate::Capacity(capacity) => self.capacity = capacity,
             OperatorUpdate::Providers(providers) => self.providers = providers,
+            OperatorUpdate::Team(team) => self.team = team,
             OperatorUpdate::Output(output) => {
                 self.outputs.push_back(output);
                 while self.outputs.len() > MAX_VISIBLE_OUTPUTS {
@@ -275,8 +282,69 @@ impl OperatorState {
                     self.catalog.playbooks.push(playbook.clone());
                 }
             }
+            xai_grok_protocol::Event::TeamPresenceSet { presence } => {
+                if let Some(known) = self.state_team_presence_mut(presence) {
+                    *known = presence.clone();
+                } else if presence.client.team_id == self.team.team_id {
+                    self.team.presence.push(presence.clone());
+                }
+            }
+            xai_grok_protocol::Event::TeamWorkItemCreated { work_item }
+            | xai_grok_protocol::Event::TeamWorkItemUpdated { work_item } => {
+                if work_item.team_id == self.team.team_id {
+                    if let Some(known) = self
+                        .team
+                        .work_items
+                        .iter_mut()
+                        .find(|known| known.work_item_id == work_item.work_item_id)
+                    {
+                        *known = work_item.clone();
+                    } else {
+                        self.team.work_items.push(work_item.clone());
+                    }
+                }
+            }
+            xai_grok_protocol::Event::TeamMessagePosted { message } => {
+                if message.team_id == self.team.team_id
+                    && !self
+                        .team
+                        .messages
+                        .iter()
+                        .any(|known| known.message_id == message.message_id)
+                {
+                    self.team.messages.push(message.clone());
+                    if self.team.messages.len() > 500 {
+                        self.team.messages.remove(0);
+                    }
+                }
+            }
+            xai_grok_protocol::Event::TeamResourceClaimed { claim }
+            | xai_grok_protocol::Event::TeamResourceReleased { claim } => {
+                if claim.team_id == self.team.team_id {
+                    if let Some(known) = self
+                        .team
+                        .resource_claims
+                        .iter_mut()
+                        .find(|known| known.claim_id == claim.claim_id)
+                    {
+                        *known = claim.clone();
+                    } else {
+                        self.team.resource_claims.push(claim.clone());
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    fn state_team_presence_mut(
+        &mut self,
+        presence: &xai_grok_protocol::TeamPresence,
+    ) -> Option<&mut xai_grok_protocol::TeamPresence> {
+        self.team.presence.iter_mut().find(|known| {
+            known.client.team_id == presence.client.team_id
+                && known.client.client_id == presence.client.client_id
+        })
     }
 
     fn reconcile_selection(&mut self) {
@@ -432,6 +500,7 @@ pub enum OperatorUpdate {
     },
     Capacity(serde_json::Value),
     Providers(serde_json::Value),
+    Team(TeamProjection),
     Output(OperatorOutput),
     Notice(String),
 }
@@ -496,24 +565,65 @@ async fn client_loop(
         {
             return;
         }
-        if refresh(&control, &updates, config.workspace_filter.clone())
-            .await
-            .is_err()
+        let team_client = TeamClient {
+            team_id: config.team_id.clone(),
+            client_id: config.client_id.clone(),
+            display_name: config.display_name.clone(),
+        };
+        if let Err(error) = set_presence(
+            &control,
+            team_client.clone(),
+            TeamPresenceState::Online,
+            config.workspace_filter.clone(),
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            let _ = updates.send(OperatorUpdate::Notice(format!(
+                "failed to publish team presence: {error}"
+            )));
+        }
+        if refresh(
+            &control,
+            &updates,
+            config.workspace_filter.clone(),
+            config.team_id.clone(),
+        )
+        .await
+        .is_err()
         {
             continue;
         }
         let mut next_projection = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut next_presence = tokio::time::Instant::now() + Duration::from_secs(10);
         'connected: loop {
             if stop.load(Ordering::Acquire) {
+                let _ = set_presence(
+                    &control,
+                    team_client.clone(),
+                    TeamPresenceState::Offline,
+                    config.workspace_filter.clone(),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
                 return;
             }
             while let Ok(command) = commands.try_recv() {
-                match submit(&control, command, config.source).await {
+                match submit(&control, command, config.source, team_client.clone()).await {
                     Ok(notice) => {
                         let _ = updates.send(OperatorUpdate::Notice(notice));
-                        if refresh(&control, &updates, config.workspace_filter.clone())
-                            .await
-                            .is_err()
+                        if refresh(
+                            &control,
+                            &updates,
+                            config.workspace_filter.clone(),
+                            config.team_id.clone(),
+                        )
+                        .await
+                        .is_err()
                         {
                             break 'connected;
                         }
@@ -586,14 +696,36 @@ async fn client_loop(
                 }
             }
             if tokio::time::Instant::now() >= next_projection {
-                if let Err(error) =
-                    refresh(&control, &updates, config.workspace_filter.clone()).await
+                if let Err(error) = refresh(
+                    &control,
+                    &updates,
+                    config.workspace_filter.clone(),
+                    config.team_id.clone(),
+                )
+                .await
                 {
                     let _ =
                         updates.send(OperatorUpdate::Connection(format!("reconnecting: {error}")));
                     break;
                 }
                 next_projection = tokio::time::Instant::now() + Duration::from_secs(2);
+            }
+            if tokio::time::Instant::now() >= next_presence {
+                if set_presence(
+                    &control,
+                    team_client.clone(),
+                    TeamPresenceState::Online,
+                    config.workspace_filter.clone(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+                next_presence = tokio::time::Instant::now() + Duration::from_secs(10);
             }
         }
     }
@@ -648,7 +780,27 @@ async fn submit(
     control: &ControlPlaneClient,
     command: OperatorCommand,
     source: IngressSource,
+    team_client: TeamClient,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    if let OperatorCommand::SubmitTurn {
+        workspace_id,
+        exercise_id,
+        operation_run_id,
+        session_id,
+        ..
+    } = &command
+    {
+        set_presence(
+            control,
+            team_client,
+            TeamPresenceState::Online,
+            Some(workspace_id.clone()),
+            Some(exercise_id.clone()),
+            operation_run_id.clone(),
+            Some(session_id.clone()),
+        )
+        .await?;
+    }
     let response = control
         .send(command.into_protocol(source), Duration::from_secs(10))
         .await?;
@@ -670,10 +822,40 @@ async fn submit(
     Ok(notice)
 }
 
+async fn set_presence(
+    control: &ControlPlaneClient,
+    client: TeamClient,
+    state: TeamPresenceState,
+    workspace_id: Option<WorkspaceId>,
+    exercise_id: Option<ExerciseId>,
+    operation_run_id: Option<OperationRunId>,
+    session_id: Option<OperatorSessionId>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = control
+        .send(
+            Command::SetTeamPresence(SetTeamPresence {
+                client,
+                state,
+                workspace_id,
+                exercise_id,
+                operation_run_id,
+                session_id,
+            }),
+            Duration::from_secs(2),
+        )
+        .await?;
+    if matches!(response, Response::TeamPresenceSet { .. }) {
+        Ok(())
+    } else {
+        Err("daemon returned an unexpected team presence response".into())
+    }
+}
+
 async fn refresh(
     control: &ControlPlaneClient,
     updates: &mpsc::SyncSender<OperatorUpdate>,
     workspace_filter: Option<WorkspaceId>,
+    team_id: TeamId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let catalog = control
         .send(
@@ -695,6 +877,12 @@ async fn refresh(
             Duration::from_secs(2),
         )
         .await?;
+    let team = control
+        .send(
+            Command::QueryProjection(ProjectionQuery::Team { team_id }),
+            Duration::from_secs(2),
+        )
+        .await?;
     if let Response::Projection(snapshot) = catalog {
         updates.send(OperatorUpdate::Catalog(serde_json::from_value(
             snapshot.value,
@@ -705,6 +893,11 @@ async fn refresh(
     }
     if let Response::Projection(snapshot) = providers {
         updates.send(OperatorUpdate::Providers(snapshot.value))?;
+    }
+    if let Response::Projection(snapshot) = team {
+        updates.send(OperatorUpdate::Team(serde_json::from_value(
+            snapshot.value,
+        )?))?;
     }
     Ok(())
 }
@@ -718,6 +911,12 @@ pub fn event_name(event: &EventEnvelope) -> &'static str {
         xai_grok_protocol::Event::EvidenceRecorded { .. } => "evidence recorded",
         xai_grok_protocol::Event::FindingCreated { .. } => "finding created",
         xai_grok_protocol::Event::FindingStatusSet { .. } => "finding status set",
+        xai_grok_protocol::Event::TeamPresenceSet { .. } => "team presence",
+        xai_grok_protocol::Event::TeamWorkItemCreated { .. } => "team work created",
+        xai_grok_protocol::Event::TeamWorkItemUpdated { .. } => "team work updated",
+        xai_grok_protocol::Event::TeamMessagePosted { .. } => "team message",
+        xai_grok_protocol::Event::TeamResourceClaimed { .. } => "team resource claimed",
+        xai_grok_protocol::Event::TeamResourceReleased { .. } => "team resource released",
         xai_grok_protocol::Event::EngagementAccepted { .. } => "turn accepted",
         xai_grok_protocol::Event::PlanAccepted { .. } => "plan accepted",
         xai_grok_protocol::Event::TaskStatus { .. } => "task status",
@@ -774,6 +973,30 @@ pub fn event_summary(event: &EventEnvelope) -> String {
             "finding {} [{:?}/{:?}]: {}",
             finding.finding_id, finding.severity, finding.status, finding.title
         ),
+        xai_grok_protocol::Event::TeamPresenceSet { presence } => format!(
+            "{} {:?}",
+            presence
+                .client
+                .display_name
+                .as_deref()
+                .unwrap_or(presence.client.client_id.as_str()),
+            presence.state
+        ),
+        xai_grok_protocol::Event::TeamWorkItemCreated { work_item }
+        | xai_grok_protocol::Event::TeamWorkItemUpdated { work_item } => format!(
+            "team work {} {:?}: {}",
+            work_item.work_item_id, work_item.status, work_item.title
+        ),
+        xai_grok_protocol::Event::TeamMessagePosted { message } => format!(
+            "{} in {}: {}",
+            message.sender, message.channel_id, message.body
+        ),
+        xai_grok_protocol::Event::TeamResourceClaimed { claim } => {
+            format!("{} claimed {}", claim.owner, claim.resource_key)
+        }
+        xai_grok_protocol::Event::TeamResourceReleased { claim } => {
+            format!("{} released {}", claim.owner, claim.resource_key)
+        }
         _ => event_name(event).to_owned(),
     }
 }

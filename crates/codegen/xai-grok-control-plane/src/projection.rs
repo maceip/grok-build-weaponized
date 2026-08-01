@@ -3,9 +3,11 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use xai_grok_protocol::{
     ArtifactId, ClientId, EngagementId, Event, EventEnvelope, EvidenceId, Exercise,
-    ExerciseEvidence, ExerciseId, ExerciseRecord, Finding, FindingId, OperationRun, OperationRunId,
-    OperatorCatalog, OperatorSession, OperatorSessionId, Playbook, PlaybookId, ProjectionQuery,
-    ProjectionSnapshot, ProviderId, ServiceHealth, ServiceId, TaskId, TaskStatus, TeamId,
+    ExerciseEvidence, ExerciseId, ExerciseRecord, Finding, FindingId, MessageId, OperationRun,
+    OperationRunId, OperatorCatalog, OperatorSession, OperatorSessionId, Playbook, PlaybookId,
+    ProjectionQuery, ProjectionSnapshot, ProviderId, ResourceClaimId, ServiceHealth, ServiceId,
+    TaskId, TaskStatus, TeamId, TeamMessage, TeamPresence, TeamProjection, TeamResourceClaim,
+    TeamWorkItem, TeamWorkItemId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -63,6 +65,10 @@ struct ProjectionState {
     playbooks: HashMap<PlaybookId, Playbook>,
     evidence: HashMap<EvidenceId, ExerciseEvidence>,
     findings: HashMap<FindingId, Finding>,
+    team_presence: HashMap<(TeamId, ClientId), TeamPresence>,
+    team_work_items: HashMap<TeamWorkItemId, TeamWorkItem>,
+    team_messages: HashMap<MessageId, TeamMessage>,
+    team_resource_claims: HashMap<ResourceClaimId, TeamResourceClaim>,
     providers: HashMap<ProviderId, ProviderProjection>,
     overloads: HashMap<String, (u32, u32)>,
 }
@@ -122,6 +128,30 @@ impl ProjectionStore {
                 state
                     .findings
                     .insert(finding.finding_id.clone(), finding.clone());
+            }
+            Event::TeamPresenceSet { presence } => {
+                state.team_presence.insert(
+                    (
+                        presence.client.team_id.clone(),
+                        presence.client.client_id.clone(),
+                    ),
+                    presence.clone(),
+                );
+            }
+            Event::TeamWorkItemCreated { work_item } | Event::TeamWorkItemUpdated { work_item } => {
+                state
+                    .team_work_items
+                    .insert(work_item.work_item_id.clone(), work_item.clone());
+            }
+            Event::TeamMessagePosted { message } => {
+                state
+                    .team_messages
+                    .insert(message.message_id.clone(), message.clone());
+            }
+            Event::TeamResourceClaimed { claim } | Event::TeamResourceReleased { claim } => {
+                state
+                    .team_resource_claims
+                    .insert(claim.claim_id.clone(), claim.clone());
             }
             Event::EngagementAccepted {
                 workspace_id,
@@ -353,6 +383,47 @@ impl ProjectionStore {
                 });
                 serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
             }
+            ProjectionQuery::Team { team_id } => {
+                let mut presence = state
+                    .team_presence
+                    .values()
+                    .filter(|presence| presence.client.team_id == team_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                presence.sort_by(|left, right| left.client.client_id.cmp(&right.client.client_id));
+                let mut work_items = state
+                    .team_work_items
+                    .values()
+                    .filter(|work_item| work_item.team_id == team_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                work_items.sort_by_key(|work_item| work_item.created_unix_ms);
+                let mut messages = state
+                    .team_messages
+                    .values()
+                    .filter(|message| message.team_id == team_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                messages.sort_by_key(|message| message.sent_unix_ms);
+                if messages.len() > 500 {
+                    messages.drain(..messages.len() - 500);
+                }
+                let mut resource_claims = state
+                    .team_resource_claims
+                    .values()
+                    .filter(|claim| claim.team_id == team_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                resource_claims.sort_by_key(|claim| claim.claimed_unix_ms);
+                serde_json::to_value(TeamProjection {
+                    team_id,
+                    presence,
+                    work_items,
+                    messages,
+                    resource_claims,
+                })
+                .unwrap_or(serde_json::Value::Null)
+            }
             ProjectionQuery::Providers => {
                 let mut providers = state.providers.values().cloned().collect::<Vec<_>>();
                 providers.sort_by(|left, right| left.provider_id.cmp(&right.provider_id));
@@ -390,6 +461,64 @@ impl ProjectionStore {
 
     pub async fn finding(&self, finding_id: &FindingId) -> Option<Finding> {
         self.state.read().await.findings.get(finding_id).cloned()
+    }
+
+    pub async fn team_member_exists(&self, team_id: &TeamId, client_id: &ClientId) -> bool {
+        self.state
+            .read()
+            .await
+            .team_presence
+            .contains_key(&(team_id.clone(), client_id.clone()))
+    }
+
+    pub async fn team_work_item(&self, work_item_id: &TeamWorkItemId) -> Option<TeamWorkItem> {
+        self.state
+            .read()
+            .await
+            .team_work_items
+            .get(work_item_id)
+            .cloned()
+    }
+
+    pub async fn team_message(&self, message_id: &MessageId) -> Option<TeamMessage> {
+        self.state
+            .read()
+            .await
+            .team_messages
+            .get(message_id)
+            .cloned()
+    }
+
+    pub async fn team_resource_claim(
+        &self,
+        claim_id: &ResourceClaimId,
+    ) -> Option<TeamResourceClaim> {
+        self.state
+            .read()
+            .await
+            .team_resource_claims
+            .get(claim_id)
+            .cloned()
+    }
+
+    pub async fn active_team_resource_claim(
+        &self,
+        team_id: &TeamId,
+        resource_key: &str,
+        now_unix_ms: u64,
+    ) -> Option<TeamResourceClaim> {
+        self.state
+            .read()
+            .await
+            .team_resource_claims
+            .values()
+            .find(|claim| {
+                &claim.team_id == team_id
+                    && claim.resource_key == resource_key
+                    && claim.released_unix_ms.is_none()
+                    && claim.expires_unix_ms > now_unix_ms
+            })
+            .cloned()
     }
 
     pub async fn task_belongs_to_exercise(

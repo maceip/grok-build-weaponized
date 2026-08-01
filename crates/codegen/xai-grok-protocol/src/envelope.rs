@@ -1,17 +1,20 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CapabilityManifest, CommandId, CreateExercise, CreateFinding, CreateOperationRun,
-    CreateOperatorSession, CreatePlaybook, EngagementId, EventBatch, EventId, EventReadRequest,
-    ExecutionReceipt, Exercise, ExerciseEvidence, ExerciseId, Finding, FindingId, FindingStatus,
-    IngressEnvelope, OperationRun, OperationRunId, OperatorSession, OperatorSessionId, Playbook,
-    ProtocolError, ProviderDispatch, ProviderId, RecordExerciseEvidence, RequestId, ServiceHealth,
-    ServiceId, TaskId, TaskingPlan, TeamClient, WorkspaceId,
+    CapabilityManifest, ClaimTeamResource, ClientId, CommandId, CreateExercise, CreateFinding,
+    CreateOperationRun, CreateOperatorSession, CreatePlaybook, CreateTeamWorkItem, EngagementId,
+    EventBatch, EventId, EventReadRequest, ExecutionReceipt, Exercise, ExerciseEvidence,
+    ExerciseId, Finding, FindingId, FindingStatus, IngressEnvelope, OperationRun, OperationRunId,
+    OperatorSession, OperatorSessionId, Playbook, PostTeamMessage, ProtocolError, ProviderDispatch,
+    ProviderId, RecordExerciseEvidence, RequestId, ResourceClaimId, ServiceHealth, ServiceId,
+    SetTeamPresence, TaskId, TaskingPlan, TeamClient, TeamId, TeamMessage, TeamPresence,
+    TeamResourceClaim, TeamWorkItem, TeamWorkItemId, TeamWorkItemStatus, WorkspaceId,
 };
 
-/// Protocol v5 adds durable playbook, evidence, and finding operations. It is
+/// Protocol v6 adds durable team presence, work, messaging, handoff, and
+/// resource-coordination operations. It is
 /// not wire-compatible with older clients.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +48,25 @@ pub enum Command {
     SetFindingStatus {
         finding_id: FindingId,
         status: FindingStatus,
+    },
+    SetTeamPresence(SetTeamPresence),
+    CreateTeamWorkItem(CreateTeamWorkItem),
+    AssignTeamWorkItem {
+        work_item_id: TeamWorkItemId,
+        assignee: Option<ClientId>,
+        expected_revision: u64,
+    },
+    SetTeamWorkItemStatus {
+        work_item_id: TeamWorkItemId,
+        status: TeamWorkItemStatus,
+        expected_revision: u64,
+    },
+    PostTeamMessage(PostTeamMessage),
+    ClaimTeamResource(ClaimTeamResource),
+    ReleaseTeamResource {
+        claim_id: ResourceClaimId,
+        owner: ClientId,
+        expected_revision: u64,
     },
     SubmitIngress(IngressEnvelope),
     SubmitPlan(TaskingPlan),
@@ -135,6 +157,24 @@ pub enum Response {
     FindingStatusSet {
         finding: Finding,
     },
+    TeamPresenceSet {
+        presence: TeamPresence,
+    },
+    TeamWorkItemCreated {
+        work_item: TeamWorkItem,
+    },
+    TeamWorkItemUpdated {
+        work_item: TeamWorkItem,
+    },
+    TeamMessagePosted {
+        message: TeamMessage,
+    },
+    TeamResourceClaimed {
+        claim: TeamResourceClaim,
+    },
+    TeamResourceReleased {
+        claim: TeamResourceClaim,
+    },
     PlanAccepted {
         engagement_id: EngagementId,
         revision: u32,
@@ -198,6 +238,24 @@ pub enum Event {
     },
     FindingStatusSet {
         finding: Finding,
+    },
+    TeamPresenceSet {
+        presence: TeamPresence,
+    },
+    TeamWorkItemCreated {
+        work_item: TeamWorkItem,
+    },
+    TeamWorkItemUpdated {
+        work_item: TeamWorkItem,
+    },
+    TeamMessagePosted {
+        message: TeamMessage,
+    },
+    TeamResourceClaimed {
+        claim: TeamResourceClaim,
+    },
+    TeamResourceReleased {
+        claim: TeamResourceClaim,
     },
     EngagementAccepted {
         workspace_id: String,
@@ -272,6 +330,9 @@ pub enum ProjectionQuery {
     },
     ExerciseRecord {
         exercise_id: ExerciseId,
+    },
+    Team {
+        team_id: TeamId,
     },
     Providers,
     Capacity,

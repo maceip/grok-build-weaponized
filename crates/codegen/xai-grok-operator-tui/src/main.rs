@@ -556,6 +556,60 @@ impl App {
             lines.push(Line::raw(""));
         }
         lines.push(Line::styled(
+            "TEAM",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        if self.state.team.presence.is_empty() {
+            lines.push(Line::raw("No connected team clients"));
+        }
+        for presence in &self.state.team.presence {
+            lines.push(Line::raw(format!(
+                "{} {:?}",
+                presence
+                    .client
+                    .display_name
+                    .as_deref()
+                    .unwrap_or(presence.client.client_id.as_str()),
+                presence.state
+            )));
+        }
+        for work_item in self.state.team.work_items.iter().filter(|item| {
+            self.state
+                .selection
+                .exercise_id
+                .as_ref()
+                .is_none_or(|selected| item.exercise_id.as_ref() == Some(selected))
+        }) {
+            lines.push(Line::raw(format!(
+                "{:?}: {}{}",
+                work_item.status,
+                work_item.title,
+                work_item
+                    .assignee
+                    .as_ref()
+                    .map(|assignee| format!(" -> {}", assignee.as_str()))
+                    .unwrap_or_default()
+            )));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        for claim in self
+            .state
+            .team
+            .resource_claims
+            .iter()
+            .filter(|claim| claim.released_unix_ms.is_none() && claim.expires_unix_ms > now)
+        {
+            lines.push(Line::raw(format!(
+                "claim {} by {}",
+                claim.resource_key,
+                claim.owner.as_str()
+            )));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
             "CAPACITY",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));

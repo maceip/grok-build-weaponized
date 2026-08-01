@@ -6,11 +6,13 @@ use std::time::Duration;
 
 use xai_grok_control_client::{ClientIdentity, ControlPlaneClient};
 use xai_grok_protocol::{
-    ArtifactId, ClientId, Command, CommandId, CreateExercise, CreateFinding, CreateOperationRun,
-    CreateOperatorSession, CreatePlaybook, EventReadRequest, EvidenceId, ExerciseId,
-    FindingSeverity, FindingStatus, IngressEnvelope, IngressSource, OperationRunId,
-    OperatorSessionId, PlaybookId, PlaybookStep, ProjectionQuery, RecordExerciseEvidence, Response,
-    RuntimeProfile, TargetId, TaskId, TeamClient, TeamId, WorkspaceId, parse_scope_targets,
+    ArtifactId, ChannelId, ClaimTeamResource, ClientId, Command, CommandId, CreateExercise,
+    CreateFinding, CreateOperationRun, CreateOperatorSession, CreatePlaybook, CreateTeamWorkItem,
+    EventReadRequest, EvidenceId, ExerciseId, FindingSeverity, FindingStatus, IngressEnvelope,
+    IngressSource, OperationRunId, OperatorSessionId, PlaybookId, PlaybookStep, PostTeamMessage,
+    ProjectionQuery, RecordExerciseEvidence, ResourceClaimId, Response, RuntimeProfile,
+    SetTeamPresence, TargetId, TaskId, TeamClient, TeamId, TeamPresenceState, TeamWorkItemId,
+    TeamWorkItemStatus, WorkspaceId, parse_scope_targets,
 };
 
 const USAGE: &str = "\
@@ -26,6 +28,14 @@ Commands:
   evidence record --exercise ID [--run ID] [--session ID] [--task ID] [--artifact ID] --finding TEXT --confidence 0..1 [--attribute K=V ...]
   finding create --exercise ID [--run ID] --title TEXT --summary TEXT --severity LEVEL [--evidence IDS] [--targets IDS]
   finding status ID candidate|confirmed|remediated|rejected
+  team status ID
+  team presence --team ID --client ID [--display-name NAME] [--state online|away|offline] [--workspace ID] [--exercise ID] [--run ID] [--session ID]
+  team work create --team ID [--exercise ID] [--run ID] --title TEXT --objective TEXT [--assignee CLIENT]
+  team work assign ID CLIENT|- --revision N
+  team work status ID STATUS --revision N
+  team message --team ID --channel ID --sender CLIENT --body TEXT [--reply-to ID]
+  team claim --team ID --owner CLIENT --resource KEY --lease-ms N
+  team release CLAIM_ID --owner CLIENT --revision N
   submit --workspace ID [--exercise ID] [--run ID] --session ID --request TEXT|-
   artifact read ID [--cursor N] [--limit N] [--all] [--raw]
   profile lint FILE
@@ -56,7 +66,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("GROKD_SOCKET").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(".grok/grokd.sock"));
-    let team = take_leading_option(&mut arguments, "--team")?;
+    let team_option = take_leading_option(&mut arguments, "--team")?;
     let client = take_leading_option(&mut arguments, "--client")?;
     let display_name = take_leading_option(&mut arguments, "--display-name")?;
     let command = arguments.pop_front().ok_or("missing command")?;
@@ -66,7 +76,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut identity = ClientIdentity::new("grokctl", env!("CARGO_PKG_VERSION"));
-    match (team, client) {
+    match (team_option, client) {
         (Some(team_id), Some(client_id)) => {
             identity.team = Some(TeamClient {
                 team_id: TeamId::from_string(team_id),
@@ -87,6 +97,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "session" => create_session(&control, arguments).await,
         "evidence" => record_evidence(&control, arguments).await,
         "finding" => finding(&control, arguments).await,
+        "team" => team(&control, arguments).await,
         "submit" => submit(&control, arguments).await,
         "artifact" => read_artifact(&control, arguments).await,
         _ => Err(format!("unknown command {command:?}\n{USAGE}").into()),
@@ -506,6 +517,307 @@ fn parse_finding_status(value: &str) -> Result<FindingStatus, Box<dyn std::error
         "remediated" => Ok(FindingStatus::Remediated),
         "rejected" => Ok(FindingStatus::Rejected),
         _ => Err(format!("unknown finding status {value:?}").into()),
+    }
+}
+
+async fn team(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match arguments.pop_front().as_deref() {
+        Some("status") => {
+            let team_id =
+                TeamId::from_string(arguments.pop_front().ok_or("team status requires an id")?);
+            reject_remaining(&arguments)?;
+            write_json(
+                &control
+                    .send(
+                        Command::QueryProjection(ProjectionQuery::Team { team_id }),
+                        Duration::from_secs(5),
+                    )
+                    .await?,
+            )
+        }
+        Some("presence") => team_presence(control, arguments).await,
+        Some("work") => team_work(control, arguments).await,
+        Some("message") => team_message(control, arguments).await,
+        Some("claim") => team_claim(control, arguments).await,
+        Some("release") => team_release(control, arguments).await,
+        _ => Err("team requires status, presence, work, message, claim, or release".into()),
+    }
+}
+
+async fn team_presence(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut team_id = None;
+    let mut client_id = None;
+    let mut display_name = None;
+    let mut state = TeamPresenceState::Online;
+    let mut workspace_id = None;
+    let mut exercise_id = None;
+    let mut operation_run_id = None;
+    let mut session_id = None;
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--team" => team_id = Some(value(&mut arguments, "--team")?),
+            "--client" => client_id = Some(value(&mut arguments, "--client")?),
+            "--display-name" => display_name = Some(value(&mut arguments, "--display-name")?),
+            "--state" => {
+                state = parse_presence_state(&value(&mut arguments, "--state")?)?;
+            }
+            "--workspace" => workspace_id = Some(value(&mut arguments, "--workspace")?),
+            "--exercise" => exercise_id = Some(value(&mut arguments, "--exercise")?),
+            "--run" => operation_run_id = Some(value(&mut arguments, "--run")?),
+            "--session" => session_id = Some(value(&mut arguments, "--session")?),
+            other => return Err(format!("unknown team presence option {other:?}").into()),
+        }
+    }
+    write_json(
+        &control
+            .send(
+                Command::SetTeamPresence(SetTeamPresence {
+                    client: TeamClient {
+                        team_id: TeamId::from_string(
+                            team_id.ok_or("team presence requires --team")?,
+                        ),
+                        client_id: ClientId::from_string(
+                            client_id.ok_or("team presence requires --client")?,
+                        ),
+                        display_name,
+                    },
+                    state,
+                    workspace_id: workspace_id.map(WorkspaceId::from_string),
+                    exercise_id: exercise_id.map(ExerciseId::from_string),
+                    operation_run_id: operation_run_id.map(OperationRunId::from_string),
+                    session_id: session_id.map(OperatorSessionId::from_string),
+                }),
+                Duration::from_secs(5),
+            )
+            .await?,
+    )
+}
+
+async fn team_work(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match arguments.pop_front().as_deref() {
+        Some("create") => {
+            let mut team_id = None;
+            let mut exercise_id = None;
+            let mut operation_run_id = None;
+            let mut title = None;
+            let mut objective = None;
+            let mut assignee = None;
+            while let Some(argument) = arguments.pop_front() {
+                match argument.as_str() {
+                    "--team" => team_id = Some(value(&mut arguments, "--team")?),
+                    "--exercise" => exercise_id = Some(value(&mut arguments, "--exercise")?),
+                    "--run" => operation_run_id = Some(value(&mut arguments, "--run")?),
+                    "--title" => title = Some(value(&mut arguments, "--title")?),
+                    "--objective" => objective = Some(value(&mut arguments, "--objective")?),
+                    "--assignee" => assignee = Some(value(&mut arguments, "--assignee")?),
+                    other => return Err(format!("unknown team work option {other:?}").into()),
+                }
+            }
+            write_json(
+                &control
+                    .send(
+                        Command::CreateTeamWorkItem(CreateTeamWorkItem {
+                            team_id: TeamId::from_string(
+                                team_id.ok_or("team work create requires --team")?,
+                            ),
+                            exercise_id: exercise_id.map(ExerciseId::from_string),
+                            operation_run_id: operation_run_id.map(OperationRunId::from_string),
+                            title: title.ok_or("team work create requires --title")?,
+                            objective: objective.ok_or("team work create requires --objective")?,
+                            assignee: assignee.map(ClientId::from_string),
+                        }),
+                        Duration::from_secs(5),
+                    )
+                    .await?,
+            )
+        }
+        Some("assign") => {
+            let work_item_id = TeamWorkItemId::from_string(
+                arguments
+                    .pop_front()
+                    .ok_or("team work assign requires an id")?,
+            );
+            let assignee = arguments
+                .pop_front()
+                .ok_or("team work assign requires CLIENT or -")?;
+            let expected_revision = parse_revision_option(&mut arguments)?;
+            write_json(
+                &control
+                    .send(
+                        Command::AssignTeamWorkItem {
+                            work_item_id,
+                            assignee: (assignee != "-").then(|| ClientId::from_string(assignee)),
+                            expected_revision,
+                        },
+                        Duration::from_secs(5),
+                    )
+                    .await?,
+            )
+        }
+        Some("status") => {
+            let work_item_id = TeamWorkItemId::from_string(
+                arguments
+                    .pop_front()
+                    .ok_or("team work status requires an id")?,
+            );
+            let status = parse_work_item_status(
+                &arguments
+                    .pop_front()
+                    .ok_or("team work status requires a status")?,
+            )?;
+            let expected_revision = parse_revision_option(&mut arguments)?;
+            write_json(
+                &control
+                    .send(
+                        Command::SetTeamWorkItemStatus {
+                            work_item_id,
+                            status,
+                            expected_revision,
+                        },
+                        Duration::from_secs(5),
+                    )
+                    .await?,
+            )
+        }
+        _ => Err("team work requires create, assign, or status".into()),
+    }
+}
+
+async fn team_message(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut team_id = None;
+    let mut channel_id = None;
+    let mut sender = None;
+    let mut body = None;
+    let mut reply_to = None;
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--team" => team_id = Some(value(&mut arguments, "--team")?),
+            "--channel" => channel_id = Some(value(&mut arguments, "--channel")?),
+            "--sender" => sender = Some(value(&mut arguments, "--sender")?),
+            "--body" => body = Some(value(&mut arguments, "--body")?),
+            "--reply-to" => reply_to = Some(value(&mut arguments, "--reply-to")?),
+            other => return Err(format!("unknown team message option {other:?}").into()),
+        }
+    }
+    write_json(
+        &control
+            .send(
+                Command::PostTeamMessage(PostTeamMessage {
+                    team_id: TeamId::from_string(team_id.ok_or("team message requires --team")?),
+                    channel_id: ChannelId::from_string(
+                        channel_id.ok_or("team message requires --channel")?,
+                    ),
+                    sender: ClientId::from_string(sender.ok_or("team message requires --sender")?),
+                    body: body.ok_or("team message requires --body")?,
+                    reply_to: reply_to.map(xai_grok_protocol::MessageId::from_string),
+                }),
+                Duration::from_secs(5),
+            )
+            .await?,
+    )
+}
+
+async fn team_claim(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut team_id = None;
+    let mut owner = None;
+    let mut resource_key = None;
+    let mut lease_ms = None;
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--team" => team_id = Some(value(&mut arguments, "--team")?),
+            "--owner" => owner = Some(value(&mut arguments, "--owner")?),
+            "--resource" => resource_key = Some(value(&mut arguments, "--resource")?),
+            "--lease-ms" => lease_ms = Some(value(&mut arguments, "--lease-ms")?.parse()?),
+            other => return Err(format!("unknown team claim option {other:?}").into()),
+        }
+    }
+    write_json(
+        &control
+            .send(
+                Command::ClaimTeamResource(ClaimTeamResource {
+                    team_id: TeamId::from_string(team_id.ok_or("team claim requires --team")?),
+                    owner: ClientId::from_string(owner.ok_or("team claim requires --owner")?),
+                    resource_key: resource_key.ok_or("team claim requires --resource")?,
+                    lease_ms: lease_ms.ok_or("team claim requires --lease-ms")?,
+                }),
+                Duration::from_secs(5),
+            )
+            .await?,
+    )
+}
+
+async fn team_release(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let claim_id =
+        ResourceClaimId::from_string(arguments.pop_front().ok_or("team release requires an id")?);
+    let mut owner = None;
+    let mut revision = None;
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--owner" => owner = Some(value(&mut arguments, "--owner")?),
+            "--revision" => revision = Some(value(&mut arguments, "--revision")?.parse()?),
+            other => return Err(format!("unknown team release option {other:?}").into()),
+        }
+    }
+    write_json(
+        &control
+            .send(
+                Command::ReleaseTeamResource {
+                    claim_id,
+                    owner: ClientId::from_string(owner.ok_or("team release requires --owner")?),
+                    expected_revision: revision.ok_or("team release requires --revision")?,
+                },
+                Duration::from_secs(5),
+            )
+            .await?,
+    )
+}
+
+fn parse_revision_option(
+    arguments: &mut VecDeque<String>,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    if arguments.pop_front().as_deref() != Some("--revision") {
+        return Err("operation requires --revision N".into());
+    }
+    let revision = value(arguments, "--revision")?.parse()?;
+    reject_remaining(arguments)?;
+    Ok(revision)
+}
+
+fn parse_presence_state(value: &str) -> Result<TeamPresenceState, Box<dyn std::error::Error>> {
+    match value {
+        "online" => Ok(TeamPresenceState::Online),
+        "away" => Ok(TeamPresenceState::Away),
+        "offline" => Ok(TeamPresenceState::Offline),
+        _ => Err(format!("unknown team presence state {value:?}").into()),
+    }
+}
+
+fn parse_work_item_status(value: &str) -> Result<TeamWorkItemStatus, Box<dyn std::error::Error>> {
+    match value {
+        "open" => Ok(TeamWorkItemStatus::Open),
+        "in_progress" | "in-progress" => Ok(TeamWorkItemStatus::InProgress),
+        "blocked" => Ok(TeamWorkItemStatus::Blocked),
+        "completed" => Ok(TeamWorkItemStatus::Completed),
+        "cancelled" | "canceled" => Ok(TeamWorkItemStatus::Cancelled),
+        _ => Err(format!("unknown team work item status {value:?}").into()),
     }
 }
 
