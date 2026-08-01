@@ -11,7 +11,13 @@ use xai_grok_protocol::{
 pub struct ServiceRecord {
     pub service_id: ServiceId,
     pub provider_id: ProviderId,
+    /// Control-plane fencing generation. This advances for provider-object
+    /// replacement and for restarts of the executable worker it owns.
     pub generation: u64,
+    /// Provider-reported child-process generation. Older serialized records
+    /// predate this field and represented their first worker generation.
+    #[serde(default = "default_worker_generation")]
+    pub worker_generation: u64,
     pub manifest_hash: String,
     pub manifest: CapabilityManifest,
     pub health: ServiceHealth,
@@ -46,8 +52,15 @@ impl ServiceSupervisor {
     pub async fn register(
         &self,
         manifest: CapabilityManifest,
+        worker_generation: u64,
     ) -> Result<ServiceRecord, ProtocolError> {
         manifest.validate()?;
+        if worker_generation == 0 {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidEnvelope,
+                "provider worker generation must be at least one",
+            ));
+        }
         if !manifest.protocol.supports(PROTOCOL_VERSION) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::IncompatibleVersion,
@@ -73,6 +86,7 @@ impl ServiceSupervisor {
             service_id: ServiceId::new(),
             provider_id: manifest.provider_id.clone(),
             generation,
+            worker_generation,
             manifest_hash: manifest.content_hash(),
             manifest,
             health: ServiceHealth::Starting,
@@ -84,6 +98,65 @@ impl ServiceSupervisor {
             .services
             .insert(record.provider_id.clone(), record.clone());
         Ok(record)
+    }
+
+    /// Observes the generation exported by an executable provider. A newer
+    /// worker receives a new service identity and fencing generation. A stale
+    /// observation is rejected, so delayed health checks cannot revive state
+    /// owned by a process that has already been replaced.
+    pub async fn observe_worker_generation(
+        &self,
+        provider_id: &ProviderId,
+        worker_generation: u64,
+        health: ServiceHealth,
+    ) -> Result<ServiceRecord, ProtocolError> {
+        if worker_generation == 0 {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidEnvelope,
+                "provider worker generation must be at least one",
+            ));
+        }
+        let now = now_unix_ms();
+        let mut state = self.state.write().await;
+        let record = state.services.get_mut(provider_id).ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::UnknownProvider,
+                format!("service provider {provider_id} is not registered"),
+            )
+        })?;
+        if worker_generation < record.worker_generation {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::Conflict,
+                format!(
+                    "stale worker generation {worker_generation}; active worker generation is {}",
+                    record.worker_generation
+                ),
+            ));
+        }
+        if worker_generation > record.worker_generation {
+            let generation_delta = worker_generation - record.worker_generation;
+            record.generation =
+                record
+                    .generation
+                    .checked_add(generation_delta)
+                    .ok_or_else(|| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::Conflict,
+                            format!("service generation exhausted for provider {provider_id}"),
+                        )
+                    })?;
+            record.worker_generation = worker_generation;
+            record.service_id = ServiceId::new();
+            record.registered_unix_ms = now;
+            record.restart_count = record.generation.saturating_sub(1);
+        }
+        record.health = health;
+        record.last_heartbeat_unix_ms = now;
+        let updated = record.clone();
+        state
+            .generations
+            .insert(provider_id.clone(), updated.generation);
+        Ok(updated)
     }
 
     pub async fn heartbeat(
@@ -186,6 +259,10 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+const fn default_worker_generation() -> u64 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -229,13 +306,38 @@ mod tests {
     #[tokio::test]
     async fn stale_generation_cannot_heartbeat() {
         let supervisor = ServiceSupervisor::new(1_000);
-        let first = supervisor.register(manifest()).await.unwrap();
-        let second = supervisor.register(manifest()).await.unwrap();
+        let first = supervisor.register(manifest(), 1).await.unwrap();
+        let second = supervisor.register(manifest(), 1).await.unwrap();
         assert!(second.generation > first.generation);
         let error = supervisor
             .heartbeat(&first.provider_id, first.generation, ServiceHealth::Ready)
             .await
             .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::Conflict);
+    }
+
+    #[tokio::test]
+    async fn worker_restart_rotates_service_identity_and_fences_stale_observations() {
+        let supervisor = ServiceSupervisor::new(1_000);
+        let first = supervisor.register(manifest(), 1).await.unwrap();
+        let second = supervisor
+            .observe_worker_generation(&first.provider_id, 2, ServiceHealth::Ready)
+            .await
+            .unwrap();
+        assert_eq!(second.worker_generation, 2);
+        assert_eq!(second.generation, first.generation + 1);
+        assert_ne!(second.service_id, first.service_id);
+        assert_eq!(second.restart_count, first.restart_count + 1);
+
+        let error = supervisor
+            .observe_worker_generation(&first.provider_id, 1, ServiceHealth::Ready)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::Conflict);
+        assert_eq!(
+            supervisor.get(&first.provider_id).await.unwrap(),
+            second,
+            "a stale observation must not alter the active record"
+        );
     }
 }

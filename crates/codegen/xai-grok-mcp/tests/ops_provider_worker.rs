@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime};
 
 use xai_grok_control_plane::{ExecutionProvider, ProcessExecutionProvider, ProcessProviderConfig};
 use xai_grok_protocol::{
-    CapabilityRequirement, ExecutionMode, ExecutionTask, ProviderDispatch, TaskId,
+    CapabilityRequirement, ExecutionMode, ExecutionTask, ProviderDispatch, ServiceHealth, TaskId,
 };
 
 fn dispatch(operation: &str, input: serde_json::Value) -> ProviderDispatch {
@@ -90,4 +90,37 @@ async fn daemon_process_provider_executes_the_real_vulnerability_worker() {
             .unwrap()
             .contains("example_check.py")
     );
+
+    let first_generation = provider.worker_generation().await;
+    let first_pid = provider.status().await["child_pid"].as_u64().unwrap();
+    let first_pid = i32::try_from(first_pid).unwrap();
+    // SAFETY: `first_pid` was reported by the child owned by this provider,
+    // remains within pid_t range, and the test waits for it to be reaped before
+    // issuing more work. SIGKILL is intentional to exercise crash recovery.
+    assert_eq!(unsafe { libc::kill(first_pid, libc::SIGKILL) }, 0);
+
+    let failure_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if provider.health().await == ServiceHealth::Failed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < failure_deadline,
+            "provider did not observe the killed worker"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(provider.worker_generation().await, first_generation);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let result = provider
+        .execute(dispatch(
+            "vulnerability.search",
+            serde_json::json!({"query":"CVE-2026-4242","limit":1}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(result.output[0]["id"], "EDB-424242");
+    assert_eq!(provider.worker_generation().await, first_generation + 1);
+    assert!(provider.status().await["child_pid"].as_u64().is_some());
 }

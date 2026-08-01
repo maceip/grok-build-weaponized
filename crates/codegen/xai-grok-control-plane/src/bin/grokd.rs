@@ -131,10 +131,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let binary = resolve_agent_binary(arguments.agent_binary.as_ref())?;
         let runtime_worker =
             resolve_runtime_worker(arguments.local_runtime_worker.as_ref(), &binary)?;
-        let workspace = arguments
-            .agent_workspace
-            .unwrap_or(std::env::current_dir()?)
-            .canonicalize()?;
+        let workspace = dunce::canonicalize(
+            arguments
+                .agent_workspace
+                .unwrap_or(std::env::current_dir()?),
+        )?;
         let mut provider_config = AgentProviderConfig::new(binary, workspace);
         if let Some(requirement) = profile_requirement(profile.as_ref(), ProviderKind::ModelRuntime)
         {
@@ -259,13 +260,13 @@ fn native_execution_limits(profile: Option<&RuntimeProfile>) -> NativeExecutionL
         .min(profile.limits.maximum_worker_processes)
         .max(1) as usize;
     let maximum_total_spool_bytes = profile.limits.maximum_spool_bytes.max(1024);
-    let maximum_spool_bytes_per_owner = maximum_total_spool_bytes.min(16 * GIB).max(1024);
+    let maximum_spool_bytes_per_owner = maximum_total_spool_bytes.clamp(1024, 16 * GIB);
     NativeExecutionLimits {
         maximum_parallel,
         maximum_jobs: (profile.limits.command_queue as usize)
             .saturating_add(maximum_parallel)
             .max(1),
-        maximum_spool_bytes_per_job: maximum_spool_bytes_per_owner.min(4 * GIB).max(1024),
+        maximum_spool_bytes_per_job: maximum_spool_bytes_per_owner.clamp(1024, 4 * GIB),
         maximum_spool_bytes_per_owner,
         maximum_total_spool_bytes,
     }
@@ -383,7 +384,7 @@ fn validate_active_providers(
 
 fn resolve_agent_binary(explicit: Option<&PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(explicit) = explicit {
-        return Ok(explicit.canonicalize()?);
+        return Ok(dunce::canonicalize(explicit)?);
     }
     let current_executable = std::env::current_exe()?;
     let directory = current_executable.parent().ok_or_else(|| {
@@ -413,7 +414,7 @@ fn resolve_runtime_worker(
     agent_binary: &std::path::Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(explicit) = explicit {
-        return Ok(explicit.canonicalize()?);
+        return Ok(dunce::canonicalize(explicit)?);
     }
     let candidate = agent_binary
         .parent()
@@ -443,7 +444,7 @@ fn resolve_sibling_binary(
     option: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(explicit) = explicit {
-        return Ok(explicit.canonicalize()?);
+        return Ok(dunce::canonicalize(explicit)?);
     }
     let current_executable = std::env::current_exe()?;
     let candidate = current_executable

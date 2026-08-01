@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -136,6 +137,7 @@ pub struct ProcessExecutionProvider {
     manifest_hash: String,
     process: Mutex<Option<WorkerProcess>>,
     restart_not_before: StdMutex<Option<tokio::time::Instant>>,
+    worker_generation: AtomicU64,
 }
 
 impl ProcessExecutionProvider {
@@ -149,6 +151,7 @@ impl ProcessExecutionProvider {
             manifest_hash,
             process: Mutex::new(Some(process)),
             restart_not_before: StdMutex::new(None),
+            worker_generation: AtomicU64::new(1),
         }))
     }
 
@@ -176,7 +179,22 @@ impl ProcessExecutionProvider {
                 ),
             ));
         }
+        let next_generation = self
+            .worker_generation
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::Conflict,
+                    format!(
+                        "provider {} worker generation exhausted",
+                        self.manifest.provider_id
+                    ),
+                )
+            })?;
         *process = Some(replacement);
+        self.worker_generation
+            .store(next_generation, Ordering::Release);
         *self
             .restart_not_before
             .lock()
@@ -197,6 +215,10 @@ impl ProcessExecutionProvider {
 impl ExecutionProvider for ProcessExecutionProvider {
     fn manifest(&self) -> CapabilityManifest {
         self.manifest.clone()
+    }
+
+    async fn worker_generation(&self) -> u64 {
+        self.worker_generation.load(Ordering::Acquire)
     }
 
     async fn health(&self) -> ServiceHealth {
@@ -229,6 +251,7 @@ impl ExecutionProvider for ProcessExecutionProvider {
                 "transport":"local_binary_ipc",
                 "busy":true,
                 "restart_in_ms":retry_in_ms,
+                "worker_generation":self.worker_generation.load(Ordering::Acquire),
             });
         };
         serde_json::json!({
@@ -237,6 +260,7 @@ impl ExecutionProvider for ProcessExecutionProvider {
             "child_pid":process.as_ref().and_then(|worker| worker.child.id()),
             "restart_in_ms":retry_in_ms,
             "manifest_hash":self.manifest_hash,
+            "worker_generation":self.worker_generation.load(Ordering::Acquire),
         })
     }
 

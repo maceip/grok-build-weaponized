@@ -76,6 +76,8 @@ struct ActiveUpload {
     lifecycle: UploadLifecycle,
 }
 
+type RecoveredUploads = (HashMap<ArtifactUploadId, Arc<Mutex<ActiveUpload>>>, u64);
+
 #[derive(Default)]
 struct CapacityUsage {
     stored: u64,
@@ -851,7 +853,7 @@ fn hash_upload(
 fn recover_uploads(
     config: &ArtifactStoreConfig,
     available_bytes: u64,
-) -> Result<(HashMap<ArtifactUploadId, Arc<Mutex<ActiveUpload>>>, u64), ArtifactError> {
+) -> Result<RecoveredUploads, ArtifactError> {
     let root = config.root.join("uploads");
     let mut metadata_paths = std::fs::read_dir(&root)?
         .filter_map(Result::ok)

@@ -14,7 +14,8 @@ pub use coordinator::{
     SubscriptionItem,
 };
 pub use store::{
-    AcceptOutcome, EngagementError, EngagementMutation, EngagementStore, RecoveryReport,
+    AcceptOutcome, ControlCommandClaim, EngagementError, EngagementMutation, EngagementStore,
+    RecoveryReport,
 };
 pub use types::{
     ActionIdentity, ActionRecord, ActionReplayPolicy, ActionResolution, ActionSpec, ActionStatus,

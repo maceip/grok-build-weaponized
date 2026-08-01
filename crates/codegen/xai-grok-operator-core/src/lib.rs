@@ -140,32 +140,20 @@ impl OperatorState {
         let Some(selected) = self.selection.session_id.as_ref() else {
             return false;
         };
-        self.events.iter().any(|event| {
-            event.engagement_id.as_ref() == Some(&output.engagement_id)
-                && matches!(
-                    &event.event,
-                    xai_grok_protocol::Event::EngagementAccepted {
-                        operator_session_id: Some(session_id),
-                        ..
-                    } if session_id == selected
-                )
-        })
+        self.task_graphs
+            .get(&output.engagement_id)
+            .and_then(|graph| graph.operator_session_id.as_ref())
+            == Some(selected)
     }
 
     pub fn engagement_is_in_selected_session(&self, engagement_id: &EngagementId) -> bool {
         let Some(selected) = self.selection.session_id.as_ref() else {
             return false;
         };
-        self.events.iter().any(|event| {
-            event.engagement_id.as_ref() == Some(engagement_id)
-                && matches!(
-                    &event.event,
-                    xai_grok_protocol::Event::EngagementAccepted {
-                        operator_session_id: Some(session_id),
-                        ..
-                    } if session_id == selected
-                )
-        })
+        self.task_graphs
+            .get(engagement_id)
+            .and_then(|graph| graph.operator_session_id.as_ref())
+            == Some(selected)
     }
 
     pub fn selected_task_graphs(&self) -> Vec<&TaskGraphProjection> {
@@ -1170,11 +1158,19 @@ mod tests {
         });
         state.apply(OperatorUpdate::TaskGraph(TaskGraphProjection {
             engagement_id: engagement_id.clone(),
+            workspace_id: Some("workspace-a".to_owned()),
+            session_id: Some("session-a".to_owned()),
+            exercise_id: Some(ExerciseId::from_string("exercise-a")),
+            operation_run_id: Some(OperationRunId::from_string("run-a")),
+            operator_session_id: Some(OperatorSessionId::from_string("session-a")),
+            team_id: None,
+            client_id: None,
             revision: 1,
             objective: "Inventory hosts".to_owned(),
             tasks: Vec::new(),
             last_sequence: 1,
         }));
+        state.events.clear();
         assert_eq!(state.selected_task_graphs().len(), 1);
         assert_eq!(state.selected_task_graphs()[0].engagement_id, engagement_id);
 

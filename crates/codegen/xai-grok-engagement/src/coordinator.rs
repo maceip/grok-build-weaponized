@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::store::{
-    AcceptOutcome, EngagementError, EngagementMutation, EngagementStore, RecoveryReport,
+    AcceptOutcome, ControlCommandClaim, EngagementError, EngagementMutation, EngagementStore,
+    RecoveryReport,
 };
 use crate::types::{
     ActionRecord, ActionResolution, ActionSpec, ActionStatus, EngagementCheckpoint,
@@ -128,6 +129,27 @@ impl EngagementCoordinator {
         let mutation = self.call(move |store| store.accept(input)).await?;
         self.publish(&mutation);
         Ok(mutation.value)
+    }
+
+    pub async fn claim_control_command(
+        &self,
+        command_id: String,
+        command_hash: String,
+    ) -> Result<ControlCommandClaim, EngagementError> {
+        self.call(move |store| store.claim_control_command(&command_id, &command_hash))
+            .await
+    }
+
+    pub async fn complete_control_command(
+        &self,
+        command_id: String,
+        command_hash: String,
+        response_json: String,
+    ) -> Result<(), EngagementError> {
+        self.call(move |store| {
+            store.complete_control_command(&command_id, &command_hash, &response_json)
+        })
+        .await
     }
 
     pub async fn accept_and_claim(

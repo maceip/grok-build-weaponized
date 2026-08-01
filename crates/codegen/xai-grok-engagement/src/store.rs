@@ -10,13 +10,14 @@ use crate::types::{
     JobKind, JobLifecycle, NewEngagement, QueuePriority, RuntimeAdmissionRecord,
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_CHECKPOINT_BYTES: usize = 1024 * 1024;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_ACTION_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_EVENT_PAGE: usize = 1_000;
 const MAX_LIST_PAGE: usize = 512;
 const MAX_ACCEPTED_NONTERMINAL_ENGAGEMENTS: usize = 4_096;
+const MAX_CONTROL_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngagementError {
@@ -47,6 +48,8 @@ pub enum EngagementError {
     ActionConflict(String),
     #[error("durable job identity {0} was reused with different job content")]
     JobConflict(String),
+    #[error("control command identity {0} was reused with different command content")]
+    ControlCommandConflict(String),
     #[error("{field} exceeds its {limit}-byte durable storage limit")]
     TooLarge { field: &'static str, limit: usize },
     #[error("invalid persisted {field} value: {value}")]
@@ -80,6 +83,13 @@ pub struct RecoveryReport {
     pub events: Vec<EngagementEvent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlCommandClaim {
+    New,
+    Completed(String),
+    InDoubt,
+}
+
 pub struct EngagementStore {
     connection: Connection,
     admission_capacity: usize,
@@ -106,6 +116,17 @@ impl EngagementStore {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS control_commands(
+                command_id TEXT PRIMARY KEY,
+                command_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                response_json TEXT,
+                started_at_ms INTEGER NOT NULL,
+                completed_at_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_control_commands_status
+                ON control_commands(status, started_at_ms);
 
             CREATE TABLE IF NOT EXISTS engagements(
                 engagement_id TEXT PRIMARY KEY,
@@ -305,6 +326,113 @@ impl EngagementStore {
         admission_capacity: usize,
     ) -> Result<Self, EngagementError> {
         Self::open_with_capacity(path, admission_capacity)
+    }
+
+    pub fn claim_control_command(
+        &mut self,
+        command_id: &str,
+        command_hash: &str,
+    ) -> Result<ControlCommandClaim, EngagementError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO control_commands(
+                command_id, command_hash, status, response_json,
+                started_at_ms, completed_at_ms
+             ) VALUES (?1, ?2, 'started', NULL, ?3, NULL)",
+            params![command_id, command_hash, now_ms()],
+        )?;
+        if inserted == 1 {
+            transaction.commit()?;
+            return Ok(ControlCommandClaim::New);
+        }
+        let (stored_hash, status, response_json) = transaction.query_row(
+            "SELECT command_hash, status, response_json
+             FROM control_commands WHERE command_id=?1",
+            [command_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?;
+        if stored_hash != command_hash {
+            return Err(EngagementError::ControlCommandConflict(
+                command_id.to_owned(),
+            ));
+        }
+        let claim = match (status.as_str(), response_json) {
+            ("started", _) => ControlCommandClaim::InDoubt,
+            ("completed", Some(response)) => ControlCommandClaim::Completed(response),
+            _ => {
+                return Err(EngagementError::InvalidPersistedValue {
+                    field: "control command status",
+                    value: status,
+                });
+            }
+        };
+        transaction.commit()?;
+        Ok(claim)
+    }
+
+    pub fn complete_control_command(
+        &mut self,
+        command_id: &str,
+        command_hash: &str,
+        response_json: &str,
+    ) -> Result<(), EngagementError> {
+        if response_json.len() > MAX_CONTROL_RESPONSE_BYTES {
+            return Err(EngagementError::TooLarge {
+                field: "control command response",
+                limit: MAX_CONTROL_RESPONSE_BYTES,
+            });
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (stored_hash, status, stored_response) = transaction.query_row(
+            "SELECT command_hash, status, response_json
+                 FROM control_commands WHERE command_id=?1",
+            [command_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?;
+        if stored_hash != command_hash {
+            return Err(EngagementError::ControlCommandConflict(
+                command_id.to_owned(),
+            ));
+        }
+        if status == "completed" {
+            if stored_response.as_deref() == Some(response_json) {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(EngagementError::ControlCommandConflict(
+                command_id.to_owned(),
+            ));
+        }
+        if status != "started" {
+            return Err(EngagementError::InvalidPersistedValue {
+                field: "control command status",
+                value: status,
+            });
+        }
+        transaction.execute(
+            "UPDATE control_commands
+             SET status='completed', response_json=?2, completed_at_ms=?3
+             WHERE command_id=?1 AND status='started'",
+            params![command_id, response_json, now_ms()],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn accept(

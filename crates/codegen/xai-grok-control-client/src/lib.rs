@@ -11,9 +11,10 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use xai_grok_protocol::{
-    Command, CommandEnvelope, CommandId, EventBatch, EventReadRequest, Hello,
-    MAX_CONTROL_FRAME_BYTES, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, Response,
-    ResponseEnvelope, TeamClient,
+    ArtifactId, BuzzIngress, Command, CommandEnvelope, CommandId, EngagementId, Event, EventBatch,
+    EventReadRequest, Hello, IngressEnvelope, IngressSource, MAX_CONTROL_FRAME_BYTES,
+    PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, QmIngress, Response, ResponseEnvelope,
+    TaskGraphProjection, TaskId, TeamClient,
 };
 
 #[derive(Clone, Debug)]
@@ -55,6 +56,332 @@ pub enum ClientError {
     MismatchedResponse,
     #[error("control-plane returned {0} instead of an event batch")]
     ExpectedEvents(&'static str),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SourceAdapterError {
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    #[error("source adapter expected {expected}, received {actual}")]
+    UnexpectedResponse {
+        expected: &'static str,
+        actual: &'static str,
+    },
+    #[error("source adapter projection decode: {0}")]
+    Projection(#[from] serde_json::Error),
+    #[error("invalid source delivery: {0}")]
+    InvalidDelivery(String),
+}
+
+/// Durable acknowledgement returned to Buzz or QM after `grokd` accepts an
+/// ingress delivery. Re-delivering the same source identifier returns the same
+/// engagement ID with `accepted == false`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceDeliveryReceipt {
+    pub protocol_version: u32,
+    pub source: IngressSource,
+    pub source_event_id: String,
+    pub engagement_id: EngagementId,
+    pub accepted: bool,
+}
+
+/// Compact, source-neutral reference to one durable Grok event.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceEventReference {
+    pub event_id: String,
+    pub sequence: u64,
+    pub generation: u64,
+    pub observed_unix_ms: u64,
+    pub event_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<ArtifactId>,
+}
+
+/// Cursor-resumable progress page for a previously acknowledged source
+/// delivery. `next_sequence` advances across unrelated daemon events as well,
+/// so reconnecting adapters never rescan global traffic.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SourceProgressPage {
+    pub protocol_version: u32,
+    pub source: IngressSource,
+    pub source_event_id: String,
+    pub engagement_id: EngagementId,
+    pub references: Vec<SourceEventReference>,
+    pub high_watermark: u64,
+    pub next_sequence: u64,
+    pub caught_up: bool,
+}
+
+/// Versioned NDJSON frames emitted by `grokctl ingress ... --follow`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "frame", rename_all = "snake_case")]
+pub enum SourceAdapterFrame {
+    Accepted {
+        receipt: SourceDeliveryReceipt,
+    },
+    Progress {
+        page: SourceProgressPage,
+    },
+    Complete {
+        protocol_version: u32,
+        source: IngressSource,
+        source_event_id: String,
+        engagement_id: EngagementId,
+        next_sequence: u64,
+    },
+}
+
+/// Executable Buzz/QM ingress boundary over the local versioned `grokd`
+/// protocol. Source systems remain transport adapters; they never own or
+/// invoke Grok execution state directly.
+pub struct SourceIngressAdapter<'a> {
+    control: &'a ControlPlaneClient,
+}
+
+impl<'a> SourceIngressAdapter<'a> {
+    pub fn new(control: &'a ControlPlaneClient) -> Self {
+        Self { control }
+    }
+
+    pub async fn deliver_buzz(
+        &self,
+        delivery: BuzzIngress,
+    ) -> Result<SourceDeliveryReceipt, SourceAdapterError> {
+        require_source_fields(&[
+            ("event_id", &delivery.event_id),
+            ("community", &delivery.community),
+            ("channel_id", &delivery.channel_id),
+            ("author", &delivery.author),
+            ("content", &delivery.content),
+        ])?;
+        let source_event_id = delivery.event_id.clone();
+        self.deliver(
+            IngressSource::Buzz,
+            source_event_id,
+            delivery.into_envelope(),
+        )
+        .await
+    }
+
+    pub async fn deliver_qm(
+        &self,
+        delivery: QmIngress,
+    ) -> Result<SourceDeliveryReceipt, SourceAdapterError> {
+        require_source_fields(&[
+            ("job_id", &delivery.job_id),
+            ("scope_id", &delivery.scope_id),
+            ("request", &delivery.request),
+        ])?;
+        if delivery
+            .room_id
+            .as_ref()
+            .is_some_and(|room| room.trim().is_empty())
+        {
+            return Err(SourceAdapterError::InvalidDelivery(
+                "room_id must not be empty when supplied".to_owned(),
+            ));
+        }
+        let source_event_id = delivery.job_id.clone();
+        self.deliver(IngressSource::Qm, source_event_id, delivery.into_envelope())
+            .await
+    }
+
+    async fn deliver(
+        &self,
+        source: IngressSource,
+        source_event_id: String,
+        ingress: IngressEnvelope,
+    ) -> Result<SourceDeliveryReceipt, SourceAdapterError> {
+        let response = self
+            .control
+            .send(Command::SubmitIngress(ingress), Duration::from_secs(10))
+            .await?;
+        let Response::Accepted {
+            engagement_id,
+            accepted,
+        } = response
+        else {
+            return Err(SourceAdapterError::UnexpectedResponse {
+                expected: "accepted",
+                actual: response_name(&response),
+            });
+        };
+        Ok(SourceDeliveryReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            source,
+            source_event_id,
+            engagement_id,
+            accepted,
+        })
+    }
+
+    pub async fn progress(
+        &self,
+        receipt: &SourceDeliveryReceipt,
+        after_sequence: u64,
+        maximum_events: u32,
+        wait_ms: u32,
+    ) -> Result<SourceProgressPage, SourceAdapterError> {
+        let batch = self
+            .control
+            .read_events(EventReadRequest {
+                after_sequence,
+                maximum_events,
+                wait_ms,
+                engagement_id: Some(receipt.engagement_id.clone()),
+            })
+            .await?;
+        Ok(SourceProgressPage {
+            protocol_version: PROTOCOL_VERSION,
+            source: receipt.source,
+            source_event_id: receipt.source_event_id.clone(),
+            engagement_id: receipt.engagement_id.clone(),
+            references: batch.events.iter().map(event_reference).collect(),
+            high_watermark: batch.high_watermark,
+            next_sequence: batch.next_sequence,
+            caught_up: batch.caught_up,
+        })
+    }
+
+    pub async fn task_graph(
+        &self,
+        engagement_id: EngagementId,
+    ) -> Result<Option<TaskGraphProjection>, SourceAdapterError> {
+        let response = self
+            .control
+            .send(
+                Command::QueryProjection(xai_grok_protocol::ProjectionQuery::TaskGraph {
+                    engagement_id,
+                }),
+                Duration::from_secs(2),
+            )
+            .await?;
+        let Response::Projection(snapshot) = response else {
+            return Err(SourceAdapterError::UnexpectedResponse {
+                expected: "projection",
+                actual: response_name(&response),
+            });
+        };
+        if snapshot.value.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_value(snapshot.value)?))
+    }
+
+    pub async fn is_terminal(
+        &self,
+        engagement_id: EngagementId,
+    ) -> Result<bool, SourceAdapterError> {
+        let Some(graph) = self.task_graph(engagement_id).await? else {
+            return Ok(false);
+        };
+        Ok(!graph.tasks.is_empty()
+            && graph.tasks.iter().all(|task| {
+                matches!(
+                    task.status,
+                    xai_grok_protocol::TaskStatus::Completed
+                        | xai_grok_protocol::TaskStatus::Failed
+                        | xai_grok_protocol::TaskStatus::Cancelled
+                        | xai_grok_protocol::TaskStatus::Lost
+                )
+            }))
+    }
+}
+
+fn require_source_fields(fields: &[(&str, &String)]) -> Result<(), SourceAdapterError> {
+    for (name, value) in fields {
+        if value.trim().is_empty() {
+            return Err(SourceAdapterError::InvalidDelivery(format!(
+                "{name} must not be empty"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn event_reference(envelope: &xai_grok_protocol::EventEnvelope) -> SourceEventReference {
+    let (event_kind, task_id, artifact_id) = match &envelope.event {
+        Event::ExerciseCreated { .. } => ("exercise_created", None, None),
+        Event::OperationRunCreated { .. } => ("operation_run_created", None, None),
+        Event::OperatorSessionCreated { .. } => ("operator_session_created", None, None),
+        Event::PlaybookCreated { .. } => ("playbook_created", None, None),
+        Event::EvidenceRecorded { .. } => ("evidence_recorded", None, None),
+        Event::FindingCreated { .. } => ("finding_created", None, None),
+        Event::FindingStatusSet { .. } => ("finding_status_set", None, None),
+        Event::TeamPresenceSet { .. } => ("team_presence_set", None, None),
+        Event::TeamWorkItemCreated { .. } => ("team_work_item_created", None, None),
+        Event::TeamWorkItemUpdated { .. } => ("team_work_item_updated", None, None),
+        Event::TeamMessagePosted { .. } => ("team_message_posted", None, None),
+        Event::TeamResourceClaimed { .. } => ("team_resource_claimed", None, None),
+        Event::TeamResourceReleased { .. } => ("team_resource_released", None, None),
+        Event::EngagementAccepted { .. } => ("engagement_accepted", None, None),
+        Event::PlanAccepted { .. } => ("plan_accepted", None, None),
+        Event::TaskStatus { task_id, .. } => ("task_status", Some(task_id.clone()), None),
+        Event::Observation { task_id, .. } => ("observation", Some(task_id.clone()), None),
+        Event::ProviderState { .. } => ("provider_state", None, None),
+        Event::ArtifactAvailable {
+            artifact_id,
+            task_id,
+            ..
+        } => (
+            "artifact_available",
+            task_id.clone(),
+            Some(artifact_id.clone()),
+        ),
+        Event::ProviderOutput {
+            task_id,
+            artifact_id,
+        } => (
+            "provider_output",
+            Some(task_id.clone()),
+            Some(artifact_id.clone()),
+        ),
+        Event::Overload { .. } => ("overload", None, None),
+    };
+    SourceEventReference {
+        event_id: envelope.event_id.to_string(),
+        sequence: envelope.sequence,
+        generation: envelope.generation,
+        observed_unix_ms: envelope.observed_unix_ms,
+        event_kind: event_kind.to_owned(),
+        task_id,
+        artifact_id,
+    }
+}
+
+fn response_name(response: &Response) -> &'static str {
+    match response {
+        Response::Hello(_) => "hello",
+        Response::Accepted { .. } => "accepted",
+        Response::ExerciseCreated { .. } => "exercise_created",
+        Response::OperationRunCreated { .. } => "operation_run_created",
+        Response::OperatorSessionCreated { .. } => "operator_session_created",
+        Response::PlaybookCreated { .. } => "playbook_created",
+        Response::EvidenceRecorded { .. } => "evidence_recorded",
+        Response::FindingCreated { .. } => "finding_created",
+        Response::FindingStatusSet { .. } => "finding_status_set",
+        Response::TeamPresenceSet { .. } => "team_presence_set",
+        Response::TeamWorkItemCreated { .. } => "team_work_item_created",
+        Response::TeamWorkItemUpdated { .. } => "team_work_item_updated",
+        Response::TeamMessagePosted { .. } => "team_message_posted",
+        Response::TeamResourceClaimed { .. } => "team_resource_claimed",
+        Response::TeamResourceReleased { .. } => "team_resource_released",
+        Response::ProviderInvoked { .. } => "provider_invoked",
+        Response::PlanAccepted { .. } => "plan_accepted",
+        Response::DispatchAccepted { .. } => "dispatch_accepted",
+        Response::ProviderRegistered { .. } => "provider_registered",
+        Response::ArtifactStored { .. } => "artifact_stored",
+        Response::ArtifactUploadStarted { .. } => "artifact_upload_started",
+        Response::ArtifactUploadState { .. } => "artifact_upload_state",
+        Response::ArtifactUploadProgress { .. } => "artifact_upload_progress",
+        Response::ArtifactUploadAborted { .. } => "artifact_upload_aborted",
+        Response::ArtifactChunk { .. } => "artifact_chunk",
+        Response::Projection(_) => "projection",
+        Response::Events(_) => "events",
+        Response::Ack => "ack",
+    }
 }
 
 pub struct ControlPlaneClient {

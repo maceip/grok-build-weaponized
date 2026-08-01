@@ -60,6 +60,13 @@ pub struct ProviderOutput {
 pub trait ExecutionProvider: Send + Sync + 'static {
     fn manifest(&self) -> CapabilityManifest;
 
+    /// Monotonically identifies the live child process or native worker owned
+    /// by this provider object. A value change means any worker-local session,
+    /// lease, or cache state from the previous generation is no longer valid.
+    async fn worker_generation(&self) -> u64 {
+        1
+    }
+
     async fn health(&self) -> ServiceHealth {
         ServiceHealth::Ready
     }
@@ -145,7 +152,12 @@ impl Drop for QueueDepthGuard<'_> {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ProviderCapacity {
     pub provider_id: ProviderId,
+    /// Generation of this registry entry. This changes when the provider
+    /// object itself is drained, removed, and registered again.
     pub generation: u64,
+    /// Generation of the executable worker behind the provider object. This
+    /// also changes for transparent child-process restarts.
+    pub worker_generation: u64,
     pub maximum_parallel: u32,
     pub available_permits: u32,
     pub queued: u32,
@@ -500,9 +512,12 @@ impl ProviderRegistry {
             .map(|(provider_id, entry)| (provider_id.clone(), entry.clone()))
             .collect::<Vec<_>>();
         futures::future::join_all(entries.into_iter().map(|(provider_id, entry)| async move {
+            let (worker_generation, status) =
+                tokio::join!(entry.provider.worker_generation(), entry.provider.status());
             ProviderCapacity {
                 provider_id: provider_id.clone(),
                 generation: entry.generation,
+                worker_generation,
                 maximum_parallel: entry.manifest.concurrency.maximum_parallel,
                 available_permits: entry.permits.available_permits() as u32,
                 queued: entry.queued.load(Ordering::Acquire),
@@ -510,7 +525,7 @@ impl ProviderRegistry {
                 draining: entry.draining.load(Ordering::Acquire),
                 completed: entry.completed.load(Ordering::Relaxed),
                 failed: entry.failed.load(Ordering::Relaxed),
-                status: entry.provider.status().await,
+                status,
             }
         }))
         .await

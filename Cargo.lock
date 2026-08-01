@@ -15444,6 +15444,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "clap",
+ "dunce",
  "futures",
  "rmp-serde",
  "serde",

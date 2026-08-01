@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,8 @@ pub enum JournalError {
     ChecksumMismatch,
     #[error("event sequence {current} does not follow {previous}")]
     NonMonotonic { previous: u64, current: u64 },
+    #[error("event journal index expected sequence {expected} but decoded {actual}")]
+    IndexMismatch { expected: u64, actual: u64 },
     #[error("event journal lock is poisoned")]
     Poisoned,
 }
@@ -33,7 +36,44 @@ pub enum JournalError {
 /// frame is detected during replay and never silently ignored.
 pub struct EventJournal {
     path: PathBuf,
-    writer: Mutex<File>,
+    state: Mutex<JournalState>,
+}
+
+struct JournalState {
+    writer: File,
+    index: JournalIndex,
+}
+
+#[derive(Default)]
+struct JournalIndex {
+    records: Vec<RecordIndex>,
+    by_engagement: HashMap<EngagementId, Vec<usize>>,
+}
+
+#[derive(Clone, Copy)]
+struct RecordIndex {
+    sequence: u64,
+    offset: u64,
+}
+
+impl JournalIndex {
+    fn push(&mut self, event: &EventEnvelope, offset: u64) {
+        let position = self.records.len();
+        self.records.push(RecordIndex {
+            sequence: event.sequence,
+            offset,
+        });
+        if let Some(engagement_id) = &event.engagement_id {
+            self.by_engagement
+                .entry(engagement_id.clone())
+                .or_default()
+                .push(position);
+        }
+    }
+
+    fn last_sequence(&self) -> Option<u64> {
+        self.records.last().map(|record| record.sequence)
+    }
 }
 
 impl EventJournal {
@@ -42,17 +82,16 @@ impl EventJournal {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let index = build_index(&path)?;
         let writer = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
             .open(&path)?;
-        let journal = Self {
+        Ok(Self {
             path,
-            writer: Mutex::new(writer),
-        };
-        journal.replay()?;
-        Ok(journal)
+            state: Mutex::new(JournalState { writer, index }),
+        })
     }
 
     pub fn append(&self, event: &EventEnvelope) -> Result<(), JournalError> {
@@ -70,19 +109,29 @@ impl EventJournal {
             })?
             .to_be_bytes();
         let checksum = blake3::hash(&bytes);
-        let mut writer = self.writer.lock().map_err(|_| JournalError::Poisoned)?;
-        writer.write_all(&length)?;
-        writer.write_all(&bytes)?;
-        writer.write_all(checksum.as_bytes())?;
-        writer.sync_data()?;
+        let mut state = self.state.lock().map_err(|_| JournalError::Poisoned)?;
+        if let Some(previous) = state.index.last_sequence()
+            && previous.checked_add(1) != Some(event.sequence)
+        {
+            return Err(JournalError::NonMonotonic {
+                previous,
+                current: event.sequence,
+            });
+        }
+        let offset = state.writer.seek(std::io::SeekFrom::End(0))?;
+        state.writer.write_all(&length)?;
+        state.writer.write_all(&bytes)?;
+        state.writer.write_all(checksum.as_bytes())?;
+        state.writer.sync_data()?;
+        state.index.push(event, offset);
         Ok(())
     }
 
     pub fn replay(&self) -> Result<Vec<EventEnvelope>, JournalError> {
-        let _writer_guard = self.writer.lock().map_err(|_| JournalError::Poisoned)?;
+        let state = self.state.lock().map_err(|_| JournalError::Poisoned)?;
         let mut reader = File::open(&self.path)?;
         reader.seek(std::io::SeekFrom::Start(0))?;
-        let mut events = Vec::new();
+        let mut events = Vec::with_capacity(state.index.records.len());
         let mut previous: Option<u64> = None;
         loop {
             let mut header = [0_u8; 4];
@@ -132,34 +181,100 @@ impl EventJournal {
 
     /// Read a bounded cursor page without materializing the complete journal.
     ///
-    /// The startup replay verifies the entire journal. Cursor reads retain the
-    /// same frame and checksum checks for every record they traverse while
-    /// keeping result memory bounded by `maximum_events`.
+    /// Opening the journal verifies every frame while constructing a sequence
+    /// and engagement index. Cursor reads seek directly to indexed records and
+    /// revalidate their frame checksums, keeping both work and result memory
+    /// bounded by `maximum_events`.
     pub fn read_after(
         &self,
         after_sequence: u64,
         maximum_events: usize,
         engagement_id: Option<&EngagementId>,
     ) -> Result<(Vec<EventEnvelope>, u64), JournalError> {
-        let _writer_guard = self.writer.lock().map_err(|_| JournalError::Poisoned)?;
-        let mut reader = File::open(&self.path)?;
-        let mut events = Vec::with_capacity(maximum_events);
-        let mut previous: Option<u64> = None;
-        let mut scanned_through = after_sequence;
-        while events.len() < maximum_events {
-            let Some(event) = read_event_record(&mut reader, &mut previous)? else {
-                break;
-            };
-            if event.sequence <= after_sequence {
-                continue;
-            }
-            scanned_through = event.sequence;
-            if engagement_id.is_none_or(|expected| event.engagement_id.as_ref() == Some(expected)) {
-                events.push(event);
-            }
-        }
+        let (events, scanned_through, _) =
+            self.read_after_indexed(after_sequence, maximum_events, engagement_id)?;
         Ok((events, scanned_through))
     }
+
+    fn read_after_indexed(
+        &self,
+        after_sequence: u64,
+        maximum_events: usize,
+        engagement_id: Option<&EngagementId>,
+    ) -> Result<(Vec<EventEnvelope>, u64, usize), JournalError> {
+        if maximum_events == 0 {
+            return Ok((Vec::new(), after_sequence, 0));
+        }
+        let state = self.state.lock().map_err(|_| JournalError::Poisoned)?;
+        let mut reader = File::open(&self.path)?;
+        let mut events = Vec::with_capacity(maximum_events);
+        let mut records_read = 0;
+        let matching_positions = engagement_id.and_then(|id| state.index.by_engagement.get(id));
+        let remaining_matches;
+        let positions: Box<dyn Iterator<Item = usize> + '_> = if engagement_id.is_some() {
+            let matching_positions = matching_positions.map_or(&[][..], Vec::as_slice);
+            let start = matching_positions.partition_point(|position| {
+                state.index.records[*position].sequence <= after_sequence
+            });
+            remaining_matches = matching_positions.len().saturating_sub(start);
+            Box::new(
+                matching_positions[start..]
+                    .iter()
+                    .copied()
+                    .take(maximum_events),
+            )
+        } else {
+            let start = state
+                .index
+                .records
+                .partition_point(|record| record.sequence <= after_sequence);
+            remaining_matches = state.index.records.len().saturating_sub(start);
+            Box::new(start..state.index.records.len().min(start + maximum_events))
+        };
+        for position in positions {
+            let record = state.index.records[position];
+            events.push(read_indexed_event(&mut reader, record)?);
+            records_read += 1;
+        }
+        let scanned_through = if remaining_matches < maximum_events {
+            state.index.last_sequence().unwrap_or(after_sequence)
+        } else {
+            events.last().map_or(after_sequence, |event| event.sequence)
+        };
+        Ok((events, scanned_through, records_read))
+    }
+}
+
+fn build_index(path: &Path) -> Result<JournalIndex, JournalError> {
+    if !path.exists() {
+        return Ok(JournalIndex::default());
+    }
+    let mut reader = File::open(path)?;
+    let mut index = JournalIndex::default();
+    let mut previous = None;
+    loop {
+        let offset = reader.stream_position()?;
+        let Some(event) = read_event_record(&mut reader, &mut previous)? else {
+            break;
+        };
+        index.push(&event, offset);
+    }
+    Ok(index)
+}
+
+fn read_indexed_event(
+    reader: &mut File,
+    record: RecordIndex,
+) -> Result<EventEnvelope, JournalError> {
+    reader.seek(std::io::SeekFrom::Start(record.offset))?;
+    let event = read_event_record(reader, &mut None)?.ok_or(JournalError::Truncated)?;
+    if event.sequence != record.sequence {
+        return Err(JournalError::IndexMismatch {
+            expected: record.sequence,
+            actual: event.sequence,
+        });
+    }
+    Ok(event)
 }
 
 fn read_event_record(
@@ -271,5 +386,70 @@ mod tests {
             EventJournal::open(path),
             Err(JournalError::ChecksumMismatch)
         ));
+    }
+
+    #[test]
+    fn cursor_reads_seek_directly_to_the_requested_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = EventJournal::open(directory.path().join("events.bin")).unwrap();
+        for sequence in 1..=32 {
+            journal.append(&event(sequence)).unwrap();
+        }
+
+        let (events, scanned_through, records_read) =
+            journal.read_after_indexed(29, 2, None).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![30, 31]
+        );
+        assert_eq!(scanned_through, 31);
+        assert_eq!(records_read, 2);
+
+        let (events, scanned_through, records_read) =
+            journal.read_after_indexed(31, 8, None).unwrap();
+        assert_eq!(events[0].sequence, 32);
+        assert_eq!(scanned_through, 32);
+        assert_eq!(records_read, 1);
+    }
+
+    #[test]
+    fn engagement_cursor_uses_its_index_and_advances_across_irrelevant_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = EventJournal::open(directory.path().join("events.bin")).unwrap();
+        let selected: EngagementId = "selected".into();
+        for sequence in 1..=32 {
+            let mut envelope = event(sequence);
+            if sequence == 7 || sequence == 17 {
+                envelope.engagement_id = Some(selected.clone());
+            } else {
+                envelope.engagement_id = Some("other".into());
+            }
+            journal.append(&envelope).unwrap();
+        }
+
+        let (events, scanned_through, records_read) =
+            journal.read_after_indexed(7, 16, Some(&selected)).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 17);
+        assert_eq!(records_read, 1);
+        assert_eq!(scanned_through, 32);
+    }
+
+    #[test]
+    fn append_rejects_non_monotonic_sequences_before_persisting() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = EventJournal::open(directory.path().join("events.bin")).unwrap();
+        journal.append(&event(10)).unwrap();
+        assert!(matches!(
+            journal.append(&event(12)),
+            Err(JournalError::NonMonotonic {
+                previous: 10,
+                current: 12
+            })
+        ));
+        assert_eq!(journal.replay().unwrap().len(), 1);
     }
 }

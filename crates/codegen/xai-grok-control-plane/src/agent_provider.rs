@@ -108,7 +108,7 @@ impl AgentTurnInput {
 
 enum WorkerCommand {
     Execute {
-        dispatch: ProviderDispatch,
+        dispatch: Box<ProviderDispatch>,
         respond_to: oneshot::Sender<Result<ProviderOutput, ProtocolError>>,
     },
     Cancel {
@@ -203,6 +203,7 @@ pub struct AgentExecutionProvider {
     manifest: CapabilityManifest,
     commands: mpsc::Sender<WorkerCommand>,
     health: watch::Receiver<ServiceHealth>,
+    worker_generation: watch::Receiver<u64>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -213,11 +214,20 @@ impl AgentExecutionProvider {
         manifest.validate()?;
         let (commands, receiver) = mpsc::channel(config.queue_capacity as usize);
         let (health_tx, health) = watch::channel(ServiceHealth::Starting);
+        let (worker_generation_tx, worker_generation) = watch::channel(0);
         let (startup_tx, startup_rx) = oneshot::channel();
         let worker_config = config.clone();
         let thread = std::thread::Builder::new()
             .name("grok-agent-provider".to_owned())
-            .spawn(move || run_worker_thread(worker_config, receiver, health_tx, startup_tx))
+            .spawn(move || {
+                run_worker_thread(
+                    worker_config,
+                    receiver,
+                    health_tx,
+                    worker_generation_tx,
+                    startup_tx,
+                );
+            })
             .map_err(|error| {
                 ProtocolError::new(
                     ProtocolErrorCode::ServiceUnavailable,
@@ -229,6 +239,7 @@ impl AgentExecutionProvider {
                 manifest,
                 commands,
                 health,
+                worker_generation,
                 thread: Mutex::new(Some(thread)),
             })),
             Ok(Ok(Err(error))) => {
@@ -275,6 +286,10 @@ impl ExecutionProvider for AgentExecutionProvider {
         self.manifest.clone()
     }
 
+    async fn worker_generation(&self) -> u64 {
+        *self.worker_generation.borrow()
+    }
+
     async fn health(&self) -> ServiceHealth {
         *self.health.borrow()
     }
@@ -290,7 +305,7 @@ impl ExecutionProvider for AgentExecutionProvider {
             return serde_json::json!({"error":"agent provider command channel is closed"});
         }
         match tokio::time::timeout(Duration::from_secs(2), response).await {
-            Ok(Ok(Ok(status))) => status,
+            Ok(Ok(Ok(status))) => with_worker_generation(status, *self.worker_generation.borrow()),
             Ok(Ok(Err(error))) => serde_json::json!({"error":error.to_string()}),
             Ok(Err(_)) => serde_json::json!({"error":"agent provider dropped status response"}),
             Err(_) => serde_json::json!({"error":"agent provider status timed out"}),
@@ -301,7 +316,7 @@ impl ExecutionProvider for AgentExecutionProvider {
         let (respond_to, response) = oneshot::channel();
         self.commands
             .send(WorkerCommand::Execute {
-                dispatch,
+                dispatch: Box::new(dispatch),
                 respond_to,
             })
             .await
@@ -330,6 +345,7 @@ fn run_worker_thread(
     config: AgentProviderConfig,
     receiver: mpsc::Receiver<WorkerCommand>,
     health: watch::Sender<ServiceHealth>,
+    worker_generation: watch::Sender<u64>,
     startup: oneshot::Sender<Result<(), ProtocolError>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -345,19 +361,31 @@ fn run_worker_thread(
         }
     };
     let local = tokio::task::LocalSet::new();
-    local.block_on(&runtime, run_worker(config, receiver, health, startup));
+    local.block_on(
+        &runtime,
+        run_worker(config, receiver, health, worker_generation, startup),
+    );
 }
 
 async fn run_worker(
     config: AgentProviderConfig,
     mut receiver: mpsc::Receiver<WorkerCommand>,
     health: watch::Sender<ServiceHealth>,
+    worker_generation: watch::Sender<u64>,
     startup: oneshot::Sender<Result<(), ProtocolError>>,
 ) {
     let mut startup = Some(startup);
     loop {
         let _ = health.send(ServiceHealth::Starting);
-        match run_generation(&config, &mut receiver, &health, &mut startup).await {
+        match run_generation(
+            &config,
+            &mut receiver,
+            &health,
+            &worker_generation,
+            &mut startup,
+        )
+        .await
+        {
             Ok(WorkerExit::Shutdown) => {
                 if let Some(startup) = startup.take() {
                     let _ = startup.send(Err(unavailable(
@@ -389,6 +417,7 @@ async fn run_generation(
     config: &AgentProviderConfig,
     receiver: &mut mpsc::Receiver<WorkerCommand>,
     health: &watch::Sender<ServiceHealth>,
+    worker_generation: &watch::Sender<u64>,
     startup: &mut Option<oneshot::Sender<Result<(), ProtocolError>>>,
 ) -> Result<WorkerExit, ProtocolError> {
     let mut child = tokio::process::Command::new(&config.binary)
@@ -428,6 +457,10 @@ async fn run_generation(
             .await;
     });
     initialize_agent(&connection).await?;
+    let next_generation = (*worker_generation.borrow())
+        .checked_add(1)
+        .ok_or_else(|| unavailable("agent provider worker generation exhausted"))?;
+    worker_generation.send_replace(next_generation);
     let _ = health.send(ServiceHealth::Ready);
     if let Some(startup) = startup.take() {
         let _ = startup.send(Ok(()));
@@ -461,7 +494,8 @@ async fn run_generation(
                         return Ok(WorkerExit::Shutdown);
                     }
                     WorkerCommand::Cancel { request_id, respond_to } => {
-                        let result = if let Some(session_id) = active.borrow().get(&request_id).cloned() {
+                        let session_id = active.borrow().get(&request_id).cloned();
+                        let result = if let Some(session_id) = session_id {
                             connection
                                 .cancel(acp::CancelNotification::new(session_id))
                                 .await
@@ -507,7 +541,7 @@ async fn run_generation(
                                 &session_locks,
                                 &active,
                                 &config,
-                                dispatch,
+                                *dispatch,
                             )
                             .await;
                             let _ = respond_to.send(result);
@@ -743,6 +777,21 @@ fn manifest(config: &AgentProviderConfig) -> CapabilityManifest {
 
 fn unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message).retryable()
+}
+
+fn with_worker_generation(
+    mut status: serde_json::Value,
+    worker_generation: u64,
+) -> serde_json::Value {
+    if let Some(object) = status.as_object_mut() {
+        object.insert("worker_generation".to_owned(), worker_generation.into());
+        status
+    } else {
+        serde_json::json!({
+            "worker_generation": worker_generation,
+            "runtime": status,
+        })
+    }
 }
 
 fn now_unix_ms() -> u64 {

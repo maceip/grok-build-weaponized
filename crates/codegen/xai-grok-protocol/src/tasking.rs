@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ArtifactId, EngagementId, OperationId, ProviderId, RequestId, TaskId};
+use crate::{
+    ArtifactId, ClientId, EngagementId, ExerciseId, OperationId, OperationRunId, OperatorSessionId,
+    ProviderId, RequestId, TaskId, TeamId,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -210,6 +213,22 @@ pub struct TaskProjection {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskGraphProjection {
     pub engagement_id: EngagementId,
+    /// Durable ownership copied from the engagement projection. These fields
+    /// let stateless clients scope graphs without retaining historical events.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub exercise_id: Option<ExerciseId>,
+    #[serde(default)]
+    pub operation_run_id: Option<OperationRunId>,
+    #[serde(default)]
+    pub operator_session_id: Option<OperatorSessionId>,
+    #[serde(default)]
+    pub team_id: Option<TeamId>,
+    #[serde(default)]
+    pub client_id: Option<ClientId>,
     pub revision: u32,
     pub objective: String,
     pub tasks: Vec<TaskProjection>,

@@ -165,17 +165,29 @@ impl ProjectionStore {
                 client_id,
             } => {
                 if let Some(engagement_id) = &envelope.engagement_id {
-                    let projection = engagement(&mut state, engagement_id);
-                    projection.workspace_id = Some(workspace_id.clone());
-                    projection.session_id = Some(session_id.clone());
-                    projection.exercise_id.clone_from(exercise_id);
-                    projection.operation_run_id.clone_from(operation_run_id);
-                    projection
-                        .operator_session_id
-                        .clone_from(operator_session_id);
-                    projection.team_id.clone_from(team_id);
-                    projection.client_id.clone_from(client_id);
-                    projection.last_sequence = envelope.sequence;
+                    {
+                        let projection = engagement(&mut state, engagement_id);
+                        projection.workspace_id = Some(workspace_id.clone());
+                        projection.session_id = Some(session_id.clone());
+                        projection.exercise_id.clone_from(exercise_id);
+                        projection.operation_run_id.clone_from(operation_run_id);
+                        projection
+                            .operator_session_id
+                            .clone_from(operator_session_id);
+                        projection.team_id.clone_from(team_id);
+                        projection.client_id.clone_from(client_id);
+                        projection.last_sequence = envelope.sequence;
+                    }
+                    if let Some(graph) = state.task_graphs.get_mut(engagement_id) {
+                        graph.workspace_id = Some(workspace_id.clone());
+                        graph.session_id = Some(session_id.clone());
+                        graph.exercise_id.clone_from(exercise_id);
+                        graph.operation_run_id.clone_from(operation_run_id);
+                        graph.operator_session_id.clone_from(operator_session_id);
+                        graph.team_id.clone_from(team_id);
+                        graph.client_id.clone_from(client_id);
+                        graph.last_sequence = envelope.sequence;
+                    }
                 }
             }
             Event::PlanAccepted {
@@ -184,10 +196,21 @@ impl ProjectionStore {
                 plan,
             } => {
                 if let Some(engagement_id) = &envelope.engagement_id {
-                    let projection = engagement(&mut state, engagement_id);
-                    projection.plan_revision = Some(*revision);
-                    projection.task_count = *task_count;
-                    projection.last_sequence = envelope.sequence;
+                    let ownership = {
+                        let projection = engagement(&mut state, engagement_id);
+                        projection.plan_revision = Some(*revision);
+                        projection.task_count = *task_count;
+                        projection.last_sequence = envelope.sequence;
+                        (
+                            projection.workspace_id.clone(),
+                            projection.session_id.clone(),
+                            projection.exercise_id.clone(),
+                            projection.operation_run_id.clone(),
+                            projection.operator_session_id.clone(),
+                            projection.team_id.clone(),
+                            projection.client_id.clone(),
+                        )
+                    };
                     if let Some(plan) = plan {
                         let prior = state.task_graphs.remove(engagement_id);
                         let tasks = plan
@@ -218,6 +241,13 @@ impl ProjectionStore {
                             engagement_id.clone(),
                             TaskGraphProjection {
                                 engagement_id: engagement_id.clone(),
+                                workspace_id: ownership.0,
+                                session_id: ownership.1,
+                                exercise_id: ownership.2,
+                                operation_run_id: ownership.3,
+                                operator_session_id: ownership.4,
+                                team_id: ownership.5,
+                                client_id: ownership.6,
                                 revision: *revision,
                                 objective: plan.objective.clone(),
                                 tasks,
@@ -697,7 +727,7 @@ fn engagement<'a>(
 
 #[cfg(test)]
 mod tests {
-    use xai_grok_protocol::{EventId, PROTOCOL_VERSION};
+    use xai_grok_protocol::{EventId, PROTOCOL_VERSION, TaskingPlan};
 
     use super::*;
 
@@ -730,5 +760,121 @@ mod tests {
         let providers: Vec<ProviderProjection> = serde_json::from_value(snapshot.value).unwrap();
         assert_eq!(providers[0].generation, 2);
         assert_eq!(providers[0].health, ServiceHealth::Ready);
+    }
+
+    #[tokio::test]
+    async fn task_graph_owns_its_session_when_engagement_precedes_plan() {
+        let store = ProjectionStore::new();
+        let engagement_id: EngagementId = "engagement".into();
+        let operator_session_id: OperatorSessionId = "operator-session".into();
+        store
+            .apply(&EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                event_id: EventId::new(),
+                engagement_id: Some(engagement_id.clone()),
+                sequence: 1,
+                causation_id: None,
+                generation: 0,
+                observed_unix_ms: 1,
+                event: Event::EngagementAccepted {
+                    workspace_id: "workspace".to_owned(),
+                    session_id: "legacy-session".to_owned(),
+                    exercise_id: Some("exercise".into()),
+                    operation_run_id: Some("run".into()),
+                    operator_session_id: Some(operator_session_id.clone()),
+                    team_id: Some("team".into()),
+                    client_id: Some("client".into()),
+                },
+            })
+            .await;
+        store
+            .apply(&EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                event_id: EventId::new(),
+                engagement_id: Some(engagement_id.clone()),
+                sequence: 2,
+                causation_id: None,
+                generation: 0,
+                observed_unix_ms: 2,
+                event: Event::PlanAccepted {
+                    revision: 1,
+                    task_count: 0,
+                    plan: Some(TaskingPlan {
+                        engagement_id: engagement_id.clone(),
+                        revision: 1,
+                        objective: "objective".to_owned(),
+                        tasks: Vec::new(),
+                    }),
+                },
+            })
+            .await;
+
+        let graph: TaskGraphProjection = serde_json::from_value(
+            store
+                .query(ProjectionQuery::TaskGraph { engagement_id })
+                .await
+                .value,
+        )
+        .unwrap();
+        assert_eq!(graph.operator_session_id, Some(operator_session_id));
+        assert_eq!(graph.workspace_id.as_deref(), Some("workspace"));
+        assert_eq!(graph.operation_run_id, Some("run".into()));
+    }
+
+    #[tokio::test]
+    async fn late_engagement_metadata_updates_an_existing_task_graph() {
+        let store = ProjectionStore::new();
+        let engagement_id: EngagementId = "engagement".into();
+        store
+            .apply(&EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                event_id: EventId::new(),
+                engagement_id: Some(engagement_id.clone()),
+                sequence: 1,
+                causation_id: None,
+                generation: 0,
+                observed_unix_ms: 1,
+                event: Event::PlanAccepted {
+                    revision: 1,
+                    task_count: 0,
+                    plan: Some(TaskingPlan {
+                        engagement_id: engagement_id.clone(),
+                        revision: 1,
+                        objective: "objective".to_owned(),
+                        tasks: Vec::new(),
+                    }),
+                },
+            })
+            .await;
+        store
+            .apply(&EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                event_id: EventId::new(),
+                engagement_id: Some(engagement_id.clone()),
+                sequence: 2,
+                causation_id: None,
+                generation: 0,
+                observed_unix_ms: 2,
+                event: Event::EngagementAccepted {
+                    workspace_id: "workspace".to_owned(),
+                    session_id: "legacy-session".to_owned(),
+                    exercise_id: Some("exercise".into()),
+                    operation_run_id: Some("run".into()),
+                    operator_session_id: Some("operator-session".into()),
+                    team_id: None,
+                    client_id: None,
+                },
+            })
+            .await;
+
+        let graph: TaskGraphProjection = serde_json::from_value(
+            store
+                .query(ProjectionQuery::TaskGraph { engagement_id })
+                .await
+                .value,
+        )
+        .unwrap();
+        assert_eq!(graph.operator_session_id, Some("operator-session".into()));
+        assert_eq!(graph.last_sequence, 2);
     }
 }

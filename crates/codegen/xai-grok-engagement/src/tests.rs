@@ -961,6 +961,7 @@ fn normalized_schema_and_checkpoint_cover_every_durable_coordinate() {
         "snapshots",
         "job_checkpoints",
         "pending_stages",
+        "control_commands",
     ] {
         let exists = connection
             .query_row(
@@ -1003,6 +1004,42 @@ fn normalized_schema_and_checkpoint_cover_every_durable_coordinate() {
         .unwrap();
     assert_eq!(task_id.as_deref(), Some("task-a"));
     assert_eq!(action_id.as_deref(), Some("action-a"));
+}
+
+#[test]
+fn control_command_claims_are_restart_safe_and_content_bound() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("state.sqlite");
+    {
+        let mut store = EngagementStore::open(&path).unwrap();
+        assert_eq!(
+            store.claim_control_command("command-a", "hash-a").unwrap(),
+            crate::ControlCommandClaim::New
+        );
+        assert_eq!(
+            store.claim_control_command("command-a", "hash-a").unwrap(),
+            crate::ControlCommandClaim::InDoubt
+        );
+        store
+            .complete_control_command("command-a", "hash-a", "{\"response\":\"ok\"}")
+            .unwrap();
+    }
+
+    let mut reopened = EngagementStore::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .claim_control_command("command-a", "hash-a")
+            .unwrap(),
+        crate::ControlCommandClaim::Completed("{\"response\":\"ok\"}".to_owned())
+    );
+    assert!(matches!(
+        reopened.claim_control_command("command-a", "different"),
+        Err(crate::EngagementError::ControlCommandConflict(command_id))
+            if command_id == "command-a"
+    ));
+    reopened
+        .complete_control_command("command-a", "hash-a", "{\"response\":\"ok\"}")
+        .unwrap();
 }
 
 #[test]

@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xai_grok_engagement::{
-    EngagementCheckpoint, EngagementCoordinator, NewEngagement, QueuePriority,
+    ControlCommandClaim, EngagementCheckpoint, EngagementCoordinator, NewEngagement, QueuePriority,
 };
 use xai_grok_protocol::{
     CapabilityRequirement, Command, CommandEnvelope, CommandId, EngagementId, Event, EventBatch,
@@ -87,7 +87,12 @@ struct QueuedCommand {
 struct ResponseCache {
     capacity: usize,
     order: VecDeque<CommandId>,
-    responses: HashMap<CommandId, ResponseEnvelope>,
+    responses: HashMap<CommandId, CachedResponse>,
+}
+
+struct CachedResponse {
+    command_hash: String,
+    response: ResponseEnvelope,
 }
 
 impl ResponseCache {
@@ -99,17 +104,36 @@ impl ResponseCache {
         }
     }
 
-    fn get(&self, command_id: &CommandId) -> Option<ResponseEnvelope> {
-        self.responses.get(command_id).cloned()
+    fn get(
+        &self,
+        command_id: &CommandId,
+        command_hash: &str,
+    ) -> Result<Option<ResponseEnvelope>, ProtocolError> {
+        let Some(cached) = self.responses.get(command_id) else {
+            return Ok(None);
+        };
+        if cached.command_hash != command_hash {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::Conflict,
+                format!("command ID {command_id} was reused with different command content"),
+            ));
+        }
+        Ok(Some(cached.response.clone()))
     }
 
-    fn insert(&mut self, response: ResponseEnvelope) {
+    fn insert(&mut self, command_hash: String, response: ResponseEnvelope) {
         let command_id = response.command_id.clone();
         if self.responses.contains_key(&command_id) {
             return;
         }
         self.order.push_back(command_id.clone());
-        self.responses.insert(command_id, response);
+        self.responses.insert(
+            command_id,
+            CachedResponse {
+                command_hash,
+                response,
+            },
+        );
         while self.responses.len() > self.capacity {
             if let Some(expired) = self.order.pop_front() {
                 self.responses.remove(&expired);
@@ -399,10 +423,84 @@ struct ControlPlaneCore {
 
 impl ControlPlaneCore {
     async fn process(self: &Arc<Self>, envelope: CommandEnvelope) -> ResponseEnvelope {
-        if let Some(response) = self.responses.lock().await.get(&envelope.command_id) {
-            return response;
-        }
         let command_id = envelope.command_id.clone();
+        let command_hash = match canonical_json_bytes(&envelope.command) {
+            Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+            Err(error) => {
+                return ResponseEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    command_id,
+                    response: Err(error),
+                };
+            }
+        };
+        match self
+            .responses
+            .lock()
+            .await
+            .get(&envelope.command_id, &command_hash)
+        {
+            Ok(Some(response)) => return response,
+            Ok(None) => {}
+            Err(error) => {
+                return ResponseEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    command_id,
+                    response: Err(error),
+                };
+            }
+        }
+        let durable = command_requires_durable_response(&envelope.command);
+        if durable {
+            match self
+                .engagement
+                .claim_control_command(command_id.to_string(), command_hash.clone())
+                .await
+            {
+                Ok(ControlCommandClaim::New) => {}
+                Ok(ControlCommandClaim::Completed(response_json)) => {
+                    let response = match serde_json::from_str::<ResponseEnvelope>(&response_json) {
+                        Ok(response) if response.command_id == command_id => response,
+                        Ok(_) => ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            command_id,
+                            response: Err(internal_error(
+                                "persisted command response has a mismatched command ID",
+                            )),
+                        },
+                        Err(error) => ResponseEnvelope {
+                            protocol_version: PROTOCOL_VERSION,
+                            command_id,
+                            response: Err(internal_error(format!(
+                                "persisted command response is invalid: {error}"
+                            ))),
+                        },
+                    };
+                    self.responses
+                        .lock()
+                        .await
+                        .insert(command_hash, response.clone());
+                    return response;
+                }
+                Ok(ControlCommandClaim::InDoubt) => {
+                    return ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        command_id,
+                        response: Err(ProtocolError::new(
+                            ProtocolErrorCode::ServiceUnavailable,
+                            "command execution began before daemon recovery; it will not be repeated because its outcome is indeterminate",
+                        )),
+                    };
+                }
+                Err(error) => {
+                    return ResponseEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        command_id,
+                        response: Err(engagement_error(error)),
+                    };
+                }
+            }
+        }
         let result = match envelope.validate(now_unix_ms()) {
             Ok(()) => self.handle(envelope).await,
             Err(error) => Err(error),
@@ -412,7 +510,29 @@ impl ControlPlaneCore {
             command_id,
             response: result,
         };
-        self.responses.lock().await.insert(response.clone());
+        if durable {
+            let persisted = serde_json::to_string(&response).map_err(internal_error);
+            let persisted = match persisted {
+                Ok(response_json) => self
+                    .engagement
+                    .complete_control_command(
+                        response.command_id.to_string(),
+                        command_hash.clone(),
+                        response_json,
+                    )
+                    .await
+                    .map_err(engagement_error),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = persisted {
+                tracing::error!(%error, command_id = %response.command_id, "failed to persist command result; stopping daemon");
+                self.shutdown.cancel();
+            }
+        }
+        self.responses
+            .lock()
+            .await
+            .insert(command_hash, response.clone());
         response
     }
 
@@ -1455,12 +1575,10 @@ impl ControlPlaneCore {
                 generation,
                 health,
             } => {
-                if self.providers.generation(&provider_id).await != Some(generation) {
+                if self.providers.generation(&provider_id).await.is_none() {
                     return Err(ProtocolError::new(
                         ProtocolErrorCode::UnknownProvider,
-                        format!(
-                            "provider {provider_id} generation {generation} has no executable registration"
-                        ),
+                        format!("provider {provider_id} has no executable registration"),
                     ));
                 }
                 let record = self
@@ -2164,29 +2282,15 @@ impl ControlPlaneCore {
         }
 
         let deadline = tokio::time::Instant::now() + Duration::from_millis(request.wait_ms.into());
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return self.read_event_page(request).await;
-            }
-            match tokio::time::timeout(remaining, live_events.recv()).await {
-                Ok(Ok(event))
-                    if request
-                        .engagement_id
-                        .as_ref()
-                        .is_none_or(|expected| event.engagement_id.as_ref() == Some(expected)) =>
-                {
-                    return self.read_event_page(request).await;
-                }
-                Ok(Ok(_)) => continue,
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                    return self.read_event_page(request).await;
-                }
-                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
-                    return self.read_event_page(request).await;
-                }
-            }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if !remaining.is_zero() {
+            // Even an unrelated durable event advances a filtered cursor.
+            // Read a fresh indexed page after the first wakeup so a quiet
+            // engagement does not repeatedly scan or wait behind global
+            // traffic it has already observed.
+            let _ = tokio::time::timeout(remaining, live_events.recv()).await;
         }
+        self.read_event_page(request).await
     }
 
     async fn read_event_page(
@@ -2313,8 +2417,14 @@ impl ControlPlaneHandle {
     ) -> Result<(u64, String), ProtocolError> {
         let manifest = provider.manifest();
         let provider_id = manifest.provider_id.clone();
+        let worker_generation = provider.worker_generation().await;
         let (registry_generation, manifest_hash) = self.core.providers.register(provider).await?;
-        let mut service = match self.core.services.register(manifest).await {
+        let mut service = match self
+            .core
+            .services
+            .register(manifest, worker_generation)
+            .await
+        {
             Ok(service) => service,
             Err(error) => {
                 self.core
@@ -2324,20 +2434,6 @@ impl ControlPlaneHandle {
                 return Err(error);
             }
         };
-        if registry_generation != service.generation {
-            self.core
-                .providers
-                .unregister(&provider_id, registry_generation)
-                .await;
-            self.core
-                .services
-                .remove(&provider_id, service.generation)
-                .await;
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::Conflict,
-                "provider registry and service supervisor generations diverged",
-            ));
-        }
         service = self
             .core
             .services
@@ -2466,13 +2562,17 @@ impl ControlPlane {
                                 .await;
                             if let Ok(record) = maintenance_core
                                 .services
-                                .heartbeat(
+                                .observe_worker_generation(
                                     &capacity.provider_id,
-                                    capacity.generation,
+                                    capacity.worker_generation,
                                     health,
                                 )
                                 .await
-                                && previous.as_ref().is_some_and(|record| record.health != health)
+                                && previous.as_ref().is_some_and(|previous| {
+                                    previous.health != record.health
+                                        || previous.generation != record.generation
+                                        || previous.service_id != record.service_id
+                                })
                                 && let Err(error) = maintenance_core
                                     .emit(
                                         None,
@@ -2542,8 +2642,23 @@ fn engagement_error(error: xai_grok_engagement::EngagementError) -> ProtocolErro
         error @ xai_grok_engagement::EngagementError::NotFound(_) => {
             ProtocolError::new(ProtocolErrorCode::NotFound, error.to_string())
         }
+        error @ xai_grok_engagement::EngagementError::ControlCommandConflict(_) => {
+            ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string())
+        }
         error => internal_error(error),
     }
+}
+
+fn command_requires_durable_response(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Hello(_)
+            | Command::ProviderHeartbeat { .. }
+            | Command::InspectArtifactUpload { .. }
+            | Command::ReadArtifact { .. }
+            | Command::ReadEvents(_)
+            | Command::QueryProjection(_)
+    )
 }
 
 fn internal_error(error: impl std::fmt::Display) -> ProtocolError {
@@ -2629,7 +2744,7 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use xai_grok_protocol::{
         ArtifactContract, CancellationSemantics, CapabilityManifest, CapabilityRequirement,
@@ -2645,6 +2760,33 @@ mod tests {
 
     use super::*;
     use crate::provider::FunctionProvider;
+
+    struct GenerationProvider {
+        manifest: CapabilityManifest,
+        worker_generation: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionProvider for GenerationProvider {
+        fn manifest(&self) -> CapabilityManifest {
+            self.manifest.clone()
+        }
+
+        async fn worker_generation(&self) -> u64 {
+            self.worker_generation.load(Ordering::Acquire)
+        }
+
+        async fn execute(
+            &self,
+            _dispatch: ProviderDispatch,
+        ) -> Result<ProviderOutput, ProtocolError> {
+            Ok(ProviderOutput::default())
+        }
+
+        async fn cancel(&self, _request_id: &RequestId) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
 
     fn envelope(command: Command) -> CommandEnvelope {
         CommandEnvelope {
@@ -2840,6 +2982,169 @@ mod tests {
         assert_eq!(catalog.sessions[0].session_id, session_id);
         handle.shutdown_token().cancel();
         reopened.wait().await;
+    }
+
+    #[tokio::test]
+    async fn mutating_command_response_is_replayed_after_restart_and_bound_to_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().to_path_buf();
+        let command_id = CommandId::from_string("stable-create-exercise");
+        let command = Command::CreateExercise(CreateExercise {
+            workspace_id: WorkspaceId::from_string("workspace-a"),
+            name: "Restart-safe assessment".to_owned(),
+            objective: "Prove durable command identity".to_owned(),
+            scope: Vec::new(),
+        });
+        let first_response = {
+            let control_plane = ControlPlane::open(ControlPlaneConfig::new(&state_path))
+                .await
+                .unwrap();
+            let handle = control_plane.handle();
+            let response = handle
+                .submit(CommandEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    command_id: command_id.clone(),
+                    causation_id: None,
+                    deadline_unix_ms: now_unix_ms() + 5_000,
+                    command: command.clone(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                response.response,
+                Ok(Response::ExerciseCreated { .. })
+            ));
+            handle.shutdown_token().cancel();
+            control_plane.wait().await;
+            response
+        };
+
+        let reopened = ControlPlane::open(ControlPlaneConfig::new(&state_path))
+            .await
+            .unwrap();
+        let handle = reopened.handle();
+        let replay = handle
+            .submit(CommandEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                command_id: command_id.clone(),
+                causation_id: None,
+                deadline_unix_ms: now_unix_ms() + 5_000,
+                command,
+            })
+            .await
+            .unwrap();
+        assert_eq!(replay, first_response);
+
+        let conflict = handle
+            .submit(CommandEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                command_id,
+                causation_id: None,
+                deadline_unix_ms: now_unix_ms() + 5_000,
+                command: Command::CreateExercise(CreateExercise {
+                    workspace_id: WorkspaceId::from_string("workspace-a"),
+                    name: "Different content".to_owned(),
+                    objective: "Must not execute".to_owned(),
+                    scope: Vec::new(),
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            conflict.response,
+            Err(ProtocolError {
+                code: ProtocolErrorCode::Conflict,
+                ..
+            })
+        ));
+
+        let catalog = handle
+            .submit(envelope(Command::QueryProjection(
+                ProjectionQuery::OperatorCatalog {
+                    workspace_id: Some(WorkspaceId::from_string("workspace-a")),
+                },
+            )))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Projection(snapshot) = catalog else {
+            panic!("expected operator catalog");
+        };
+        let catalog: OperatorCatalog = serde_json::from_value(snapshot.value).unwrap();
+        assert_eq!(catalog.exercises.len(), 1);
+
+        handle.shutdown_token().cancel();
+        reopened.wait().await;
+    }
+
+    #[tokio::test]
+    async fn indeterminate_pre_restart_command_is_never_executed_twice() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().to_path_buf();
+        std::fs::create_dir_all(&state_path).unwrap();
+        let command_id = CommandId::from_string("interrupted-create-exercise");
+        let command = Command::CreateExercise(CreateExercise {
+            workspace_id: WorkspaceId::from_string("workspace-a"),
+            name: "Must remain absent".to_owned(),
+            objective: "Simulated interrupted command".to_owned(),
+            scope: Vec::new(),
+        });
+        let command_hash = blake3::hash(&canonical_json_bytes(&command).unwrap())
+            .to_hex()
+            .to_string();
+        {
+            let mut store =
+                xai_grok_engagement::EngagementStore::open(&state_path.join("engagements.sqlite3"))
+                    .unwrap();
+            assert_eq!(
+                store
+                    .claim_control_command(command_id.as_str(), &command_hash)
+                    .unwrap(),
+                ControlCommandClaim::New
+            );
+        }
+
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(&state_path))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        let response = handle
+            .submit(CommandEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                command_id,
+                causation_id: None,
+                deadline_unix_ms: now_unix_ms() + 5_000,
+                command,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.response,
+            Err(ProtocolError {
+                code: ProtocolErrorCode::ServiceUnavailable,
+                retryable: false,
+                ..
+            })
+        ));
+        let catalog = handle
+            .submit(envelope(Command::QueryProjection(
+                ProjectionQuery::OperatorCatalog {
+                    workspace_id: Some(WorkspaceId::from_string("workspace-a")),
+                },
+            )))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Projection(snapshot) = catalog else {
+            panic!("expected operator catalog");
+        };
+        let catalog: OperatorCatalog = serde_json::from_value(snapshot.value).unwrap();
+        assert!(catalog.exercises.is_empty());
+
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
     }
 
     #[tokio::test]
@@ -3509,6 +3814,68 @@ mod tests {
         assert_eq!(snapshot.value["providers"][0]["available_permits"], 1);
         assert_eq!(snapshot.value["providers"][0]["queue_capacity"], 4);
         assert_eq!(snapshot.value["overloads"], serde_json::json!({}));
+
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_rotates_service_generation_after_owned_worker_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = ControlPlaneConfig::new(directory.path());
+        config.heartbeat_timeout_ms = 200;
+        let control_plane = ControlPlane::open(config).await.unwrap();
+        let handle = control_plane.handle();
+        let worker_generation = Arc::new(AtomicU64::new(1));
+        handle
+            .register_provider(Arc::new(GenerationProvider {
+                manifest: provider_manifest(),
+                worker_generation: worker_generation.clone(),
+            }))
+            .await
+            .unwrap();
+
+        let first = handle
+            .submit(envelope(Command::QueryProjection(
+                ProjectionQuery::Providers,
+            )))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Projection(first) = first else {
+            panic!("expected provider projection");
+        };
+        let first_generation = first.value[0]["generation"].as_u64().unwrap();
+        let first_service_id = first.value[0]["service_id"].as_str().unwrap().to_owned();
+
+        worker_generation.store(2, Ordering::Release);
+        let updated = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = handle
+                    .submit(envelope(Command::QueryProjection(
+                        ProjectionQuery::Providers,
+                    )))
+                    .await
+                    .unwrap()
+                    .response
+                    .unwrap();
+                let Response::Projection(snapshot) = response else {
+                    panic!("expected provider projection");
+                };
+                if snapshot.value[0]["generation"].as_u64() == Some(first_generation + 1) {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("maintenance must observe the replacement worker");
+        assert_ne!(
+            updated.value[0]["service_id"].as_str().unwrap(),
+            first_service_id
+        );
+        assert_eq!(handle.providers().capacity().await[0].worker_generation, 2);
 
         handle.shutdown_token().cancel();
         control_plane.wait().await;

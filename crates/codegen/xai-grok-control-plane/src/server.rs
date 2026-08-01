@@ -227,8 +227,8 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use xai_grok_control_client::{ClientIdentity, ControlPlaneClient};
-    use xai_grok_protocol::{Command, ProjectionQuery, Response};
+    use xai_grok_control_client::{ClientIdentity, ControlPlaneClient, SourceIngressAdapter};
+    use xai_grok_protocol::{BuzzIngress, Command, ProjectionQuery, QmIngress, Response};
     use xai_grok_tools::computer::local::DaemonTerminalBackend;
     use xai_grok_tools::computer::types::{TaskKind, TerminalBackend, TerminalRunRequest};
     use xai_grok_tools::notification::ToolNotificationHandle;
@@ -266,6 +266,93 @@ mod tests {
         handle.shutdown_token().cancel();
         control_plane.wait().await;
         server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn buzz_and_qm_adapters_ack_deduplicate_and_resume_over_real_ipc() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state");
+        let socket_path = directory.path().join("grokd.sock");
+        let mut config = ControlPlaneConfig::new(&state_path);
+        config.auto_schedule_plans = false;
+        let control_plane = ControlPlane::open(config).await.unwrap();
+        let handle = control_plane.handle();
+        let server = ControlPlaneServer::bind(ServerConfig::new(&socket_path), handle.clone())
+            .await
+            .unwrap();
+        let server_task = tokio::spawn(server.run());
+        let client = ControlPlaneClient::connect(
+            &socket_path,
+            ClientIdentity::new("source-adapter-test", env!("CARGO_PKG_VERSION")),
+        )
+        .await
+        .unwrap();
+        let adapter = SourceIngressAdapter::new(&client);
+        let buzz_delivery = BuzzIngress {
+            event_id: "buzz-event-17".to_owned(),
+            community: "red-team".to_owned(),
+            channel_id: "operation-room".to_owned(),
+            author: "operator-a".to_owned(),
+            content: "inventory the approved target range".to_owned(),
+        };
+        let first = adapter.deliver_buzz(buzz_delivery.clone()).await.unwrap();
+        assert!(first.accepted);
+        let duplicate = adapter.deliver_buzz(buzz_delivery.clone()).await.unwrap();
+        assert!(!duplicate.accepted);
+        assert_eq!(duplicate.engagement_id, first.engagement_id);
+
+        let qm = adapter
+            .deliver_qm(QmIngress {
+                job_id: "qm-job-9".to_owned(),
+                scope_id: "assessment-4".to_owned(),
+                room_id: Some("operator-room".to_owned()),
+                request: "collect the current service inventory".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert!(qm.accepted);
+        assert_ne!(qm.engagement_id, first.engagement_id);
+
+        let progress = adapter.progress(&first, 0, 16, 0).await.unwrap();
+        assert_eq!(progress.references.len(), 1);
+        assert_eq!(progress.references[0].event_kind, "engagement_accepted");
+        assert_eq!(progress.references[0].sequence, 1);
+        assert_eq!(progress.next_sequence, 2);
+        assert!(progress.caught_up);
+
+        drop(client);
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+        server_task.await.unwrap().unwrap();
+        drop(handle);
+
+        let mut config = ControlPlaneConfig::new(&state_path);
+        config.auto_schedule_plans = false;
+        let restarted = ControlPlane::open(config).await.unwrap();
+        let restarted_handle = restarted.handle();
+        let restarted_server =
+            ControlPlaneServer::bind(ServerConfig::new(&socket_path), restarted_handle.clone())
+                .await
+                .unwrap();
+        let restarted_server_task = tokio::spawn(restarted_server.run());
+        let reconnected = ControlPlaneClient::connect(
+            &socket_path,
+            ClientIdentity::new("source-adapter-test", env!("CARGO_PKG_VERSION")),
+        )
+        .await
+        .unwrap();
+        let restarted_adapter = SourceIngressAdapter::new(&reconnected);
+        let replay = restarted_adapter.deliver_buzz(buzz_delivery).await.unwrap();
+        assert!(!replay.accepted);
+        assert_eq!(replay.engagement_id, first.engagement_id);
+        let replayed_progress = restarted_adapter.progress(&replay, 0, 16, 0).await.unwrap();
+        assert_eq!(replayed_progress.references, progress.references);
+        assert_eq!(replayed_progress.next_sequence, progress.next_sequence);
+
+        drop(reconnected);
+        restarted_handle.shutdown_token().cancel();
+        restarted.wait().await;
+        restarted_server_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

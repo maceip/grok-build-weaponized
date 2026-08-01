@@ -4,16 +4,19 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use xai_grok_control_client::{ClientIdentity, ControlPlaneClient};
+use xai_grok_control_client::{
+    ClientIdentity, ControlPlaneClient, SourceAdapterFrame, SourceDeliveryReceipt,
+    SourceIngressAdapter,
+};
 use xai_grok_protocol::{
-    ArtifactId, ChannelId, ClaimTeamResource, ClientId, Command, CommandId, CreateExercise,
-    CreateFinding, CreateOperationRun, CreateOperatorSession, CreatePlaybook, CreateTeamWorkItem,
-    EventReadRequest, EvidenceId, ExerciseId, FindingSeverity, FindingStatus, IngressEnvelope,
-    IngressSource, OperationId, OperationRunId, OperatorSessionId, PlaybookId, PlaybookStep,
-    PostTeamMessage, ProjectionQuery, ProviderId, RecordExerciseEvidence, RequestId,
-    ResourceClaimId, Response, RuntimeProfile, SetTeamPresence, TargetId, TaskId, TeamClient,
-    TeamId, TeamPresenceState, TeamWorkItemId, TeamWorkItemStatus, WorkspaceId,
-    parse_scope_targets,
+    ArtifactId, BuzzIngress, ChannelId, ClaimTeamResource, ClientId, Command, CommandId,
+    CreateExercise, CreateFinding, CreateOperationRun, CreateOperatorSession, CreatePlaybook,
+    CreateTeamWorkItem, EventReadRequest, EvidenceId, ExerciseId, FindingSeverity, FindingStatus,
+    IngressEnvelope, IngressSource, OperationId, OperationRunId, OperatorSessionId,
+    PROTOCOL_VERSION, PlaybookId, PlaybookStep, PostTeamMessage, ProjectionQuery, ProviderId,
+    QmIngress, RecordExerciseEvidence, RequestId, ResourceClaimId, Response, RuntimeProfile,
+    SetTeamPresence, TargetId, TaskId, TeamClient, TeamId, TeamPresenceState, TeamWorkItemId,
+    TeamWorkItemStatus, WorkspaceId, parse_scope_targets,
 };
 
 const USAGE: &str = "\
@@ -47,6 +50,8 @@ Commands:
   job cancel ID
   job cleanup ID
   submit --workspace ID [--exercise ID] [--run ID] --session ID --request TEXT|-
+  ingress buzz --event-id ID --community ID --channel ID --author ID --content TEXT|- [--follow] [--after N]
+  ingress qm --job-id ID --scope ID [--room ID] --request TEXT|- [--follow] [--after N]
   artifact put FILE --media-type TYPE [--content-hash BLAKE3] [--chunk-bytes N]
   artifact resume UPLOAD_ID FILE [--chunk-bytes N]
   artifact status UPLOAD_ID
@@ -115,9 +120,156 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "provider" => provider(&control, arguments).await,
         "job" => job(&control, arguments).await,
         "submit" => submit(&control, arguments).await,
+        "ingress" => source_ingress(&control, arguments).await,
         "artifact" => artifact(&control, arguments).await,
         _ => Err(format!("unknown command {command:?}\n{USAGE}").into()),
     }
+}
+
+#[derive(Clone, Copy)]
+struct FollowOptions {
+    follow: bool,
+    after_sequence: u64,
+    wait_ms: u32,
+    timeout_ms: u64,
+}
+
+impl Default for FollowOptions {
+    fn default() -> Self {
+        Self {
+            follow: false,
+            after_sequence: 0,
+            wait_ms: 30_000,
+            timeout_ms: 30 * 60 * 1_000,
+        }
+    }
+}
+
+async fn source_ingress(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match arguments.pop_front().as_deref() {
+        Some("buzz") => buzz_ingress(control, arguments).await,
+        Some("qm") => qm_ingress(control, arguments).await,
+        _ => Err(format!("ingress requires buzz or qm\n{USAGE}").into()),
+    }
+}
+
+async fn buzz_ingress(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut event_id = None;
+    let mut community = None;
+    let mut channel_id = None;
+    let mut author = None;
+    let mut content = None;
+    let mut follow = FollowOptions::default();
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--event-id" => event_id = Some(value(&mut arguments, "--event-id")?),
+            "--community" => community = Some(value(&mut arguments, "--community")?),
+            "--channel" => channel_id = Some(value(&mut arguments, "--channel")?),
+            "--author" => author = Some(value(&mut arguments, "--author")?),
+            "--content" => content = Some(value(&mut arguments, "--content")?),
+            "--follow" => follow.follow = true,
+            "--after" => follow.after_sequence = value(&mut arguments, "--after")?.parse()?,
+            "--wait-ms" => follow.wait_ms = value(&mut arguments, "--wait-ms")?.parse()?,
+            "--timeout-ms" => follow.timeout_ms = value(&mut arguments, "--timeout-ms")?.parse()?,
+            other => return Err(format!("unknown Buzz ingress option {other:?}").into()),
+        }
+    }
+    let delivery = BuzzIngress {
+        event_id: event_id.ok_or("Buzz ingress requires --event-id")?,
+        community: community.ok_or("Buzz ingress requires --community")?,
+        channel_id: channel_id.ok_or("Buzz ingress requires --channel")?,
+        author: author.ok_or("Buzz ingress requires --author")?,
+        content: read_stdin_value(content.ok_or("Buzz ingress requires --content")?)?,
+    };
+    let adapter = SourceIngressAdapter::new(control);
+    let receipt = adapter.deliver_buzz(delivery).await?;
+    publish_source_delivery(&adapter, receipt, follow).await
+}
+
+async fn qm_ingress(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut job_id = None;
+    let mut scope_id = None;
+    let mut room_id = None;
+    let mut request = None;
+    let mut follow = FollowOptions::default();
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--job-id" => job_id = Some(value(&mut arguments, "--job-id")?),
+            "--scope" => scope_id = Some(value(&mut arguments, "--scope")?),
+            "--room" => room_id = Some(value(&mut arguments, "--room")?),
+            "--request" => request = Some(value(&mut arguments, "--request")?),
+            "--follow" => follow.follow = true,
+            "--after" => follow.after_sequence = value(&mut arguments, "--after")?.parse()?,
+            "--wait-ms" => follow.wait_ms = value(&mut arguments, "--wait-ms")?.parse()?,
+            "--timeout-ms" => follow.timeout_ms = value(&mut arguments, "--timeout-ms")?.parse()?,
+            other => return Err(format!("unknown QM ingress option {other:?}").into()),
+        }
+    }
+    let delivery = QmIngress {
+        job_id: job_id.ok_or("QM ingress requires --job-id")?,
+        scope_id: scope_id.ok_or("QM ingress requires --scope")?,
+        room_id,
+        request: read_stdin_value(request.ok_or("QM ingress requires --request")?)?,
+    };
+    let adapter = SourceIngressAdapter::new(control);
+    let receipt = adapter.deliver_qm(delivery).await?;
+    publish_source_delivery(&adapter, receipt, follow).await
+}
+
+async fn publish_source_delivery(
+    adapter: &SourceIngressAdapter<'_>,
+    receipt: SourceDeliveryReceipt,
+    options: FollowOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !options.follow {
+        return write_json(&SourceAdapterFrame::Accepted { receipt });
+    }
+    write_json_line(&SourceAdapterFrame::Accepted {
+        receipt: receipt.clone(),
+    })?;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(options.timeout_ms.max(1));
+    let mut cursor = options.after_sequence;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "source delivery {} did not reach a terminal task state within {}ms; resume with --after {cursor}",
+                receipt.source_event_id, options.timeout_ms
+            )
+            .into());
+        }
+        let page = adapter
+            .progress(&receipt, cursor, 128, options.wait_ms.min(60_000))
+            .await?;
+        cursor = page.next_sequence;
+        write_json_line(&SourceAdapterFrame::Progress { page })?;
+        if adapter.is_terminal(receipt.engagement_id.clone()).await? {
+            write_json_line(&SourceAdapterFrame::Complete {
+                protocol_version: PROTOCOL_VERSION,
+                source: receipt.source,
+                source_event_id: receipt.source_event_id,
+                engagement_id: receipt.engagement_id,
+                next_sequence: cursor,
+            })?;
+            return Ok(());
+        }
+    }
+}
+
+fn read_stdin_value(mut value: String) -> Result<String, Box<dyn std::error::Error>> {
+    if value == "-" {
+        value.clear();
+        std::io::stdin().read_to_string(&mut value)?;
+    }
+    Ok(value)
 }
 
 async fn provider(
@@ -1477,5 +1629,13 @@ fn reject_remaining(arguments: &VecDeque<String>) -> Result<(), Box<dyn std::err
 fn write_json(value: &impl serde::Serialize) -> Result<(), Box<dyn std::error::Error>> {
     serde_json::to_writer_pretty(std::io::stdout().lock(), value)?;
     println!();
+    Ok(())
+}
+
+fn write_json_line(value: &impl serde::Serialize) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, value)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
     Ok(())
 }
