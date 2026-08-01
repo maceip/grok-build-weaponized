@@ -66,6 +66,7 @@ impl NativeExecutionProvider {
             operation("native.command.status", "Read native command status", false),
             operation("native.command.wait", "Wait for native command", true),
             operation("native.command.output", "Read native command output", true),
+            operation("native.command.stdin", "Write native command stdin", true),
             operation("native.command.cancel", "Cancel native command", false),
             operation(
                 "native.command.cleanup",
@@ -99,6 +100,7 @@ impl NativeExecutionProvider {
                 "process_tree_cancellation",
                 "stream_identity",
                 "stream_sequence",
+                "streaming_stdin",
                 "terminal_cleanup",
             ]
             .into_iter()
@@ -210,6 +212,16 @@ impl ExecutionProvider for NativeExecutionProvider {
                             input.maximum_records,
                             input.maximum_bytes,
                         )
+                        .await
+                        .map_err(native_error)?,
+                )
+                .map_err(internal_error)?
+            }
+            "native.command.stdin" => {
+                let input: StdinInput = parse(input)?;
+                serde_json::to_value(
+                    self.supervisor
+                        .write_stdin(&input.job_id, &input.bytes, input.close)
                         .await
                         .map_err(native_error)?,
                 )
@@ -340,6 +352,15 @@ struct OutputInput {
     maximum_records: usize,
     #[serde(default = "default_bytes")]
     maximum_bytes: usize,
+}
+
+#[derive(Deserialize)]
+struct StdinInput {
+    job_id: String,
+    #[serde(default)]
+    bytes: Vec<u8>,
+    #[serde(default)]
+    close: bool,
 }
 
 fn default_records() -> usize {
@@ -487,5 +508,60 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(missing.code, ProtocolErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn provider_streams_input_to_a_real_daemon_owned_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = NativeExecutionProvider::open(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let started = provider
+            .execute(dispatch(
+                "native.command.start",
+                serde_json::json!({
+                    "executable": "/bin/sh",
+                    "args": ["-c", "cat"],
+                    "timeout_ms": 5000,
+                    "stdin": "pipe"
+                }),
+            ))
+            .await
+            .unwrap();
+        let job_id = started.output["job_id"].as_str().unwrap().to_owned();
+        let written = provider
+            .execute(dispatch(
+                "native.command.stdin",
+                serde_json::json!({
+                    "job_id": job_id,
+                    "bytes": [100, 97, 101, 109, 111, 110, 45, 115, 116, 100, 105, 110],
+                    "close": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(written.output["stdin_closed"], true);
+        let waited = provider
+            .execute(dispatch(
+                "native.command.wait",
+                serde_json::json!({"job_id": job_id, "wait_ms": 5000}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(waited.output["lifecycle"], "completed");
+        let page = provider
+            .execute(dispatch(
+                "native.command.output",
+                serde_json::json!({"job_id": job_id}),
+            ))
+            .await
+            .unwrap();
+        let bytes = page.output["records"][0]["bytes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|byte| byte.as_u64().unwrap() as u8)
+            .collect::<Vec<_>>();
+        assert_eq!(bytes, b"daemon-stdin");
     }
 }

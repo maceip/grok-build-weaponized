@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt as _;
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -16,6 +16,8 @@ use crate::spool::{OutputPage, OutputStream, SequencedSpool, SpoolBudget, read_p
 const DEFAULT_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_PAGE_RECORDS: usize = 512;
 const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STDIN_WRITE_BYTES: usize = 1024 * 1024;
+const STDIN_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum NativeExecutionError {
@@ -56,6 +58,14 @@ pub enum JobLifecycle {
     Lost,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStdin {
+    #[default]
+    Null,
+    Pipe,
+}
+
 impl JobLifecycle {
     pub fn is_terminal(self) -> bool {
         matches!(
@@ -75,6 +85,8 @@ pub struct CommandRequest {
     pub env: BTreeMap<String, String>,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub stdin: CommandStdin,
 }
 
 fn default_timeout() -> u64 {
@@ -129,6 +141,17 @@ pub struct JobSnapshot {
     pub result: Option<serde_json::Value>,
     #[serde(default)]
     pub owner_id: String,
+    #[serde(default)]
+    pub stdin: CommandStdin,
+    #[serde(default)]
+    pub stdin_closed: bool,
+}
+
+enum JobStdinState {
+    Null,
+    Pending,
+    Open(ChildStdin),
+    Closed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +168,7 @@ struct JobState {
     metadata_path: PathBuf,
     nmap_target: Option<String>,
     nmap_xml_path: Option<PathBuf>,
+    stdin: Mutex<JobStdinState>,
 }
 
 pub struct NativeExecutionSupervisor {
@@ -237,6 +261,7 @@ impl NativeExecutionSupervisor {
             request.timeout_ms,
             None,
             None,
+            request.stdin,
         )
         .await
     }
@@ -270,6 +295,7 @@ impl NativeExecutionSupervisor {
             request.timeout_ms,
             Some(request.target),
             Some(xml_path),
+            CommandStdin::Null,
         )
         .await
     }
@@ -320,6 +346,78 @@ impl NativeExecutionSupervisor {
         let job = self.job(job_id).await?;
         job.cancellation.cancel();
         self.wait(job_id, Duration::from_secs(2)).await
+    }
+
+    /// Write a bounded chunk to a command's daemon-owned stdin pipe.
+    ///
+    /// A start request may still be queued behind the execution semaphore, so
+    /// writers wait for that exact job's pipe to materialize. The caller's
+    /// control-plane command deadline remains the outer bound; this local wait
+    /// prevents an orphaned write from hanging forever if process startup is
+    /// poisoned.
+    pub async fn write_stdin(
+        &self,
+        job_id: &str,
+        bytes: &[u8],
+        close: bool,
+    ) -> Result<JobSnapshot, NativeExecutionError> {
+        if bytes.len() > MAX_STDIN_WRITE_BYTES {
+            return Err(NativeExecutionError::InvalidRequest(format!(
+                "stdin write is {} bytes; maximum is {MAX_STDIN_WRITE_BYTES}",
+                bytes.len()
+            )));
+        }
+        if bytes.is_empty() && !close {
+            return Err(NativeExecutionError::InvalidRequest(
+                "stdin write must contain bytes or request close".to_owned(),
+            ));
+        }
+        let job = self.job(job_id).await?;
+        let deadline = tokio::time::Instant::now() + STDIN_READY_TIMEOUT;
+        loop {
+            let mut stdin = job.stdin.lock().await;
+            match &mut *stdin {
+                JobStdinState::Null => {
+                    return Err(NativeExecutionError::InvalidRequest(format!(
+                        "native job {job_id} was not started with piped stdin"
+                    )));
+                }
+                JobStdinState::Pending => {
+                    drop(stdin);
+                    let snapshot = job.snapshot.lock().await.clone();
+                    if snapshot.lifecycle.is_terminal() {
+                        return Err(NativeExecutionError::InvalidRequest(format!(
+                            "native job {job_id} terminated before stdin became available"
+                        )));
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(NativeExecutionError::InvalidRequest(format!(
+                            "native job {job_id} stdin did not become ready"
+                        )));
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                JobStdinState::Open(writer) => {
+                    writer.write_all(bytes).await?;
+                    writer.flush().await?;
+                    if close {
+                        *stdin = JobStdinState::Closed;
+                    }
+                    drop(stdin);
+                    if close {
+                        let mut snapshot = job.snapshot.lock().await;
+                        snapshot.stdin_closed = true;
+                        persist_snapshot(&job.metadata_path, &snapshot).await?;
+                    }
+                    return self.snapshot(job_id).await;
+                }
+                JobStdinState::Closed => {
+                    return Err(NativeExecutionError::InvalidRequest(format!(
+                        "native job {job_id} stdin is closed"
+                    )));
+                }
+            }
+        }
     }
 
     /// Return immutable file-backed artifacts only after every output reader
@@ -416,6 +514,7 @@ impl NativeExecutionSupervisor {
         timeout_ms: u64,
         nmap_target: Option<String>,
         nmap_xml_path: Option<PathBuf>,
+        stdin: CommandStdin,
     ) -> Result<JobSnapshot, NativeExecutionError> {
         self.start_process_with_id(
             new_job_id(),
@@ -428,6 +527,7 @@ impl NativeExecutionSupervisor {
             timeout_ms,
             nmap_target,
             nmap_xml_path,
+            stdin,
         )
         .await
     }
@@ -445,6 +545,7 @@ impl NativeExecutionSupervisor {
         timeout_ms: u64,
         nmap_target: Option<String>,
         nmap_xml_path: Option<PathBuf>,
+        stdin: CommandStdin,
     ) -> Result<JobSnapshot, NativeExecutionError> {
         if self.jobs.read().await.len() >= self.maximum_jobs {
             return Err(NativeExecutionError::Overloaded);
@@ -471,6 +572,8 @@ impl NativeExecutionSupervisor {
             spool_bytes: 0,
             result: None,
             owner_id,
+            stdin,
+            stdin_closed: stdin == CommandStdin::Null,
         };
         persist_snapshot(&metadata_path, &snapshot).await?;
         let job = Arc::new(JobState {
@@ -480,6 +583,10 @@ impl NativeExecutionSupervisor {
             metadata_path,
             nmap_target,
             nmap_xml_path,
+            stdin: Mutex::new(match stdin {
+                CommandStdin::Null => JobStdinState::Null,
+                CommandStdin::Pipe => JobStdinState::Pending,
+            }),
         });
         self.jobs.write().await.insert(job_id, job.clone());
         let supervisor = self.clone();
@@ -529,7 +636,10 @@ impl NativeExecutionSupervisor {
         let mut command = Command::new(&executable);
         command
             .args(&args)
-            .stdin(Stdio::null())
+            .stdin(match job.snapshot.lock().await.stdin {
+                CommandStdin::Null => Stdio::null(),
+                CommandStdin::Pipe => Stdio::piped(),
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -550,6 +660,19 @@ impl NativeExecutionSupervisor {
                     .await;
             }
         };
+        if job.snapshot.lock().await.stdin == CommandStdin::Pipe {
+            let Some(child_stdin) = child.stdin.take() else {
+                drop(permit);
+                return self
+                    .finish_with_error(
+                        &job,
+                        JobLifecycle::Failed,
+                        "process was configured with piped stdin but no pipe was created",
+                    )
+                    .await;
+            };
+            *job.stdin.lock().await = JobStdinState::Open(child_stdin);
+        }
         {
             let mut snapshot = job.snapshot.lock().await;
             snapshot.lifecycle = JobLifecycle::Running;
@@ -601,7 +724,12 @@ impl NativeExecutionSupervisor {
             }
         }
         drop(permit);
+        let piped_stdin = job.snapshot.lock().await.stdin == CommandStdin::Pipe;
+        if piped_stdin {
+            *job.stdin.lock().await = JobStdinState::Closed;
+        }
         let mut snapshot = job.snapshot.lock().await;
+        snapshot.stdin_closed = piped_stdin || snapshot.stdin_closed;
         snapshot.lifecycle = if reader_error.is_some() {
             JobLifecycle::Failed
         } else {
@@ -687,6 +815,7 @@ impl NativeExecutionSupervisor {
             self.spool_budget
                 .reserve_existing(&snapshot.owner_id, spool_bytes)
                 .await?;
+            let stdin = snapshot.stdin;
             self.jobs.write().await.insert(
                 snapshot.job_id.clone(),
                 Arc::new(JobState {
@@ -696,6 +825,11 @@ impl NativeExecutionSupervisor {
                     metadata_path,
                     nmap_target: None,
                     nmap_xml_path,
+                    stdin: Mutex::new(if stdin == CommandStdin::Pipe {
+                        JobStdinState::Closed
+                    } else {
+                        JobStdinState::Null
+                    }),
                 }),
             );
         }
@@ -817,6 +951,7 @@ mod tests {
                 cwd: None,
                 env: BTreeMap::new(),
                 timeout_ms: 5_000,
+                stdin: CommandStdin::Null,
             })
             .await
             .unwrap();
@@ -867,6 +1002,7 @@ mod tests {
                 cwd: None,
                 env: BTreeMap::new(),
                 timeout_ms: 60_000,
+                stdin: CommandStdin::Null,
             })
             .await
             .unwrap();
@@ -896,6 +1032,7 @@ mod tests {
             cwd: None,
             env: BTreeMap::new(),
             timeout_ms: 5_000,
+            stdin: CommandStdin::Null,
         };
 
         let first = supervisor
@@ -943,5 +1080,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after_cleanup.lifecycle, JobLifecycle::Completed);
+    }
+
+    #[tokio::test]
+    async fn piped_stdin_is_bounded_streamed_and_explicitly_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let supervisor = NativeExecutionSupervisor::open(directory.path(), 1, 16, 1024 * 1024)
+            .await
+            .unwrap();
+        let started = supervisor
+            .start_command(CommandRequest {
+                executable: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "IFS= read -r line; printf 'received:%s' \"$line\"".to_owned(),
+                ],
+                cwd: None,
+                env: BTreeMap::new(),
+                timeout_ms: 5_000,
+                stdin: CommandStdin::Pipe,
+            })
+            .await
+            .unwrap();
+        let after_write = supervisor
+            .write_stdin(&started.job_id, b"daemon-input\n", true)
+            .await
+            .unwrap();
+        assert!(after_write.stdin_closed);
+        let completed = supervisor
+            .wait(&started.job_id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(completed.lifecycle, JobLifecycle::Completed);
+        let page = supervisor
+            .output_page(&started.job_id, 0, 10, 1024)
+            .await
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].bytes, b"received:daemon-input");
+        assert!(matches!(
+            supervisor
+                .write_stdin(&started.job_id, b"late", false)
+                .await,
+            Err(NativeExecutionError::InvalidRequest(_))
+        ));
     }
 }
