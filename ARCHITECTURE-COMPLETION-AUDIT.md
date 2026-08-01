@@ -1,5 +1,154 @@
 # Grok Build Architecture Completion Audit
 
+## Final implementation stop report — 2026-08-01
+
+This section supersedes the completion conclusions in the historical 2026-07-31 audit below. It records the repository state when work was stopped at the user's direction. It is intentionally strict: committed code, focused verification, and release qualification are reported separately.
+
+User-reported elapsed work period: **13 hours 49 minutes and 1,913 seconds**.
+
+### Repository truth at the stop point
+
+- Authoritative worktree: `/private/tmp/grok-build-real-integration`
+- Branch: `codex/real-architecture-integration`
+- Remote branch: `weaponized/codex/real-architecture-integration`
+- Last implementation commit: `eb509f3ffb73c7cfa137a29b194bd4dcf149ccb7` (`Route model Nmap through grokd`)
+- Remote reachability: the `weaponized` remote contains that exact commit.
+- The implementation worktree was clean before this status-document update.
+- The separate `/Users/mac/Documents/grok-build` checkout is on `codex/local-runtime-observability` and contains unrelated uncommitted work. It was deliberately not modified.
+- No build, soak, or monitoring process remained running after the stop request. The hourly continuation automation was paused.
+
+From `6e41e37176f799e124aed6bd48ef7124d76adb7d` through `eb509f3`, the branch gained 34 commits touching 132 files, with 29,644 inserted lines and 2,151 deleted lines. Those numbers describe scope, not correctness.
+
+### What was accomplished
+
+The following is implemented and committed. Unless a verification result is stated separately, “implemented” means that production-oriented source exists on the branch; it does not mean that the complete current branch passed release qualification.
+
+#### 1. Durable control plane and execution ownership
+
+- Added the daemon-owned native execution provider and routed terminal execution through `grokd`.
+- Added real agent execution, exercise data-plane types, durable team coordination, handoffs, completion contracts, and execution-graph projections.
+- Added durable recovery for interrupted dispatches, deferred-task reattachment, detached native-process lifecycles, queued-turn cancellation, provider cancellation before admission, and failure projection without discarding captured output.
+- Added external connector process supervision and durable ingress deduplication/recovery.
+- Added model-facing Nmap daemon routing, progressive XML result parsing, normalized host/service output, status, result, and cancellation paths in `eb509f3`.
+
+Relevant commits: `41f9f98`, `dcc6737`, `3d6e810`, `a8f0356`, `121dd75`, `efd75aa`, `950a7b0`, `9c5ecbb`, `8eca6db`, `13522f2`, `460220d`, `ea203fe`, `1593bd8`, `4b7d9aa`, `27dc230`, and `eb509f3`.
+
+#### 2. Local multi-model runtime and context admission
+
+- Added the persistent local-runtime worker protocol and supervised LiteRT-LM worker path.
+- Added exact rendered-prompt measurement and unified context admission, including atomic admission of tool schemas and structured tool-output filtering.
+- Added adaptive direct, plan/execute, and plan/execute/review coordination without transferring hidden reasoning between model stages.
+- Added bounded runtime capacity, resource accounting, cancellation, live status, session handling, and worker-residency reporting.
+- Split the LiteRT integration into ABI, configuration, context, engine/session/streaming, manager, protocol, resource, worker, and adapter concerns instead of retaining one opaque sampler-owned module.
+
+Relevant commits: `5d12cef`, `f7f6a37`, `4dfbca3`, `e40dbb2`, and `4113b2d`.
+
+#### 3. LoRA materialization and residency mechanics
+
+- Added adapter descriptors, validation, request leases, load/select/unload protocol operations, resident selection, rollback-oriented loading, KV/session separation, and observable memory counters.
+- Patched the pinned LiteRT bridge for supported LoRA ranks and compiled LoRA signature selection.
+- Added qualification-adapter conversion/build tooling.
+- Added a real worker-level adapter reclamation probe. The interrupted run recorded two resident adapters, unload from 59,113,472 bytes to 29,556,736 bytes, 29,556,736 reclaimed bytes, and successful reload to two resident adapters.
+
+Relevant commits: `dfcf5cd` and `4a0974a`.
+
+#### 4. Active local memory
+
+- Exposed daemon-facing memory operations and preserved workspace-scoped lexical/vector retrieval paths.
+- Added resilient local embedding initialization, asynchronous backfill, bounded retrieval, and immediate FTS fallback when embeddings are busy.
+- Added percentile-based memory latency enforcement rather than validating only one favorable sample.
+
+Relevant commits: `b879a51`, `4a6c5c2`, and `d7fc17e`.
+
+#### 5. Artifact and long-running process data plane
+
+- Added durable chunked artifact ingestion and direct adoption of native job spools as durable artifacts.
+- Added bounded spool storage and reclamation.
+- Added daemon-owned streaming subprocess input and consistent native job lifecycle handling.
+- Kept complete output in artifacts while exposing bounded, normalized result envelopes and cursors to model context.
+
+Relevant commits: `7e171b2`, `2d5ddb1`, `1a0ed09`, and `4f94ec7`.
+
+#### 6. Operator surfaces and verification infrastructure
+
+- Added real projection-backed operator core, terminal UI, and `egui` operator UI, then applied the gilded visual theme to the native surfaces.
+- Added cancellation and durable graph/status controls to the operator surfaces.
+- Added a PanicCheck-style KLEE workflow and streaming harnesses.
+- Added a realistic streaming test scenario, a local-runtime release/soak harness, and a real-daemon qualification binary.
+
+Relevant commits: `5e79193`, `811b851`, `b440752`, `1a8309c`, `4113b2d`, and `13522f2`.
+
+### What was actually verified
+
+- Earlier focused component tests and daemon builds documented in the historical audit passed at their then-current commits. They are useful component evidence, but they do not qualify the current branch after 34 additional commits.
+- Before `eb509f3` was committed, narrow checks for the native-execution and control-plane crates passed.
+- The full `xai-grok-tools` check was interrupted at the user's request to stop long compilation. Therefore the current tip may contain a compile or integration failure in the model-facing Nmap path.
+- A real 24-hour CI-profile run was started from commit `4a0974a`. It used the native LiteRT bridge, a real LiteRT model, two rank-16 qualification adapters, local embeddings, native jobs, cancellation, and memory retrieval.
+- That run reached 265 cycles and 1,946 elapsed seconds (32 minutes 26 seconds). At that point it had performed 265 direct generations, 265 adapter generations, 26 model cancellations, 265 native jobs, 26 native-job cancellations, and 265 memory queries. The recorded memory-retrieval p95 was 31.363 ms.
+- The report contains **no** `event=completed` record and **no** `passed=true` result. It is an interrupted observation, not a passed soak test.
+- No 72-hour release soak was run.
+- No explicit ignored performance-gate suite or final `backend=auto` smoke was run from the current tip.
+- No release-distribution artifacts were built from a SHA that passed all required gates.
+
+### What remains, sorted by importance
+
+#### P0 — Establish whether the current branch works at all
+
+1. Run focused compilation for the six files and affected crates in `eb509f3`, especially `xai-grok-tools`. Fix any compile failure without starting a whole-workspace rebuild first.
+2. Add and pass a real daemon-ownership integration test for Nmap covering start, progressive status, final XML parsing, result pagination, cancellation, artifact/spool ownership, daemon restart behavior, and fail-closed behavior when `grokd` is unavailable.
+3. Search every model-facing terminal and Nmap call site for direct `std::process` or process-global supervisor bypasses. Production mode must have one owner: `grokd`.
+4. Re-run the narrow current-tip control-plane, runtime, native-execution, tools, operator-core, TUI, and GUI gates. A commit title is not verification.
+
+#### P0 — Complete release qualification
+
+5. Run the non-overridable 24-hour CI profile from the exact committed SHA that passes the current-tip integration gates. Success requires a terminal JSONL `event=completed` record with `passed=true` after all 86,400 seconds.
+6. Run the explicit ignored performance gates and a real `backend=auto` smoke from that same passing SHA. Record IPC dispatch, orchestration, context admission, retrieval, LoRA selection, UI event-loop, cancellation, queue, memory, and spool bounds.
+7. Build `release-dist` versions of `grok-local-runtime-worker` and `xai-grok-release-soak` from that exact SHA. Record hashes and native bridge/model/adapter provenance.
+8. Run the non-overridable 72-hour release profile from those artifacts. Success requires its terminal `event=completed` and `passed=true` record after all 259,200 seconds.
+
+#### P1 — Prove the locked architecture rather than a narrower substitute
+
+9. Prove both locked warm models—VibeThinker 3B and Qwen 2.5 1.5B—under the production coordinator. The interrupted soak report names only the VibeThinker artifact.
+10. Prove the preferred Apple Silicon GPU path. The interrupted LoRA worker key records the CPU backend, so it does not establish GPU LoRA residency or GPU memory reclamation.
+11. Validate two genuinely compatible, independently useful Qwen adapters. The qualification adapters prove plumbing and output separation; they do not prove adapter quality or operational usefulness.
+12. Prove concurrent cross-adapter KV isolation under load, adapter rollback on probe failure, eviction under real memory pressure, and no silent base-model fallback.
+13. Exercise `Plan -> Execute -> Review`, correction, overload degradation, deadlines, and cancellation with both real models and real tool calls through `grokd`.
+14. Run the 100,000-chunk memory workload and demonstrate workspace isolation, FTS fallback during embedding saturation, asynchronous backfill, and consolidation without interactive stalls.
+
+#### P1 — Close external and product-surface gaps
+
+15. Validate the Metasploit, Neo4j/BloodHound, NVD, Exploit-DB, and long-running `ffuf` connectors against live local services and data, not only fixtures.
+16. Implement or validate actual Buzz and QM transports. The current repository has ingress mappings and real-IPC deduplication tests, but no evidence here of end-to-end communication with running Buzz or QM systems.
+17. Manually exercise the CLI, TUI, and `egui` UI against the same live daemon state after the final backend changes. Confirm that tabs, graphs, job progress, cancellation, memory, and failures are live projections rather than stale or synthetic surface data.
+18. Finish portable release packaging and test the static/minimum-libc artifacts on representative older Linux systems. The historical audit already identified the missing build-host musl cross-C toolchain for the full daemon link.
+
+### What gives me heartburn
+
+1. **The tip is not compile-qualified.** `eb509f3` changed 635 lines across the native Nmap and model-tool paths, and the full affected tools crate was not allowed to finish checking before the commit was pushed.
+2. **The endurance claim is currently zero.** Thirty-two minutes of healthy-looking samples cannot substitute for a 24-hour gate, and there is no completed report. The 72-hour gate never started.
+3. **There is still a bypass risk.** This architecture is only coherent if `grokd` owns production execution. One direct terminal, Nmap, runtime, memory, or job-registry path can reintroduce split ownership, duplicate cancellation, and unrecoverable state.
+4. **The validated model shape is narrower than the locked design.** The available soak evidence names one VibeThinker model and CPU LoRA execution. It does not prove two warm cooperating models or preferred GPU LoRA operation.
+5. **Qualification adapters are not production adapters.** They demonstrate loading, selection, different outputs, and memory reclamation. They do not establish that real red-team LoRAs are compatible, useful, stable, or correctly isolated over long sessions.
+6. **The change set is large and cross-cutting.** Nearly 30,000 inserted lines across runtime, control plane, memory, tools, persistence, and two UIs create substantial regression risk until current-tip integration and soak evidence exists.
+7. **The UIs can drift from the daemon contract.** They are implemented against projections, but late changes to cancellation, recovery, completion, and Nmap result shapes were not followed by final live manual validation of every surface.
+8. **There is no immutable release evidence bundle.** No single committed SHA currently has a completed 24-hour report, performance results, release binary hashes, native artifact provenance, completed 72-hour report, and clean remote verification.
+
+### Required restart order
+
+If work resumes, the shortest defensible path is:
+
+1. Treat `eb509f3` as an unqualified candidate, not a release.
+2. Finish only the affected Nmap/tools checks and the daemon-owned Nmap integration test.
+3. Audit execution bypasses and fix them before spending time on UI or new capability work.
+4. Run focused current-tip integration and performance gates with shared compilation caching.
+5. Commit and push the resulting candidate SHA.
+6. Start one uninterrupted 24-hour run and leave it alone unless it emits a failure.
+7. Only after it passes, build provenance-locked release artifacts, run the final smoke/performance gates, and start one uninterrupted 72-hour run.
+
+No new architectural feature should be added before these steps establish a trustworthy baseline.
+
+## Historical audit snapshot — 2026-07-31
+
 Audit date: 2026-07-31
 
 Checkout: `/Users/mac/Documents/grok-build`
