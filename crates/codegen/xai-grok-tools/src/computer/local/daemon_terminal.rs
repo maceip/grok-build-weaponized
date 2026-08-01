@@ -852,7 +852,7 @@ async fn publish_page(
     Ok(())
 }
 
-async fn invoke(
+pub(crate) async fn invoke(
     socket: &Path,
     operation: &str,
     input: serde_json::Value,
@@ -884,7 +884,7 @@ async fn invoke(
     }
 }
 
-fn provider_result(output: serde_json::Value) -> serde_json::Value {
+pub(crate) fn provider_result(output: serde_json::Value) -> serde_json::Value {
     if output.get("artifacts").is_some() {
         output.get("result").cloned().unwrap_or(output)
     } else {

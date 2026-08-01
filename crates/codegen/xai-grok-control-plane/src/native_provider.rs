@@ -325,11 +325,21 @@ impl NativeExecutionProvider {
                 }
                 snapshot_output(snapshot, task_deadline_exceeded)?
             }
-            "native.command.status" | "native.nmap.status" => {
+            "native.command.status" => {
                 let input: JobInput = parse(input)?;
                 serde_json::to_value(
                     self.supervisor
                         .snapshot(&input.job_id)
+                        .await
+                        .map_err(native_error)?,
+                )
+                .map_err(internal_error)?
+            }
+            "native.nmap.status" => {
+                let input: JobInput = parse(input)?;
+                serde_json::to_value(
+                    self.supervisor
+                        .nmap_snapshot(&input.job_id)
                         .await
                         .map_err(native_error)?,
                 )

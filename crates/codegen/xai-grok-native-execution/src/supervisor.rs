@@ -10,7 +10,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::nmap::{NmapRequest, NmapResult, parse_result};
+use crate::nmap::{NmapRequest, NmapResult, parse_progress_result, parse_result};
 use crate::spool::{
     OutputPage, OutputStream, SequencedSpool, SpoolBudget, SpoolBudgetSnapshot, read_page,
 };
@@ -174,7 +174,7 @@ struct JobState {
     cancellation: CancellationToken,
     spool_path: PathBuf,
     metadata_path: PathBuf,
-    nmap_target: Option<String>,
+    nmap_request: Option<NmapRequest>,
     nmap_xml_path: Option<PathBuf>,
     stdin: Mutex<JobStdinState>,
 }
@@ -333,7 +333,7 @@ impl NativeExecutionSupervisor {
             None,
             BTreeMap::new(),
             request.timeout_ms,
-            Some(request.target),
+            Some(request),
             Some(xml_path),
             CommandStdin::Null,
             BTreeMap::new(),
@@ -348,6 +348,31 @@ impl NativeExecutionSupervisor {
             .await
             .map(|metadata| metadata.len())
             .unwrap_or(0);
+        Ok(snapshot)
+    }
+
+    /// Return the durable Nmap snapshot plus any complete hosts already
+    /// present in Nmap's progressively written XML file. A torn trailing XML
+    /// token is ignored here and is validated strictly when the process exits.
+    pub async fn nmap_snapshot(
+        &self,
+        job_id: &str,
+    ) -> Result<JobSnapshot, NativeExecutionError> {
+        let job = self.job(job_id).await?;
+        let mut snapshot = job.snapshot.lock().await.clone();
+        if snapshot.kind != JobKind::Nmap {
+            return Err(NativeExecutionError::NotNmap);
+        }
+        snapshot.spool_bytes = tokio::fs::metadata(&job.spool_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if !snapshot.lifecycle.is_terminal()
+            && let (Some(request), Some(path)) = (&job.nmap_request, &job.nmap_xml_path)
+            && let Ok(result) = parse_progress_result(&request.target, request.profile, path).await
+        {
+            snapshot.result = serde_json::to_value(result).ok();
+        }
         Ok(snapshot)
     }
 
@@ -577,15 +602,15 @@ impl NativeExecutionSupervisor {
             return serde_json::from_value(result)
                 .map_err(|error| NativeExecutionError::InvalidOutput(error.to_string()));
         }
-        let target = job
-            .nmap_target
-            .as_deref()
+        let request = job
+            .nmap_request
+            .as_ref()
             .ok_or(NativeExecutionError::NotNmap)?;
         let path = job
             .nmap_xml_path
             .as_deref()
             .ok_or(NativeExecutionError::NotNmap)?;
-        parse_result(target, path).await
+        parse_result(&request.target, request.profile, path).await
     }
 
     async fn start_process(
@@ -597,7 +622,7 @@ impl NativeExecutionSupervisor {
         cwd: Option<PathBuf>,
         env: BTreeMap<String, String>,
         timeout_ms: u64,
-        nmap_target: Option<String>,
+        nmap_request: Option<NmapRequest>,
         nmap_xml_path: Option<PathBuf>,
         stdin: CommandStdin,
         metadata: BTreeMap<String, serde_json::Value>,
@@ -611,7 +636,7 @@ impl NativeExecutionSupervisor {
             cwd,
             env,
             timeout_ms,
-            nmap_target,
+            nmap_request,
             nmap_xml_path,
             stdin,
             metadata,
@@ -630,7 +655,7 @@ impl NativeExecutionSupervisor {
         cwd: Option<PathBuf>,
         env: BTreeMap<String, String>,
         timeout_ms: u64,
-        nmap_target: Option<String>,
+        nmap_request: Option<NmapRequest>,
         nmap_xml_path: Option<PathBuf>,
         stdin: CommandStdin,
         metadata: BTreeMap<String, serde_json::Value>,
@@ -670,7 +695,7 @@ impl NativeExecutionSupervisor {
             cancellation: CancellationToken::new(),
             spool_path,
             metadata_path,
-            nmap_target,
+            nmap_request,
             nmap_xml_path,
             stdin: Mutex::new(match stdin {
                 CommandStdin::Null => JobStdinState::Null,
@@ -833,9 +858,9 @@ impl NativeExecutionSupervisor {
             .unwrap_or(0);
         if snapshot.lifecycle == JobLifecycle::Completed
             && snapshot.kind == JobKind::Nmap
-            && let (Some(target), Some(path)) = (&job.nmap_target, &job.nmap_xml_path)
+            && let (Some(request), Some(path)) = (&job.nmap_request, &job.nmap_xml_path)
         {
-            match parse_result(target, path).await {
+            match parse_result(&request.target, request.profile, path).await {
                 Ok(result) => snapshot.result = serde_json::to_value(result).ok(),
                 Err(error) => {
                     snapshot.lifecycle = JobLifecycle::Failed;
@@ -912,7 +937,7 @@ impl NativeExecutionSupervisor {
                     cancellation: CancellationToken::new(),
                     spool_path,
                     metadata_path,
-                    nmap_target: None,
+                    nmap_request: None,
                     nmap_xml_path,
                     stdin: Mutex::new(if stdin == CommandStdin::Pipe {
                         JobStdinState::Closed

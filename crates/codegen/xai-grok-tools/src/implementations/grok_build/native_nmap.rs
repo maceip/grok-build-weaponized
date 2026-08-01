@@ -1,10 +1,14 @@
 //! Model-facing wrapper for the scoped native Nmap driver.
 
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::computer::local::daemon_terminal::{invoke as invoke_daemon, provider_result};
 use crate::native::execution_supervisor::ExecutionSupervisor;
 use crate::native::job_registry::{ExecutionJobHandle, ExecutionJobKind, ExecutionJobLifecycle};
 use crate::native::nmap::{
-    NativeNmapDriver, NmapHost, NmapScanArtifacts, NmapScanEvent, NmapScanReport, NmapScanRequest,
-    ScanScope, parse_nmap_xml,
+    NativeNmapDriver, NmapAddress, NmapHost, NmapPort, NmapScanArtifacts, NmapScanEvent,
+    NmapScanReport, NmapScanRequest, NmapService, ScanProfile, ScanScope, parse_nmap_xml,
 };
 use crate::types::output::{DynamicOutput, ToolOutput};
 use crate::types::requirements::Expr;
@@ -12,7 +16,210 @@ use crate::types::tool::{ToolKind, ToolNamespace};
 use crate::types::tool_io::{MCPToolInput, ToolInput};
 
 pub const OPERATIONAL_SCOPE_ENV: &str = "GROK_OPERATIONAL_SCOPE";
+const EXECUTION_BACKEND_ENV: &str = "GROK_EXECUTION_BACKEND";
+const GROKD_SOCKET_ENV: &str = "GROKD_SOCKET";
 const MAX_BACKGROUND_NMAP_JOBS: usize = 32;
+const MAX_NMAP_PORTS: usize = 1_024;
+const MAX_NMAP_TIMEOUT_SECS: u64 = 2 * 60 * 60;
+const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn validate_scan_request(
+    scan: &NmapScanRequest,
+) -> Result<(), xai_tool_runtime::ToolError> {
+    if scan.ports.len() > MAX_NMAP_PORTS {
+        return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+            "at most {MAX_NMAP_PORTS} explicit ports are allowed"
+        )));
+    }
+    let timeout = scan.timeout_secs.unwrap_or(30 * 60);
+    if timeout == 0 || timeout > MAX_NMAP_TIMEOUT_SECS {
+        return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+            "nmap timeout must be between 1 and {MAX_NMAP_TIMEOUT_SECS} seconds"
+        )));
+    }
+    Ok(())
+}
+
+fn daemon_socket() -> Result<Option<PathBuf>, xai_tool_runtime::ToolError> {
+    if std::env::var(EXECUTION_BACKEND_ENV).as_deref() != Ok("daemon") {
+        return Ok(None);
+    }
+    let socket = std::env::var_os(GROKD_SOCKET_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            xai_tool_runtime::ToolError::custom(
+                "native_nmap",
+                format!(
+                    "{EXECUTION_BACKEND_ENV}=daemon requires an absolute {GROKD_SOCKET_ENV}"
+                ),
+            )
+        })?;
+    if !socket.is_absolute() {
+        return Err(xai_tool_runtime::ToolError::custom(
+            "native_nmap",
+            format!("{GROKD_SOCKET_ENV} must be an absolute path in daemon mode"),
+        ));
+    }
+    Ok(Some(socket))
+}
+
+fn daemon_request(
+    scan: &NmapScanRequest,
+    allowed_targets: Vec<String>,
+) -> xai_grok_native_execution::NmapRequest {
+    xai_grok_native_execution::NmapRequest {
+        target: scan.target.clone(),
+        allowed_targets,
+        profile: match scan.profile {
+            ScanProfile::HostDiscovery => xai_grok_native_execution::ScanProfile::HostDiscovery,
+            ScanProfile::TcpConnect => xai_grok_native_execution::ScanProfile::TcpConnect,
+            ScanProfile::ServiceDiscovery => {
+                xai_grok_native_execution::ScanProfile::ServiceDiscovery
+            }
+        },
+        ports: scan.ports.clone(),
+        timeout_ms: scan
+            .timeout_secs
+            .unwrap_or(30 * 60)
+            .saturating_mul(1_000),
+    }
+}
+
+fn daemon_report(result: xai_grok_native_execution::NmapResult) -> NmapScanReport {
+    NmapScanReport {
+        target: result.target,
+        profile: match result.profile {
+            xai_grok_native_execution::ScanProfile::HostDiscovery => ScanProfile::HostDiscovery,
+            xai_grok_native_execution::ScanProfile::TcpConnect => ScanProfile::TcpConnect,
+            xai_grok_native_execution::ScanProfile::ServiceDiscovery => {
+                ScanProfile::ServiceDiscovery
+            }
+        },
+        scanner_version: result.scanner_version,
+        started_at: result.started_at,
+        elapsed_seconds: result.elapsed_seconds,
+        hosts_up: result.hosts_up,
+        hosts_down: result.hosts_down,
+        hosts_total: result.hosts_total,
+        hosts: result.hosts.into_iter().map(daemon_host).collect(),
+    }
+}
+
+fn daemon_host(host: xai_grok_native_execution::NmapHost) -> NmapHost {
+    NmapHost {
+        status: host.status,
+        status_reason: host.status_reason,
+        addresses: host
+            .addresses
+            .into_iter()
+            .map(|address| NmapAddress {
+                address: address.address,
+                address_type: address.address_type,
+                vendor: address.vendor,
+            })
+            .collect(),
+        hostnames: host.hostnames,
+        ports: host.ports.into_iter().map(daemon_port).collect(),
+    }
+}
+
+fn daemon_port(port: xai_grok_native_execution::NmapPort) -> NmapPort {
+    NmapPort {
+        protocol: port.protocol,
+        port: port.port,
+        state: port.state,
+        state_reason: port.state_reason,
+        service: port.service.map(|service| NmapService {
+            name: service.name,
+            product: service.product,
+            version: service.version,
+            extra_info: service.extra_info,
+            tunnel: service.tunnel,
+            os_type: service.os_type,
+            method: service.method,
+            confidence: service.confidence,
+        }),
+    }
+}
+
+async fn daemon_start(
+    socket: &Path,
+    scan: &NmapScanRequest,
+    allowed_targets: Vec<String>,
+) -> Result<String, xai_tool_runtime::ToolError> {
+    let output = invoke_daemon(
+        socket,
+        "native.nmap.start",
+        serde_json::to_value(daemon_request(scan, allowed_targets)).map_err(|error| {
+            xai_tool_runtime::ToolError::custom("native_nmap", error.to_string())
+        })?,
+        Duration::from_secs(10),
+    )
+    .await
+    .map_err(|error| xai_tool_runtime::ToolError::custom("native_nmap", error.to_string()))?;
+    let snapshot: xai_grok_native_execution::JobSnapshot =
+        serde_json::from_value(provider_result(output)).map_err(|error| {
+            xai_tool_runtime::ToolError::custom(
+                "native_nmap",
+                format!("invalid daemon Nmap start response: {error}"),
+            )
+        })?;
+    Ok(snapshot.job_id)
+}
+
+async fn daemon_snapshot(
+    socket: &Path,
+    job_id: &str,
+    operation: &str,
+) -> Result<xai_grok_native_execution::JobSnapshot, xai_tool_runtime::ToolError> {
+    let output = invoke_daemon(
+        socket,
+        operation,
+        serde_json::json!({"job_id": job_id}),
+        Duration::from_secs(10),
+    )
+    .await
+    .map_err(|error| xai_tool_runtime::ToolError::custom("native_nmap", error.to_string()))?;
+    serde_json::from_value(provider_result(output)).map_err(|error| {
+        xai_tool_runtime::ToolError::custom(
+            "native_nmap",
+            format!("invalid daemon Nmap snapshot: {error}"),
+        )
+    })
+}
+
+async fn daemon_result(
+    socket: &Path,
+    job_id: &str,
+) -> Result<NmapScanReport, xai_tool_runtime::ToolError> {
+    let output = invoke_daemon(
+        socket,
+        "native.nmap.result",
+        serde_json::json!({"job_id": job_id}),
+        Duration::from_secs(10),
+    )
+    .await
+    .map_err(|error| xai_tool_runtime::ToolError::custom("native_nmap", error.to_string()))?;
+    let result = serde_json::from_value(provider_result(output)).map_err(|error| {
+        xai_tool_runtime::ToolError::custom(
+            "native_nmap",
+            format!("invalid daemon Nmap result: {error}"),
+        )
+    })?;
+    Ok(daemon_report(result))
+}
+
+fn elapsed_millis(snapshot: &xai_grok_native_execution::JobSnapshot) -> u64 {
+    let end = snapshot.finished_unix_ms.unwrap_or_else(now_unix_ms);
+    end.saturating_sub(snapshot.started_unix_ms.unwrap_or(snapshot.created_unix_ms))
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -136,6 +343,75 @@ fn nmap_job_response(
     }
 }
 
+async fn daemon_job_response(
+    socket: &Path,
+    job_id: &str,
+    cursor: usize,
+    limit: usize,
+) -> Result<NativeNmapJobResponse, xai_tool_runtime::ToolError> {
+    let snapshot = daemon_snapshot(socket, job_id, "native.nmap.status").await?;
+    let elapsed_millis = elapsed_millis(&snapshot);
+    let limit = limit.clamp(1, 100);
+    match snapshot.lifecycle {
+        xai_grok_native_execution::JobLifecycle::Queued
+        | xai_grok_native_execution::JobLifecycle::Running => {
+            let hosts = snapshot
+                .result
+                .and_then(|result| {
+                    serde_json::from_value::<xai_grok_native_execution::NmapResult>(result).ok()
+                })
+                .map(|result| daemon_report(result).hosts)
+                .unwrap_or_default();
+            let total_hosts = hosts.len();
+            let hosts = hosts
+                .into_iter()
+                .skip(cursor)
+                .take(limit)
+                .collect::<Vec<_>>();
+            let next_cursor = (cursor.saturating_add(hosts.len()) < total_hosts)
+                .then_some(cursor.saturating_add(hosts.len()));
+            Ok(NativeNmapJobResponse::Running {
+                job_id: snapshot.job_id,
+                elapsed_millis,
+                hosts,
+                total_hosts,
+                next_cursor,
+            })
+        }
+        xai_grok_native_execution::JobLifecycle::Completed => {
+            let mut report = daemon_result(socket, job_id).await?;
+            let total_hosts = report.hosts.len();
+            report.hosts = report.hosts.into_iter().skip(cursor).take(limit).collect();
+            let next_cursor = (cursor.saturating_add(report.hosts.len()) < total_hosts)
+                .then_some(cursor.saturating_add(report.hosts.len()));
+            Ok(NativeNmapJobResponse::Completed {
+                job_id: snapshot.job_id,
+                elapsed_millis,
+                report,
+                total_hosts,
+                next_cursor,
+            })
+        }
+        xai_grok_native_execution::JobLifecycle::Cancelled => {
+            Ok(NativeNmapJobResponse::Cancelled {
+                job_id: snapshot.job_id,
+                elapsed_millis,
+            })
+        }
+        xai_grok_native_execution::JobLifecycle::Failed
+        | xai_grok_native_execution::JobLifecycle::TimedOut
+        | xai_grok_native_execution::JobLifecycle::Lost => {
+            Ok(NativeNmapJobResponse::Failed {
+                job_id: snapshot.job_id,
+                elapsed_millis,
+                error: snapshot.error.unwrap_or_else(|| {
+                    format!("daemon Nmap job terminated as {:?}", snapshot.lifecycle)
+                }),
+            })
+        }
+    }
+}
+
 fn report_from_snapshot_artifact(
     snapshot: &crate::native::job_registry::ExecutionJobSnapshot,
 ) -> Option<NmapScanReport> {
@@ -232,8 +508,76 @@ impl xai_tool_runtime::Tool for NativeNmapTool {
                  --operational-scope or set {OPERATIONAL_SCOPE_ENV}"
             ))
         })?;
-        let scope = ScanScope::new(scope_targets)
+        let scope = ScanScope::new(scope_targets.clone())
             .map_err(|error| xai_tool_runtime::ToolError::invalid_arguments(error.to_string()))?;
+        validate_scan_request(&input)?;
+        if !scope.allows(&input.target).map_err(|error| {
+            xai_tool_runtime::ToolError::invalid_arguments(error.to_string())
+        })? {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                "target `{}` is outside the configured scan scope",
+                input.target
+            )));
+        }
+        if let Some(socket) = daemon_socket()? {
+            let job_id = daemon_start(&socket, &input, scope_targets).await?;
+            let tool_id = xai_tool_runtime::Tool::id(self);
+            loop {
+                let status = daemon_snapshot(&socket, &job_id, "native.nmap.status");
+                let snapshot = if let Some(cancellation) =
+                    ctx.get::<xai_tool_runtime::Cancellation>()
+                {
+                    tokio::select! {
+                        result = status => result?,
+                        _ = cancellation.0.cancelled() => {
+                            daemon_snapshot(&socket, &job_id, "native.nmap.cancel").await?;
+                            return Err(xai_tool_runtime::ToolError::cancelled(
+                                tool_id,
+                                "daemon-owned native Nmap scan cancelled",
+                            ));
+                        }
+                    }
+                } else {
+                    status.await?
+                };
+                match snapshot.lifecycle {
+                    xai_grok_native_execution::JobLifecycle::Completed => {
+                        return daemon_result(&socket, &job_id).await;
+                    }
+                    xai_grok_native_execution::JobLifecycle::Queued
+                    | xai_grok_native_execution::JobLifecycle::Running => {
+                        if let Some(cancellation) = ctx.get::<xai_tool_runtime::Cancellation>() {
+                            tokio::select! {
+                                _ = tokio::time::sleep(DAEMON_POLL_INTERVAL) => {}
+                                _ = cancellation.0.cancelled() => {
+                                    daemon_snapshot(&socket, &job_id, "native.nmap.cancel").await?;
+                                    return Err(xai_tool_runtime::ToolError::cancelled(
+                                        tool_id,
+                                        "daemon-owned native Nmap scan cancelled",
+                                    ));
+                                }
+                            }
+                        } else {
+                            tokio::time::sleep(DAEMON_POLL_INTERVAL).await;
+                        }
+                    }
+                    xai_grok_native_execution::JobLifecycle::Cancelled => {
+                        return Err(xai_tool_runtime::ToolError::cancelled(
+                            tool_id,
+                            "daemon-owned native Nmap scan cancelled",
+                        ));
+                    }
+                    lifecycle => {
+                        return Err(xai_tool_runtime::ToolError::custom(
+                            "native_nmap",
+                            snapshot.error.unwrap_or_else(|| {
+                                format!("daemon-owned native Nmap scan ended as {lifecycle:?}")
+                            }),
+                        ));
+                    }
+                }
+            }
+        }
         let driver = NativeNmapDriver::discover().map_err(|error| {
             xai_tool_runtime::ToolError::custom("native_nmap", error.to_string())
         })?;
@@ -351,6 +695,7 @@ impl xai_tool_runtime::Tool for NativeNmapJobTool {
         ctx: xai_tool_runtime::ToolCallContext,
         input: NativeNmapJobRequest,
     ) -> Result<NativeNmapJobResponse, xai_tool_runtime::ToolError> {
+        let daemon = daemon_socket()?;
         let owner_session_id =
             if let Ok(resources) = crate::types::tool_metadata::shared_resources(&ctx) {
                 resources
@@ -368,9 +713,10 @@ impl xai_tool_runtime::Tool for NativeNmapJobTool {
                         "native_nmap_job requires {OPERATIONAL_SCOPE_ENV}"
                     ))
                 })?;
-                let scope = ScanScope::new(scope_targets).map_err(|error| {
+                let scope = ScanScope::new(scope_targets.clone()).map_err(|error| {
                     xai_tool_runtime::ToolError::invalid_arguments(error.to_string())
                 })?;
+                validate_scan_request(&scan)?;
                 // Validate the target synchronously so Start never returns a
                 // job that was doomed before process creation.
                 if !scope.allows(&scan.target).map_err(|error| {
@@ -380,6 +726,10 @@ impl xai_tool_runtime::Tool for NativeNmapJobTool {
                         "target `{}` is outside the configured scan scope",
                         scan.target
                     )));
+                }
+                if let Some(socket) = daemon.as_deref() {
+                    let job_id = daemon_start(socket, &scan, scope_targets).await?;
+                    return Ok(NativeNmapJobResponse::Started { job_id });
                 }
                 let driver = NativeNmapDriver::discover().map_err(|error| {
                     xai_tool_runtime::ToolError::custom("native_nmap_job", error.to_string())
@@ -444,6 +794,9 @@ impl xai_tool_runtime::Tool for NativeNmapJobTool {
                 Ok(NativeNmapJobResponse::Started { job_id })
             }
             NativeNmapJobRequest::Status { job_id } => {
+                if let Some(socket) = daemon.as_deref() {
+                    return daemon_job_response(socket, &job_id, 0, 100).await;
+                }
                 let job = ExecutionSupervisor::global()
                     .jobs()
                     .get(&job_id)
@@ -460,6 +813,9 @@ impl xai_tool_runtime::Tool for NativeNmapJobTool {
                 cursor,
                 limit,
             } => {
+                if let Some(socket) = daemon.as_deref() {
+                    return daemon_job_response(socket, &job_id, cursor, limit).await;
+                }
                 let job = ExecutionSupervisor::global()
                     .jobs()
                     .get(&job_id)
@@ -472,6 +828,10 @@ impl xai_tool_runtime::Tool for NativeNmapJobTool {
                     .map_err(|error| xai_tool_runtime::ToolError::custom("native_nmap_job", error))
             }
             NativeNmapJobRequest::Cancel { job_id } => {
+                if let Some(socket) = daemon.as_deref() {
+                    daemon_snapshot(socket, &job_id, "native.nmap.cancel").await?;
+                    return daemon_job_response(socket, &job_id, 0, 100).await;
+                }
                 let job = ExecutionSupervisor::global()
                     .jobs()
                     .get(&job_id)
