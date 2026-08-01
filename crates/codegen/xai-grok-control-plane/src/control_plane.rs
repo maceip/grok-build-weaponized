@@ -2970,6 +2970,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::native_provider::NativeExecutionProvider;
     use crate::provider::FunctionProvider;
 
     struct GenerationProvider {
@@ -4824,6 +4825,144 @@ mod tests {
         assert_eq!(replayed, terminal);
         reopened.handle().shutdown_token().cancel();
         reopened.wait().await;
+    }
+
+    #[tokio::test]
+    async fn detached_native_task_cancellation_terminates_the_daemon_owned_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let native_state = directory.path().join("native");
+        let mut config = ControlPlaneConfig::new(&state);
+        config.auto_schedule_plans = false;
+        let control_plane = ControlPlane::open(config).await.unwrap();
+        let handle = control_plane.handle();
+        let native = NativeExecutionProvider::open(native_state.clone())
+            .await
+            .unwrap();
+        handle.register_provider(native).await.unwrap();
+        let accepted = handle
+            .submit(envelope(Command::SubmitIngress(IngressEnvelope {
+                command_id: CommandId::new(),
+                source: IngressSource::Cli,
+                source_event_id: "detached-native-ingress".to_owned(),
+                workspace_id: WorkspaceId::from_string("workspace"),
+                exercise_id: None,
+                operation_run_id: None,
+                operator_session_id: None,
+                session_id: "detached-native-session".to_owned(),
+                prompt_id: "detached-native-prompt".to_owned(),
+                request: "run a daemon-owned subprocess until cancelled".to_owned(),
+                team: None,
+                metadata: serde_json::Map::new(),
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Accepted { engagement_id, .. } = accepted else {
+            panic!("expected accepted engagement");
+        };
+        let task = ExecutionTask {
+            task_id: TaskId::from_string("detached-native-task"),
+            objective: "own a real long-running subprocess".to_owned(),
+            mode: ExecutionMode::Detached,
+            capability: CapabilityRequirement {
+                operation_id: "native.command.start".into(),
+                preferred_provider: Some("native-execution".into()),
+                required_features: vec!["process_tree_cancellation".to_owned()],
+            },
+            input: serde_json::json!({
+                "executable": "/bin/sh",
+                "args": ["-c", "printf control-plane-started; sleep 30"],
+                "timeout_ms": 60_000
+            }),
+            deadline_unix_ms: now_unix_ms() + 10_000,
+            completion_tests: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        handle
+            .submit(envelope(Command::SubmitPlan(TaskingPlan {
+                engagement_id: engagement_id.clone(),
+                revision: 1,
+                objective: "detached native cancellation".to_owned(),
+                tasks: vec![task.clone()],
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let request_id = RequestId::from_string("detached-native-request");
+        handle
+            .submit(envelope(Command::Dispatch(ProviderDispatch {
+                request_id: request_id.clone(),
+                engagement_id: engagement_id.clone(),
+                plan_revision: 1,
+                task,
+                provider_id: "native-execution".into(),
+                lease_epoch: 1,
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+
+        let receipt = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let graph = task_graph(&handle, engagement_id.clone()).await;
+                if graph.tasks[0].status == TaskStatus::Running
+                    && let Some(ExecutionReceipt::Detached(receipt)) = &graph.tasks[0].execution
+                {
+                    break receipt.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached native dispatch did not become cancellable");
+        assert_eq!(receipt.request_id, request_id);
+        handle
+            .submit(envelope(Command::CancelTask {
+                engagement_id: engagement_id.clone(),
+                task_id: receipt.task_id.clone(),
+                request_id: receipt.request_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if task_graph(&handle, engagement_id.clone()).await.tasks[0].status
+                    == TaskStatus::Cancelled
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached native task did not become cancelled");
+
+        let mut jobs = tokio::fs::read_dir(native_state.join("jobs"))
+            .await
+            .unwrap();
+        let job = jobs
+            .next_entry()
+            .await
+            .unwrap()
+            .expect("native supervisor did not persist its job");
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(job.path().join("job.json")).await.unwrap())
+                .unwrap();
+        assert_eq!(persisted["lifecycle"], "cancelled");
+        assert!(persisted["finished_unix_ms"].as_u64().is_some());
+        assert_eq!(
+            task_graph(&handle, engagement_id).await.tasks[0].execution,
+            Some(ExecutionReceipt::Detached(receipt))
+        );
+
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
     }
 
     #[tokio::test]

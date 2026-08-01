@@ -1,14 +1,15 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use xai_grok_native_execution::{
-    CommandRequest, NativeExecutionError, NativeExecutionLimits, NativeExecutionSupervisor,
-    NmapRequest,
+    CommandRequest, JobSnapshot, NativeExecutionError, NativeExecutionLimits,
+    NativeExecutionSupervisor, NmapRequest,
 };
 use xai_grok_protocol::{
     ArtifactContract, CancellationSemantics, CapabilityManifest, ConcurrencyProfile,
@@ -21,9 +22,50 @@ use crate::provider::{ExecutionProvider, ProviderArtifact, ProviderOutput};
 
 pub const NATIVE_PROVIDER_ID: &str = "native-execution";
 
+struct RequestJobBinding {
+    job_id: RwLock<Option<String>>,
+    closed: AtomicBool,
+    changed: Notify,
+}
+
+impl RequestJobBinding {
+    fn pending() -> Self {
+        Self {
+            job_id: RwLock::new(None),
+            closed: AtomicBool::new(false),
+            changed: Notify::new(),
+        }
+    }
+
+    async fn bind(&self, job_id: String) {
+        *self.job_id.write().await = Some(job_id);
+        self.changed.notify_waiters();
+    }
+
+    async fn job_id(&self) -> Option<String> {
+        loop {
+            // Register before inspecting state so a bind/close between the
+            // inspection and await cannot strand cancellation forever.
+            let changed = self.changed.notified();
+            if let Some(job_id) = self.job_id.read().await.clone() {
+                return Some(job_id);
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            changed.await;
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+}
+
 pub struct NativeExecutionProvider {
     supervisor: Arc<NativeExecutionSupervisor>,
-    request_jobs: RwLock<HashMap<RequestId, String>>,
+    request_jobs: RwLock<HashMap<RequestId, Arc<RequestJobBinding>>>,
     maximum_parallel: u32,
     queue_capacity: u32,
 }
@@ -144,52 +186,124 @@ impl NativeExecutionProvider {
         }
     }
 
-    async fn remember(&self, request_id: RequestId, job_id: String) {
-        self.request_jobs.write().await.insert(request_id, job_id);
-    }
-}
-
-#[async_trait]
-impl ExecutionProvider for NativeExecutionProvider {
-    fn manifest(&self) -> CapabilityManifest {
-        Self::capability_manifest_with_capacity(self.maximum_parallel, self.queue_capacity)
-    }
-
-    async fn health(&self) -> ServiceHealth {
-        ServiceHealth::Ready
-    }
-
-    async fn status(&self) -> serde_json::Value {
-        serde_json::to_value(self.supervisor.capacity().await)
-            .unwrap_or_else(|error| serde_json::json!({"error":error.to_string()}))
+    async fn register_request(
+        &self,
+        request_id: RequestId,
+    ) -> Result<Arc<RequestJobBinding>, ProtocolError> {
+        let binding = Arc::new(RequestJobBinding::pending());
+        let mut requests = self.request_jobs.write().await;
+        if requests.contains_key(&request_id) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::Conflict,
+                format!("native request {request_id} is already active"),
+            ));
+        }
+        requests.insert(request_id, binding.clone());
+        Ok(binding)
     }
 
-    async fn execute(&self, dispatch: ProviderDispatch) -> Result<ProviderOutput, ProtocolError> {
+    async fn release_request(&self, request_id: &RequestId, binding: &Arc<RequestJobBinding>) {
+        binding.close();
+        let mut requests = self.request_jobs.write().await;
+        if requests
+            .get(request_id)
+            .is_some_and(|current| Arc::ptr_eq(current, binding))
+        {
+            requests.remove(request_id);
+        }
+    }
+
+    async fn wait_until_terminal(
+        &self,
+        job_id: &str,
+        deadline_unix_ms: u64,
+    ) -> Result<JobSnapshot, ProtocolError> {
+        loop {
+            let snapshot = self
+                .supervisor
+                .snapshot(job_id)
+                .await
+                .map_err(native_error)?;
+            if snapshot.lifecycle.is_terminal() {
+                return Ok(snapshot);
+            }
+            let now = now_unix_ms();
+            if now >= deadline_unix_ms {
+                let _ = self.supervisor.cancel(job_id).await;
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::DeadlineExceeded,
+                    format!("native job {job_id} exceeded its task deadline"),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(
+                deadline_unix_ms.saturating_sub(now).min(50),
+            ))
+            .await;
+        }
+    }
+
+    async fn terminal_artifacts(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<ProviderArtifact>, ProtocolError> {
+        Ok(self
+            .supervisor
+            .artifacts(job_id)
+            .await
+            .map_err(native_error)?
+            .into_iter()
+            .map(|artifact| ProviderArtifact::file(artifact.media_type, artifact.path))
+            .collect())
+    }
+
+    async fn execute_inner(
+        &self,
+        dispatch: ProviderDispatch,
+        binding: Option<&Arc<RequestJobBinding>>,
+    ) -> Result<ProviderOutput, ProtocolError> {
         let operation = dispatch.task.capability.operation_id.as_str();
+        let mode = dispatch.task.mode;
+        let deadline_unix_ms = dispatch.task.deadline_unix_ms;
         let owner_id = dispatch.engagement_id.to_string();
         let input = dispatch.task.input;
         let mut artifacts = Vec::new();
         let output = match operation {
             "native.command.start" => {
                 let input: StartCommandInput = parse(input)?;
-                let snapshot = self
+                let mut snapshot = self
                     .supervisor
                     .start_command_for(input.owner_id.unwrap_or(owner_id), input.request)
                     .await
                     .map_err(native_error)?;
-                self.remember(dispatch.request_id, snapshot.job_id.clone())
+                binding
+                    .expect("start operations register a request binding")
+                    .bind(snapshot.job_id.clone())
                     .await;
+                if mode == xai_grok_protocol::ExecutionMode::Detached {
+                    snapshot = self
+                        .wait_until_terminal(&snapshot.job_id, deadline_unix_ms)
+                        .await?;
+                    artifacts.extend(self.terminal_artifacts(&snapshot.job_id).await?);
+                }
                 serde_json::to_value(snapshot).map_err(internal_error)?
             }
             "native.nmap.start" => {
                 let request: NmapRequest = parse(input)?;
-                let snapshot = self
+                let mut snapshot = self
                     .supervisor
                     .start_nmap_for(owner_id, request)
                     .await
                     .map_err(native_error)?;
-                self.remember(dispatch.request_id, snapshot.job_id.clone())
+                binding
+                    .expect("start operations register a request binding")
+                    .bind(snapshot.job_id.clone())
                     .await;
+                if mode == xai_grok_protocol::ExecutionMode::Detached {
+                    snapshot = self
+                        .wait_until_terminal(&snapshot.job_id, deadline_unix_ms)
+                        .await?;
+                    artifacts.extend(self.terminal_artifacts(&snapshot.job_id).await?);
+                }
                 serde_json::to_value(snapshot).map_err(internal_error)?
             }
             "native.command.status" | "native.nmap.status" => {
@@ -223,6 +337,10 @@ impl ExecutionProvider for NativeExecutionProvider {
             }
             "native.command.wait" => {
                 let input: WaitInput = parse(input)?;
+                binding
+                    .expect("wait operations register a request binding")
+                    .bind(input.job_id.clone())
+                    .await;
                 let snapshot = self
                     .supervisor
                     .wait(
@@ -232,16 +350,7 @@ impl ExecutionProvider for NativeExecutionProvider {
                     .await
                     .map_err(native_error)?;
                 if snapshot.lifecycle.is_terminal() {
-                    artifacts.extend(
-                        self.supervisor
-                            .artifacts(&input.job_id)
-                            .await
-                            .map_err(native_error)?
-                            .into_iter()
-                            .map(|artifact| {
-                                ProviderArtifact::file(artifact.media_type, artifact.path)
-                            }),
-                    );
+                    artifacts.extend(self.terminal_artifacts(&input.job_id).await?);
                 }
                 serde_json::to_value(snapshot).map_err(internal_error)?
             }
@@ -330,14 +439,7 @@ impl ExecutionProvider for NativeExecutionProvider {
                         .collect(),
                     })
                     .collect();
-                let artifacts = self
-                    .supervisor
-                    .artifacts(&input.job_id)
-                    .await
-                    .map_err(native_error)?
-                    .into_iter()
-                    .map(|artifact| ProviderArtifact::file(artifact.media_type, artifact.path))
-                    .collect();
+                let artifacts = self.terminal_artifacts(&input.job_id).await?;
                 return Ok(ProviderOutput {
                     output: serde_json::to_value(result).map_err(internal_error)?,
                     observations,
@@ -357,15 +459,74 @@ impl ExecutionProvider for NativeExecutionProvider {
             artifacts,
         })
     }
+}
+
+#[async_trait]
+impl ExecutionProvider for NativeExecutionProvider {
+    fn manifest(&self) -> CapabilityManifest {
+        Self::capability_manifest_with_capacity(self.maximum_parallel, self.queue_capacity)
+    }
+
+    async fn health(&self) -> ServiceHealth {
+        ServiceHealth::Ready
+    }
+
+    async fn status(&self) -> serde_json::Value {
+        serde_json::to_value(self.supervisor.capacity().await)
+            .unwrap_or_else(|error| serde_json::json!({"error":error.to_string()}))
+    }
+
+    async fn execute(&self, dispatch: ProviderDispatch) -> Result<ProviderOutput, ProtocolError> {
+        let request_id = dispatch.request_id.clone();
+        let operation = dispatch.task.capability.operation_id.as_str();
+        let owns_job = matches!(
+            operation,
+            "native.command.start" | "native.nmap.start" | "native.command.wait"
+        );
+        let binding = if owns_job {
+            Some(self.register_request(request_id.clone()).await?)
+        } else {
+            None
+        };
+        let result = self.execute_inner(dispatch, binding.as_ref()).await;
+        if let Some(binding) = &binding {
+            self.release_request(&request_id, binding).await;
+        }
+        result
+    }
 
     async fn cancel(&self, request_id: &RequestId) -> Result<(), ProtocolError> {
-        let job_id = self.request_jobs.read().await.get(request_id).cloned();
-        if let Some(job_id) = job_id {
-            self.supervisor
-                .cancel(&job_id)
-                .await
-                .map_err(native_error)?;
-        }
+        let binding = self
+            .request_jobs
+            .read()
+            .await
+            .get(request_id)
+            .cloned()
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::NotFound,
+                    format!("active native request {request_id} was not found"),
+                )
+            })?;
+        let job_id = tokio::time::timeout(Duration::from_secs(5), binding.job_id())
+            .await
+            .map_err(|_| {
+                ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    format!("native request {request_id} did not expose its job before timeout"),
+                )
+                .retryable()
+            })?
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::NotFound,
+                    format!("native request {request_id} completed before cancellation"),
+                )
+            })?;
+        self.supervisor
+            .cancel(&job_id)
+            .await
+            .map_err(native_error)?;
         Ok(())
     }
 }
@@ -443,6 +604,13 @@ fn default_bytes() -> usize {
     1024 * 1024
 }
 
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn parse<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T, ProtocolError> {
     serde_json::from_value(value).map_err(|error| {
         ProtocolError::new(
@@ -487,6 +655,14 @@ mod tests {
     use super::*;
 
     fn dispatch(operation: &str, input: serde_json::Value) -> ProviderDispatch {
+        dispatch_with_mode(operation, input, ExecutionMode::Deferred)
+    }
+
+    fn dispatch_with_mode(
+        operation: &str,
+        input: serde_json::Value,
+        mode: ExecutionMode,
+    ) -> ProviderDispatch {
         ProviderDispatch {
             request_id: RequestId::new(),
             engagement_id: EngagementId::new(),
@@ -494,7 +670,7 @@ mod tests {
             task: ExecutionTask {
                 task_id: TaskId::new(),
                 objective: "native provider integration test".to_owned(),
-                mode: ExecutionMode::Deferred,
+                mode,
                 capability: CapabilityRequirement {
                     operation_id: operation.into(),
                     preferred_provider: Some(ProviderId::from_string(NATIVE_PROVIDER_ID)),
@@ -505,13 +681,26 @@ mod tests {
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64
-                    + 10_000,
+                    + 60_000,
                 completion_tests: Vec::new(),
                 depends_on: Vec::new(),
             },
             provider_id: ProviderId::from_string(NATIVE_PROVIDER_ID),
             lease_epoch: 1,
         }
+    }
+
+    async fn wait_for_job(provider: &NativeExecutionProvider) -> JobSnapshot {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(snapshot) = provider.supervisor.list(None, 0, 1).await.pop() {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real native job did not enter the supervisor")
     }
 
     #[tokio::test]
@@ -672,5 +861,93 @@ mod tests {
             .map(|byte| byte.as_u64().unwrap() as u8)
             .collect::<Vec<_>>();
         assert_eq!(bytes, b"daemon-stdin");
+    }
+
+    #[tokio::test]
+    async fn detached_request_owns_and_cancels_its_real_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = NativeExecutionProvider::open(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let dispatch = dispatch_with_mode(
+            "native.command.start",
+            serde_json::json!({
+                "executable": "/bin/sh",
+                "args": ["-c", "printf detached-started; sleep 30"],
+                "timeout_ms": 60_000
+            }),
+            ExecutionMode::Detached,
+        );
+        let request_id = dispatch.request_id.clone();
+        let running_provider = provider.clone();
+        let execution = tokio::spawn(async move { running_provider.execute(dispatch).await });
+
+        let job = wait_for_job(&provider).await;
+        provider.cancel(&request_id).await.unwrap();
+        let output = execution.await.unwrap().unwrap();
+        assert_eq!(output.output["job_id"], job.job_id);
+        assert_eq!(output.output["lifecycle"], "cancelled");
+        assert_eq!(
+            provider
+                .supervisor
+                .snapshot(output.output["job_id"].as_str().unwrap())
+                .await
+                .unwrap()
+                .lifecycle,
+            xai_grok_native_execution::JobLifecycle::Cancelled
+        );
+        assert!(provider.request_jobs.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_request_cancellation_is_routed_to_its_real_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = NativeExecutionProvider::open(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let started = provider
+            .execute(dispatch(
+                "native.command.start",
+                serde_json::json!({
+                    "executable": "/bin/sh",
+                    "args": ["-c", "sleep 30"],
+                    "timeout_ms": 60_000
+                }),
+            ))
+            .await
+            .unwrap();
+        let job_id = started.output["job_id"].as_str().unwrap().to_owned();
+        let wait_dispatch = dispatch(
+            "native.command.wait",
+            serde_json::json!({"job_id": job_id, "wait_ms": 30_000}),
+        );
+        let request_id = wait_dispatch.request_id.clone();
+        let waiting_provider = provider.clone();
+        let waiting = tokio::spawn(async move { waiting_provider.execute(wait_dispatch).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if provider.request_jobs.read().await.contains_key(&request_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("wait request did not register for cancellation");
+        provider.cancel(&request_id).await.unwrap();
+        let output = waiting.await.unwrap().unwrap();
+        assert_eq!(output.output["lifecycle"], "cancelled");
+        assert!(provider.request_jobs.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_never_claims_an_unknown_request_was_cancelled() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = NativeExecutionProvider::open(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let error = provider.cancel(&RequestId::new()).await.unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::NotFound);
     }
 }
