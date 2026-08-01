@@ -9,10 +9,11 @@ use xai_grok_protocol::{
     ArtifactId, ChannelId, ClaimTeamResource, ClientId, Command, CommandId, CreateExercise,
     CreateFinding, CreateOperationRun, CreateOperatorSession, CreatePlaybook, CreateTeamWorkItem,
     EventReadRequest, EvidenceId, ExerciseId, FindingSeverity, FindingStatus, IngressEnvelope,
-    IngressSource, OperationRunId, OperatorSessionId, PlaybookId, PlaybookStep, PostTeamMessage,
-    ProjectionQuery, RecordExerciseEvidence, ResourceClaimId, Response, RuntimeProfile,
-    SetTeamPresence, TargetId, TaskId, TeamClient, TeamId, TeamPresenceState, TeamWorkItemId,
-    TeamWorkItemStatus, WorkspaceId, parse_scope_targets,
+    IngressSource, OperationId, OperationRunId, OperatorSessionId, PlaybookId, PlaybookStep,
+    PostTeamMessage, ProjectionQuery, ProviderId, RecordExerciseEvidence, RequestId,
+    ResourceClaimId, Response, RuntimeProfile, SetTeamPresence, TargetId, TaskId, TeamClient,
+    TeamId, TeamPresenceState, TeamWorkItemId, TeamWorkItemStatus, WorkspaceId,
+    parse_scope_targets,
 };
 
 const USAGE: &str = "\
@@ -36,6 +37,13 @@ Commands:
   team message --team ID --channel ID --sender CLIENT --body TEXT [--reply-to ID]
   team claim --team ID --owner CLIENT --resource KEY --lease-ms N
   team release CLAIM_ID --owner CLIENT --revision N
+  job start --exec PATH [--arg VALUE ...] [--cwd PATH] [--env K=V ...] [--timeout-ms N]
+  job nmap --target TARGET --scope SELECTOR[,SELECTOR] [--profile host_discovery|tcp_connect|service_discovery] [--ports LIST] [--timeout-ms N]
+  job status ID
+  job wait ID [--wait-ms N]
+  job output ID [--cursor N] [--records N] [--bytes N] [--raw]
+  job result ID
+  job cancel ID
   submit --workspace ID [--exercise ID] [--run ID] --session ID --request TEXT|-
   artifact read ID [--cursor N] [--limit N] [--all] [--raw]
   profile lint FILE
@@ -98,10 +106,227 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "evidence" => record_evidence(&control, arguments).await,
         "finding" => finding(&control, arguments).await,
         "team" => team(&control, arguments).await,
+        "job" => job(&control, arguments).await,
         "submit" => submit(&control, arguments).await,
         "artifact" => read_artifact(&control, arguments).await,
         _ => Err(format!("unknown command {command:?}\n{USAGE}").into()),
     }
+}
+
+async fn job(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match arguments.pop_front().as_deref() {
+        Some("start") => start_job(control, arguments).await,
+        Some("nmap") => start_nmap_job(control, arguments).await,
+        Some("status") => invoke_job_with_id(control, "native.command.status", arguments).await,
+        Some("result") => invoke_job_with_id(control, "native.nmap.result", arguments).await,
+        Some("cancel") => invoke_job_with_id(control, "native.command.cancel", arguments).await,
+        Some("wait") => wait_for_job(control, arguments).await,
+        Some("output") => read_job_output(control, arguments).await,
+        _ => Err(format!(
+            "job requires start, nmap, status, wait, output, result, or cancel\n{USAGE}"
+        )
+        .into()),
+    }
+}
+
+async fn start_job(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut executable = None;
+    let mut args = Vec::new();
+    let mut cwd = None;
+    let mut env = serde_json::Map::new();
+    let mut timeout_ms = 20 * 60 * 1_000_u64;
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--exec" => executable = Some(value(&mut arguments, "--exec")?),
+            "--arg" => args.push(value(&mut arguments, "--arg")?),
+            "--cwd" => cwd = Some(value(&mut arguments, "--cwd")?),
+            "--env" => {
+                let pair = value(&mut arguments, "--env")?;
+                let (key, value) = pair.split_once('=').ok_or("--env requires K=V")?;
+                if key.is_empty() || key.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
+                    return Err("--env requires a non-empty NUL-free key and value".into());
+                }
+                env.insert(key.to_owned(), value.to_owned().into());
+            }
+            "--timeout-ms" => timeout_ms = value(&mut arguments, "--timeout-ms")?.parse()?,
+            other => return Err(format!("unknown job start option {other:?}").into()),
+        }
+    }
+    let response = invoke_native(
+        control,
+        "native.command.start",
+        serde_json::json!({
+            "executable": executable.ok_or("job start requires --exec")?,
+            "args": args,
+            "cwd": cwd,
+            "env": env,
+            "timeout_ms": timeout_ms,
+        }),
+    )
+    .await?;
+    write_json(&response)
+}
+
+async fn start_nmap_job(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut target = None;
+    let mut allowed_targets = None;
+    let mut profile = "service_discovery".to_owned();
+    let mut ports = Vec::new();
+    let mut timeout_ms = 20 * 60 * 1_000_u64;
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--target" => target = Some(value(&mut arguments, "--target")?),
+            "--scope" => allowed_targets = Some(value(&mut arguments, "--scope")?),
+            "--profile" => {
+                profile = value(&mut arguments, "--profile")?;
+                if !matches!(
+                    profile.as_str(),
+                    "host_discovery" | "tcp_connect" | "service_discovery"
+                ) {
+                    return Err(format!("unknown Nmap profile {profile:?}").into());
+                }
+            }
+            "--ports" => {
+                ports = split_ids(&value(&mut arguments, "--ports")?)
+                    .map(|port| port.parse::<u16>())
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            "--timeout-ms" => timeout_ms = value(&mut arguments, "--timeout-ms")?.parse()?,
+            other => return Err(format!("unknown job nmap option {other:?}").into()),
+        }
+    }
+    let allowed_targets =
+        split_ids(&allowed_targets.ok_or("job nmap requires --scope")?).collect::<Vec<_>>();
+    let response = invoke_native(
+        control,
+        "native.nmap.start",
+        serde_json::json!({
+            "target": target.ok_or("job nmap requires --target")?,
+            "allowed_targets": allowed_targets,
+            "profile": profile,
+            "ports": ports,
+            "timeout_ms": timeout_ms,
+        }),
+    )
+    .await?;
+    write_json(&response)
+}
+
+async fn invoke_job_with_id(
+    control: &ControlPlaneClient,
+    operation: &str,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let job_id = arguments
+        .pop_front()
+        .ok_or("job operation requires an id")?;
+    reject_remaining(&arguments)?;
+    write_json(&invoke_native(control, operation, serde_json::json!({"job_id": job_id})).await?)
+}
+
+async fn wait_for_job(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let job_id = arguments.pop_front().ok_or("job wait requires an id")?;
+    let mut wait_ms = 1_000_u64;
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--wait-ms" => wait_ms = value(&mut arguments, "--wait-ms")?.parse()?,
+            other => return Err(format!("unknown job wait option {other:?}").into()),
+        }
+    }
+    write_json(
+        &invoke_native(
+            control,
+            "native.command.wait",
+            serde_json::json!({"job_id": job_id, "wait_ms": wait_ms}),
+        )
+        .await?,
+    )
+}
+
+async fn read_job_output(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let job_id = arguments.pop_front().ok_or("job output requires an id")?;
+    let mut cursor = 0_u64;
+    let mut maximum_records = 128_usize;
+    let mut maximum_bytes = 1024 * 1024_usize;
+    let mut raw = false;
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--cursor" => cursor = value(&mut arguments, "--cursor")?.parse()?,
+            "--records" => maximum_records = value(&mut arguments, "--records")?.parse()?,
+            "--bytes" => maximum_bytes = value(&mut arguments, "--bytes")?.parse()?,
+            "--raw" => raw = true,
+            other => return Err(format!("unknown job output option {other:?}").into()),
+        }
+    }
+    let response = invoke_native(
+        control,
+        "native.command.output",
+        serde_json::json!({
+            "job_id": job_id,
+            "cursor": cursor,
+            "maximum_records": maximum_records,
+            "maximum_bytes": maximum_bytes,
+        }),
+    )
+    .await?;
+    if !raw {
+        return write_json(&response);
+    }
+    let Response::ProviderInvoked { output, .. } = response else {
+        return Err("daemon returned a non-provider response".into());
+    };
+    let records = output["records"]
+        .as_array()
+        .ok_or("native provider output did not contain records")?;
+    let mut stdout = std::io::stdout().lock();
+    for record in records {
+        let bytes = record["bytes"]
+            .as_array()
+            .ok_or("native output record did not contain bytes")?
+            .iter()
+            .map(|byte| {
+                byte.as_u64()
+                    .and_then(|byte| u8::try_from(byte).ok())
+                    .ok_or("native output record contained an invalid byte")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        stdout.write_all(&bytes)?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+async fn invoke_native(
+    control: &ControlPlaneClient,
+    operation: &str,
+    input: serde_json::Value,
+) -> Result<Response, Box<dyn std::error::Error>> {
+    Ok(control
+        .send(
+            Command::InvokeProvider {
+                request_id: RequestId::new(),
+                operation_id: OperationId::from_string(operation),
+                preferred_provider: Some(ProviderId::from_string("native-execution")),
+                input,
+            },
+            Duration::from_secs(35),
+        )
+        .await?)
 }
 
 async fn read_artifact(

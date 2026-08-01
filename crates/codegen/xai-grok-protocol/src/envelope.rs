@@ -4,17 +4,17 @@ use crate::{
     CapabilityManifest, ClaimTeamResource, ClientId, CommandId, CreateExercise, CreateFinding,
     CreateOperationRun, CreateOperatorSession, CreatePlaybook, CreateTeamWorkItem, EngagementId,
     EventBatch, EventId, EventReadRequest, ExecutionReceipt, Exercise, ExerciseEvidence,
-    ExerciseId, Finding, FindingId, FindingStatus, IngressEnvelope, OperationRun, OperationRunId,
-    OperatorSession, OperatorSessionId, Playbook, PostTeamMessage, ProtocolError, ProviderDispatch,
-    ProviderId, RecordExerciseEvidence, RequestId, ResourceClaimId, ServiceHealth, ServiceId,
-    SetTeamPresence, TaskId, TaskingPlan, TeamClient, TeamId, TeamMessage, TeamPresence,
-    TeamResourceClaim, TeamWorkItem, TeamWorkItemId, TeamWorkItemStatus, WorkspaceId,
+    ExerciseId, Finding, FindingId, FindingStatus, IngressEnvelope, OperationId, OperationRun,
+    OperationRunId, OperatorSession, OperatorSessionId, Playbook, PostTeamMessage, ProtocolError,
+    ProviderDispatch, ProviderId, RecordExerciseEvidence, RequestId, ResourceClaimId,
+    ServiceHealth, ServiceId, SetTeamPresence, TaskId, TaskingPlan, TeamClient, TeamId,
+    TeamMessage, TeamPresence, TeamResourceClaim, TeamWorkItem, TeamWorkItemId, TeamWorkItemStatus,
+    WorkspaceId,
 };
 
-/// Protocol v6 adds durable team presence, work, messaging, handoff, and
-/// resource-coordination operations. It is
+/// Protocol v7 adds provider invocation for headless job control. It is
 /// not wire-compatible with older clients.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +67,12 @@ pub enum Command {
         claim_id: ResourceClaimId,
         owner: ClientId,
         expected_revision: u64,
+    },
+    InvokeProvider {
+        request_id: RequestId,
+        operation_id: OperationId,
+        preferred_provider: Option<ProviderId>,
+        input: serde_json::Value,
     },
     SubmitIngress(IngressEnvelope),
     SubmitPlan(TaskingPlan),
@@ -174,6 +180,12 @@ pub enum Response {
     },
     TeamResourceReleased {
         claim: TeamResourceClaim,
+    },
+    ProviderInvoked {
+        request_id: RequestId,
+        provider_id: ProviderId,
+        output: serde_json::Value,
+        observations: Vec<crate::EvidenceObservation>,
     },
     PlanAccepted {
         engagement_id: EngagementId,

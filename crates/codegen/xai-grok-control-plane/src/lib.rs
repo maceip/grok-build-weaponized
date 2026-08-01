@@ -9,6 +9,7 @@ pub mod agent_provider;
 pub mod artifact;
 pub mod control_plane;
 pub mod journal;
+pub mod native_provider;
 pub mod projection;
 pub mod provider;
 pub mod server;
@@ -18,6 +19,7 @@ pub use agent_provider::{AGENT_TURN_OPERATION, AgentExecutionProvider, AgentProv
 pub use artifact::{ArtifactDescriptor, ArtifactStore, ArtifactStoreConfig};
 pub use control_plane::{ControlPlane, ControlPlaneConfig, ControlPlaneError, ControlPlaneHandle};
 pub use journal::{EventJournal, JournalError};
+pub use native_provider::{NATIVE_PROVIDER_ID, NativeExecutionProvider};
 pub use projection::{
     ArtifactProjection, EngagementProjection, ProjectionStore, ProviderOutputProjection,
     ProviderProjection,

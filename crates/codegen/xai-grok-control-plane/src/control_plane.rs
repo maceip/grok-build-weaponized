@@ -420,6 +420,7 @@ impl ControlPlaneCore {
         envelope: CommandEnvelope,
     ) -> Result<Response, ProtocolError> {
         let causation_id = Some(envelope.command_id.to_string());
+        let command_deadline_unix_ms = envelope.deadline_unix_ms;
         match envelope.command {
             Command::Hello(hello) => {
                 if hello.protocol_version != PROTOCOL_VERSION {
@@ -1047,6 +1048,84 @@ impl ControlPlaneCore {
                 )
                 .await?;
                 Ok(Response::TeamResourceReleased { claim })
+            }
+            Command::InvokeProvider {
+                request_id,
+                operation_id,
+                preferred_provider,
+                input,
+            } => {
+                let requirement = CapabilityRequirement {
+                    operation_id,
+                    preferred_provider: preferred_provider.clone(),
+                    required_features: Vec::new(),
+                };
+                let provider_id = self
+                    .providers
+                    .resolve_requirement(
+                        &requirement,
+                        preferred_provider.as_ref(),
+                        ExecutionMode::Interactive,
+                    )
+                    .await?;
+                let dispatch = ProviderDispatch {
+                    request_id: request_id.clone(),
+                    engagement_id: EngagementId::from_string(format!(
+                        "invoke_{}",
+                        request_id.as_str()
+                    )),
+                    plan_revision: 0,
+                    task: ExecutionTask {
+                        task_id: TaskId::from_string(format!("invoke_{}", request_id.as_str())),
+                        objective: "Direct provider invocation".to_owned(),
+                        mode: ExecutionMode::Interactive,
+                        capability: requirement,
+                        input,
+                        deadline_unix_ms: command_deadline_unix_ms,
+                        completion_tests: Vec::new(),
+                        depends_on: Vec::new(),
+                    },
+                    provider_id: provider_id.clone(),
+                    lease_epoch: 0,
+                };
+                let provider_output = self.providers.dispatch(dispatch).await?;
+                let mut artifacts = Vec::new();
+                for artifact in provider_output.artifacts {
+                    let store = self.artifacts.clone();
+                    let descriptor = tokio::task::spawn_blocking(move || {
+                        store.put(artifact.media_type, &artifact.bytes)
+                    })
+                    .await
+                    .map_err(|error| internal_error(error.to_string()))?
+                    .map_err(|error| internal_error(error.to_string()))?;
+                    self.emit(
+                        None,
+                        causation_id.clone(),
+                        0,
+                        Event::ArtifactAvailable {
+                            artifact_id: descriptor.artifact_id.clone(),
+                            task_id: None,
+                            media_type: descriptor.media_type.clone(),
+                            byte_size: descriptor.byte_size,
+                        },
+                    )
+                    .await?;
+                    artifacts.push(serde_json::to_value(descriptor).map_err(internal_error)?);
+                }
+                let output = if artifacts.is_empty() {
+                    provider_output.output
+                } else {
+                    serde_json::json!({
+                        "result": provider_output.output,
+                        "artifacts": artifacts,
+                    })
+                };
+                Ok(Response::ProviderInvoked {
+                    request_id,
+                    provider_id,
+                    output,
+                    observations: provider_output.observations,
+                })
             }
             Command::SubmitIngress(ingress) => {
                 ingress.validate()?;

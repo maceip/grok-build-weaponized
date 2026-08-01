@@ -173,6 +173,9 @@ impl ControlPlaneClient {
             Response::TeamResourceReleased { .. } => {
                 Err(ClientError::ExpectedEvents("team_resource_released"))
             }
+            Response::ProviderInvoked { .. } => {
+                Err(ClientError::ExpectedEvents("provider_invoked"))
+            }
             Response::PlanAccepted { .. } => Err(ClientError::ExpectedEvents("plan_accepted")),
             Response::DispatchAccepted { .. } => {
                 Err(ClientError::ExpectedEvents("dispatch_accepted"))

@@ -3,8 +3,8 @@
   "profile_id": "compact-local",
   "revision": 1,
   "protocol_range": {
-    "minimum": 6,
-    "maximum": 6
+    "minimum": 7,
+    "maximum": 7
   },
   "targets": [
     {

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use xai_grok_control_plane::{
     AgentExecutionProvider, AgentProviderConfig, ControlPlane, ControlPlaneConfig,
-    ControlPlaneServer, ServerConfig,
+    ControlPlaneServer, NativeExecutionProvider, ServerConfig,
 };
 use xai_grok_protocol::{PROTOCOL_VERSION, RuntimeProfile};
 
@@ -50,6 +50,11 @@ struct Arguments {
     /// does not advertise or accept executable agent work.
     #[arg(long)]
     control_only: bool,
+
+    /// Start the native execution provider without an agent worker. Useful for
+    /// compact execution nodes that are driven by another client.
+    #[arg(long)]
+    no_agent: bool,
 }
 
 #[tokio::main]
@@ -86,7 +91,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let control_plane = ControlPlane::open(control_config).await?;
     let handle = control_plane.handle();
-    let agent_provider = if arguments.control_only {
+    let native_provider = if arguments.control_only {
+        None
+    } else {
+        let provider =
+            NativeExecutionProvider::open(arguments.state_directory.join("native-execution"))
+                .await?;
+        handle.register_provider(provider.clone()).await?;
+        Some(provider)
+    };
+    let agent_provider = if arguments.control_only || arguments.no_agent {
         None
     } else {
         let binary = resolve_agent_binary(arguments.agent_binary.as_ref())?;
@@ -119,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         profile_revision = profile.as_ref().map_or(0, |profile| profile.revision),
         profile_hash = profile.as_ref().map(RuntimeProfile::content_hash).unwrap_or_default(),
         agent_provider = agent_provider.is_some(),
+        native_provider = native_provider.is_some(),
         "grokd ready"
     );
 
