@@ -129,13 +129,9 @@ impl LiteRtLmConfig {
             .transpose()?
             .unwrap_or_default();
         if !supported_lora_ranks.is_empty()
-            && !matches!(backend.as_str(), "auto" | "gpu" | "gpu_artisan")
+            && !matches!(backend.as_str(), "auto" | "cpu" | "gpu" | "gpu_artisan")
         {
-            return Err(
-                "`supported_lora_ranks` requires `backend=auto`, `backend=gpu`, or \
-                 `backend=gpu_artisan`"
-                    .to_owned(),
-            );
+            return Err("`supported_lora_ranks` requires a local LiteRT backend".to_owned());
         }
         let adapter_descriptor = query
             .get("adapter_manifest")

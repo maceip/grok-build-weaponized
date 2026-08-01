@@ -258,10 +258,18 @@ impl RuntimeManager {
 
     pub fn new(config: RuntimeManagerConfig) -> Self {
         let governor = ResourceGovernor::new(config.memory_limits);
-        Self::with_governor(config, governor)
+        Self::with_resource_governor(config, governor)
     }
 
-    fn with_governor(config: RuntimeManagerConfig, governor: ResourceGovernor) -> Self {
+    /// Construct a manager that participates in an existing process-wide
+    /// resource budget. Production globals and qualification processes use
+    /// this so inference, adapters, KV state, and local embeddings are
+    /// accounted by the same governor; isolated tests may continue to use
+    /// [`Self::new`].
+    pub fn with_resource_governor(
+        config: RuntimeManagerConfig,
+        governor: ResourceGovernor,
+    ) -> Self {
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let scheduler = Scheduler::spawn(
             config.max_active_requests.max(1),
@@ -298,7 +306,7 @@ impl RuntimeManager {
     pub fn global() -> &'static Self {
         static GLOBAL: OnceLock<RuntimeManager> = OnceLock::new();
         GLOBAL.get_or_init(|| {
-            RuntimeManager::with_governor(
+            RuntimeManager::with_resource_governor(
                 RuntimeManagerConfig::default(),
                 ResourceGovernor::global().clone(),
             )
@@ -317,18 +325,18 @@ impl RuntimeManager {
         &self,
         mut config: LiteRtLmConfig,
         model_id: &str,
-        require_gpu: bool,
+        require_lora: bool,
     ) -> Result<LiteRtLmConfig, SamplingError> {
         if config.backend != "auto" {
-            if require_gpu && !matches!(config.backend.as_str(), "gpu" | "gpu_artisan") {
+            if require_lora && !matches!(config.backend.as_str(), "cpu" | "gpu" | "gpu_artisan") {
                 return Err(runtime_error(
                     "local_runtime_backend",
-                    "LoRA-capable requests require a GPU backend",
+                    "LoRA-capable requests require a local compiled-model backend",
                 ));
             }
             return Ok(config);
         }
-        let selection_key = backend_selection_key(&config, model_id, require_gpu);
+        let selection_key = backend_selection_key(&config, model_id, require_lora);
         if let Some(selected) = self
             .inner
             .backend_selections
@@ -361,8 +369,11 @@ impl RuntimeManager {
             return Ok(config);
         }
 
-        let candidates: &[&str] = if require_gpu {
-            &["gpu"]
+        let candidates: &[&str] = if require_lora {
+            // LiteRT-LM exposes declared-rank LoRA materialization through the
+            // Artisan GPU executor. Generic GPU remains a valid fallback for
+            // artifacts whose graph carries explicit LoRA input tensors.
+            &["gpu_artisan", "gpu", "cpu"]
         } else if cfg!(target_os = "macos") {
             &["gpu", "cpu"]
         } else {
@@ -401,7 +412,7 @@ impl RuntimeManager {
                 self.remove_backend_probe_worker(&candidate, model_id).await;
             }
         }
-        let selected_index = select_backend_probe(&probes, require_gpu).ok_or_else(|| {
+        let selected_index = select_backend_probe(&probes, require_lora).ok_or_else(|| {
             runtime_error(
                 "local_runtime_backend",
                 format!(
@@ -412,7 +423,11 @@ impl RuntimeManager {
         })?;
         let selected = probes[selected_index].config.clone();
         if self.inner.mode == RuntimeMode::Worker && retain_probe_workers {
-            let rejected_backends: &[&str] = if require_gpu { &["cpu"] } else { candidates };
+            let rejected_backends: &[&str] = if require_lora {
+                &["gpu_artisan", "gpu", "cpu"]
+            } else {
+                candidates
+            };
             for backend in rejected_backends {
                 if *backend != selected.backend {
                     let mut rejected = config.clone();
@@ -431,7 +446,7 @@ impl RuntimeManager {
             event = "local_runtime_backend_selected",
             model_id,
             backend = %selected.backend,
-            gpu_required = require_gpu,
+            lora_required = require_lora,
             "selected local backend after compatibility and startup benchmark probes"
         );
         Ok(selected)
@@ -496,14 +511,98 @@ impl RuntimeManager {
         config: LiteRtLmConfig,
         descriptor: AdapterDescriptor,
     ) -> Result<u32, SamplingError> {
-        let config = self.resolve_backend(config, &model_id, true).await?;
-        self.relieve_memory_pressure().await?;
-        if !config.backend.to_ascii_lowercase().contains("gpu") {
-            return Err(runtime_error(
-                "local_runtime_adapter",
-                "LoRA requests require a GPU LiteRT-LM backend",
-            ));
+        let requested_auto = config.backend == "auto";
+        let unresolved_config = config.clone();
+        let resolved_config = self.resolve_backend(config, &model_id, true).await?;
+        let selected_backend = resolved_config.backend.clone();
+        let first_error = match self
+            .prewarm_adapter_on_backend(
+                model_id.clone(),
+                resolved_config.clone(),
+                descriptor.clone(),
+            )
+            .await
+        {
+            Ok(native_id) => return Ok(native_id),
+            Err(error) => error,
+        };
+        if !requested_auto || selected_backend == "cpu" {
+            return Err(first_error);
         }
+
+        // Once any adapter for this model is deployed, every additional
+        // adapter must qualify on that same engine backend. Moving only the
+        // failing revision to another worker would make a later selection
+        // depend on hidden deployment state and could cross-contaminate KV
+        // sessions. Backend fallback is therefore permitted only while
+        // qualifying the first adapter for a model.
+        let already_deployed = self
+            .inner
+            .adapter_deployments
+            .lock()
+            .await
+            .values()
+            .any(|deployment| deployment.model_id == model_id);
+        if already_deployed {
+            return Err(first_error);
+        }
+
+        let selection_key = backend_selection_key(&unresolved_config, &model_id, true);
+        self.inner
+            .backend_selections
+            .lock()
+            .await
+            .remove(&selection_key);
+        self.remove_backend_probe_worker(&resolved_config, &model_id)
+            .await;
+        let mut failures = vec![format!("{selected_backend}: {first_error}")];
+        for backend in lora_fallback_backends(&selected_backend) {
+            let mut candidate = unresolved_config.clone();
+            candidate.backend = (*backend).to_string();
+            match self
+                .prewarm_adapter_on_backend(model_id.clone(), candidate.clone(), descriptor.clone())
+                .await
+            {
+                Ok(native_id) => {
+                    self.inner
+                        .backend_selections
+                        .lock()
+                        .await
+                        .insert(selection_key, candidate.backend.clone());
+                    tracing::info!(
+                        target: crate::LOG_TARGET,
+                        event = "local_runtime_lora_backend_fallback",
+                        model_id,
+                        rejected_backend = %selected_backend,
+                        selected_backend = %candidate.backend,
+                        "selected a LoRA backend only after real adapter materialization and probe"
+                    );
+                    return Ok(native_id);
+                }
+                Err(error) => {
+                    failures.push(format!("{backend}: {error}"));
+                    self.remove_backend_probe_worker(&candidate, &model_id)
+                        .await;
+                }
+            }
+        }
+        Err(runtime_error(
+            "local_runtime_adapter_backend",
+            format!(
+                "no local backend passed real adapter materialization and probe: {}",
+                failures.join("; ")
+            ),
+        ))
+    }
+
+    async fn prewarm_adapter_on_backend(
+        &self,
+        model_id: String,
+        config: LiteRtLmConfig,
+        descriptor: AdapterDescriptor,
+    ) -> Result<u32, SamplingError> {
+        debug_assert_ne!(config.backend, "auto");
+        self.relieve_memory_pressure().await?;
         if config.supported_lora_ranks.is_empty()
             || !config.supported_lora_ranks.contains(&descriptor.rank)
         {
@@ -2101,24 +2200,24 @@ fn split_replica_worker_key(key: &str) -> Option<(&str, usize)> {
     Some((base, replica.parse().ok()?))
 }
 
-fn backend_selection_key(config: &LiteRtLmConfig, model_id: &str, require_gpu: bool) -> String {
+fn backend_selection_key(config: &LiteRtLmConfig, model_id: &str, require_lora: bool) -> String {
     format!(
-        "{}\0{}\0{model_id}\0gpu_required={require_gpu}",
+        "{}\0{}\0{model_id}\0lora_required={require_lora}",
         config.library_path.display(),
         config.model_path.display()
     )
 }
 
-fn select_backend_probe(probes: &[BackendProbeSample], require_gpu: bool) -> Option<usize> {
+fn select_backend_probe(probes: &[BackendProbeSample], require_lora: bool) -> Option<usize> {
     let gpu = probes
         .iter()
         .position(|probe| matches!(probe.config.backend.as_str(), "gpu" | "gpu_artisan"));
-    if require_gpu {
-        return gpu;
-    }
     let cpu = probes
         .iter()
         .position(|probe| probe.config.backend == "cpu");
+    if require_lora {
+        return gpu.or(cpu);
+    }
     match (gpu, cpu) {
         (Some(gpu), Some(cpu)) => {
             let gpu_probe = &probes[gpu];
@@ -2142,6 +2241,14 @@ fn select_backend_probe(probes: &[BackendProbeSample], require_gpu: bool) -> Opt
         (Some(gpu), None) => Some(gpu),
         (None, Some(cpu)) => Some(cpu),
         (None, None) => None,
+    }
+}
+
+fn lora_fallback_backends(selected_backend: &str) -> &'static [&'static str] {
+    match selected_backend {
+        "gpu_artisan" => &["gpu", "cpu"],
+        "gpu" => &["cpu"],
+        _ => &[],
     }
 }
 
@@ -3021,6 +3128,16 @@ mod tests {
 
         let regressed = [probe("gpu", 200, 150), probe("cpu", 100, 100)];
         assert_eq!(select_backend_probe(&regressed, false), Some(1));
+
+        let cpu_only = [probe("cpu", 100, 100)];
+        assert_eq!(select_backend_probe(&cpu_only, true), Some(0));
+    }
+
+    #[test]
+    fn lora_backend_fallback_never_moves_back_to_a_rejected_gpu_class() {
+        assert_eq!(lora_fallback_backends("gpu_artisan"), &["gpu", "cpu"]);
+        assert_eq!(lora_fallback_backends("gpu"), &["cpu"]);
+        assert!(lora_fallback_backends("cpu").is_empty());
     }
 
     #[test]

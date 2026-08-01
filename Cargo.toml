@@ -47,6 +47,7 @@ members = [
     "crates/codegen/xai-grok-paths",
     "crates/codegen/xai-grok-plugin-marketplace",
     "crates/codegen/xai-grok-protocol",
+    "crates/codegen/xai-grok-release-soak",
     "crates/codegen/xai-grok-runtime",
     "crates/codegen/xai-grok-sampler",
     "crates/codegen/xai-grok-sampling-types",

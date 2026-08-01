@@ -7,7 +7,7 @@ usage() {
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "${script_dir}/../../../../.." && pwd -P)"
-source_dir="${LITERT_LM_SOURCE:-/Users/mac/LiteRT-DPM-main}"
+source_dir="${LITERT_LM_SOURCE:-}"
 output_dir="${repo_root}/.grok/runtime"
 source "${script_dir}/toolchain.lock"
 
@@ -33,6 +33,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+[[ -n "${source_dir}" ]] || {
+  echo "pass --source PATH or set LITERT_LM_SOURCE to the pinned LiteRT-LM checkout" >&2
+  exit 1
+}
 
 [[ -f "${source_dir}/c/engine.h" ]] || {
   echo "LiteRT-LM source tree not found at ${source_dir}" >&2
@@ -87,7 +92,9 @@ patches=(
   "${script_dir}/patches/0010-llguidance-valid-eos-selection.patch"
 )
 patch_revision="$(
-  shasum -a 256 "${patches[@]}" |
+  for patch in "${patches[@]}"; do
+    shasum -a 256 "${patch}" | awk '{print $1}'
+  done |
     shasum -a 256 |
     awk '{print $1}'
 )"

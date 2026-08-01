@@ -15973,6 +15973,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-grok-release-soak"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dunce",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "xai-grok-config-types",
+ "xai-grok-memory",
+ "xai-grok-native-execution",
+ "xai-grok-runtime",
+ "xai-grok-sampling-types",
+ "xai-grok-test-support",
+ "xai-grok-tools",
+]
+
+[[package]]
 name = "xai-grok-runtime"
 version = "0.1.0"
 dependencies = [

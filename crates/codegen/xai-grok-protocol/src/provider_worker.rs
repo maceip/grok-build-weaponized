@@ -11,7 +11,7 @@ pub const MAX_PROVIDER_WORKER_FRAME_BYTES: usize = 16 * 1024 * 1024;
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum ProviderWorkerRequest {
     Hello { protocol_version: u32 },
-    Execute { dispatch: ProviderDispatch },
+    Execute { dispatch: Box<ProviderDispatch> },
     Cancel { request_id: RequestId },
     Shutdown,
 }

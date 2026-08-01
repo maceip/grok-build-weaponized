@@ -1164,12 +1164,10 @@ mod tests {
         );
     }
 
-    /// The scaffold-marker branch is scoped to evergreen sources: a short
-    /// non-evergreen chunk that merely quotes a marker phrase must be kept,
-    /// while the same text on an evergreen source is filtered.
+    /// Quoting a scaffold marker is real content regardless of source. Only
+    /// the exact generated template line is scaffold.
     #[test]
-    fn test_is_content_free_marker_branch_scoped_to_evergreen() {
-        // A short session note that happens to quote a scaffold marker phrase.
+    fn test_is_content_free_preserves_quoted_scaffold_marker() {
         let quotes_marker =
             "Reminder: the template says \"Add any cross-project preferences here\".";
         assert!(
@@ -1177,8 +1175,8 @@ mod tests {
             "non-evergreen chunk quoting a marker phrase must NOT be filtered"
         );
         assert!(
-            is_content_free(quotes_marker, "global"),
-            "the same short text on an evergreen source is treated as scaffold"
+            !is_content_free(quotes_marker, "global"),
+            "evergreen content quoting a marker phrase must NOT be filtered"
         );
     }
 

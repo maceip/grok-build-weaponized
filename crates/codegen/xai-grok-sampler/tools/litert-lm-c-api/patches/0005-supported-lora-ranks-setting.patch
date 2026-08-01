@@ -2,7 +2,7 @@ diff --git a/c/engine.cc b/c/engine.cc
 index d03ae27..bb52ebb 100644
 --- a/c/engine.cc
 +++ b/c/engine.cc
-@@ -415,6 +415,55 @@ void litert_lm_engine_settings_set_max_num_tokens(
+@@ -415,6 +415,58 @@ void litert_lm_engine_settings_set_max_num_tokens(
          max_num_tokens);
    }
  }
@@ -39,14 +39,17 @@ index d03ae27..bb52ebb 100644
 +        SetGrokLastError(status);
 +      } else if (executor_settings
 +                     .GetBackendConfig<litert::lm::GpuConfig>()
++                     .ok() ||
++                 executor_settings
++                     .GetBackendConfig<litert::lm::CpuConfig>()
 +                     .ok()) {
-+        // The compiled-model GPU executor discovers LoRA inputs directly from
-+        // the model. Rust enforces this declared set before load; native
++        // Compiled-model GPU and CPU executors discover LoRA inputs directly
++        // from the model. Rust enforces this declared set before load; native
 +        // materialization and probe generation validate the actual tensors.
 +        return 0;
 +      } else {
 +        g_grok_last_error =
-+            "supported LoRA ranks require a LiteRT GPU backend";
++            "supported LoRA ranks require a LiteRT compiled-model backend";
 +      }
 +    }
 +  }
@@ -66,7 +69,7 @@ index ba805b1..05569de 100644
  void litert_lm_engine_settings_set_max_num_tokens(
      LiteRtLmEngineSettings* settings, int max_num_tokens);
 
-+// Declares the LoRA ranks that the GPU engine must materialize.
++// Declares the LoRA ranks that the selected engine must materialize.
 +//
 +// @param settings The engine settings.
 +// @param ranks A contiguous array of non-zero ranks.

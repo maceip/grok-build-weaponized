@@ -115,6 +115,12 @@ pub enum WorkerMessage {
 pub struct WorkerStats {
     /// Current resident set size of the isolated worker process.
     pub resident_bytes: u64,
+    /// Live native threads in the isolated worker process when observable.
+    #[serde(default)]
+    pub thread_count: u32,
+    /// Open file descriptors in the isolated worker process when observable.
+    #[serde(default)]
+    pub file_descriptor_count: u32,
     pub resident_adapter_bytes: u64,
     pub resident_adapters: u32,
     pub resident_sessions: u32,

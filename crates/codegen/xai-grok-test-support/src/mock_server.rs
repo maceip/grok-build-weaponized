@@ -2042,7 +2042,10 @@ mod tests {
             server.hold_agent_completions();
             server.enqueue_response("/v1/responses", response);
             let (status, _) = tokio::time::timeout(
-                Duration::from_secs(1),
+                // This is a deadlock guard, not a latency benchmark. Leave
+                // enough scheduling slack for full-workspace parallel tests;
+                // a gated response is never released and still times out.
+                Duration::from_secs(5),
                 read_foreground(
                     &server,
                     InferenceEndpoint::Responses,

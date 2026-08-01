@@ -155,18 +155,37 @@ pub struct DreamMessage {
 /// Returns `true` if the content is scaffold boilerplate that should not be
 /// fed to the dream model as existing memory context.
 ///
-/// A file is scaffold only if it is short (< 500 bytes trimmed) AND contains
-/// a scaffold marker. Files with substantial content are never scaffold, even
-/// if they contain leftover marker strings from the initial template.
+/// A file is scaffold only when it contains a known marker and every other
+/// non-empty line is part of the generated template. Size is deliberately not
+/// used: a newly initialized memory file can remain small after its first real
+/// entry, and dropping that entry from retrieval loses durable evidence.
 pub(crate) fn is_scaffold_template(content: &str) -> bool {
-    const SCAFFOLD_MAX_LEN: usize = 500;
     const MARKERS: &[&str] = &[
         "Auto-populated by dream consolidation",
         "Add project-specific knowledge here",
         "Add any cross-project preferences here",
     ];
     let trimmed = content.trim();
-    trimmed.len() < SCAFFOLD_MAX_LEN && MARKERS.iter().any(|marker| trimmed.contains(marker))
+    if !MARKERS.iter().any(|marker| trimmed.contains(marker)) {
+        return false;
+    }
+
+    trimmed.lines().all(|line| {
+        let line = line.trim();
+        if line.is_empty() || super::chunker::header_level(line).is_some() {
+            return true;
+        }
+        let comment = line
+            .strip_prefix("<!--")
+            .and_then(|line| line.strip_suffix("-->"))
+            .map(str::trim);
+        if comment.is_some_and(|line| MARKERS.contains(&line)) {
+            return true;
+        }
+        line.starts_with("> Auto-populated by dream consolidation")
+            || line == "> This file is automatically managed by Grok's memory system."
+            || line == "> You can also edit it manually — changes will be indexed on next session."
+    })
 }
 
 /// Build the user message for the dream model call from session log contents.
@@ -1349,26 +1368,28 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_boundary_499_bytes_is_scaffold() {
+    fn scaffold_rejects_short_real_content_even_when_marker_remains() {
         let marker = "Add project-specific knowledge here";
-        let pad_len = 499 - marker.len();
-        let content = format!("{}{}", "x".repeat(pad_len), marker);
-        assert_eq!(content.trim().len(), 499);
+        let content =
+            format!("# Project Memory\n\n<!-- {marker} -->\n\n## Finding\n\nHTTP 200 on port 443.");
         assert!(
-            is_scaffold_template(&content),
-            "499-byte content with marker must be classified as scaffold"
+            !is_scaffold_template(&content),
+            "a first small durable entry must not be classified as scaffold"
         );
     }
 
     #[test]
-    fn scaffold_boundary_500_bytes_is_not_scaffold() {
-        let marker = "Add project-specific knowledge here";
-        let pad_len = 500 - marker.len();
-        let content = format!("{}{}", "x".repeat(pad_len), marker);
-        assert_eq!(content.trim().len(), 500);
+    fn scaffold_rejects_initialized_global_memory_with_one_entry() {
+        let content = "# Global Memory\n\n\
+            > This file is automatically managed by Grok's memory system.\n\
+            > You can also edit it manually — changes will be indexed on next session.\n\n\
+            ## Preferences\n\n\
+            <!-- Add any cross-project preferences here -->\n\n\
+            ## Finding\n\n\
+            open-port-443";
         assert!(
-            !is_scaffold_template(&content),
-            "500-byte content with marker must NOT be classified as scaffold"
+            !is_scaffold_template(content),
+            "real content appended to the global template must remain searchable"
         );
     }
 

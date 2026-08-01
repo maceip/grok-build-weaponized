@@ -61,6 +61,8 @@ impl WorkerState {
             xai_grok_runtime::litert_lm::resident_session_stats();
         WorkerStats {
             resident_bytes: process_resident_bytes(),
+            thread_count: process_thread_count(),
+            file_descriptor_count: process_file_descriptor_count(),
             resident_adapter_bytes: self.adapters.resident_bytes(),
             resident_adapters: self.adapters.resident_count(),
             resident_sessions,
@@ -75,63 +77,7 @@ impl WorkerState {
 
 #[cfg(target_os = "macos")]
 fn process_resident_bytes() -> u64 {
-    use std::ffi::c_void;
-    use std::mem::{MaybeUninit, size_of};
-
-    const PROC_PIDTASKINFO: i32 = 4;
-
-    #[repr(C)]
-    struct ProcTaskInfo {
-        virtual_size: u64,
-        resident_size: u64,
-        total_user: u64,
-        total_system: u64,
-        threads_user: u64,
-        threads_system: u64,
-        policy: i32,
-        faults: i32,
-        pageins: i32,
-        cow_faults: i32,
-        messages_sent: i32,
-        messages_received: i32,
-        syscalls_mach: i32,
-        syscalls_unix: i32,
-        context_switches: i32,
-        thread_count: i32,
-        running_threads: i32,
-        priority: i32,
-    }
-
-    #[link(name = "proc")]
-    unsafe extern "C" {
-        fn proc_pidinfo(
-            pid: libc::pid_t,
-            flavor: i32,
-            arg: u64,
-            buffer: *mut c_void,
-            buffer_size: i32,
-        ) -> i32;
-    }
-
-    let mut info = MaybeUninit::<ProcTaskInfo>::zeroed();
-    let expected = i32::try_from(size_of::<ProcTaskInfo>()).unwrap_or(i32::MAX);
-    // SAFETY: `info` is writable for exactly `expected` bytes and proc_pidinfo
-    // initializes the complete PROC_PIDTASKINFO record on a full-size return.
-    let written = unsafe {
-        proc_pidinfo(
-            std::process::id() as libc::pid_t,
-            PROC_PIDTASKINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            expected,
-        )
-    };
-    if written == expected {
-        // SAFETY: a full-size successful return initialized the record.
-        unsafe { info.assume_init().resident_size }
-    } else {
-        0
-    }
+    macos_task_info().map_or(0, |info| info.pti_resident_size)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -143,6 +89,84 @@ fn process_resident_bytes() -> u64 {
     // SAFETY: sysconf is thread-safe and has no pointer arguments.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     resident_pages.saturating_mul(u64::try_from(page_size).unwrap_or(0))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_task_info() -> Option<libc::proc_taskinfo> {
+    use std::ffi::c_void;
+    use std::mem::{MaybeUninit, size_of};
+
+    let mut info = MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    let expected = i32::try_from(size_of::<libc::proc_taskinfo>()).ok()?;
+    // SAFETY: `info` is writable for exactly `expected` bytes and a full-size
+    // return is required before the initialized record is read.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            std::process::id() as libc::pid_t,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast::<c_void>(),
+            expected,
+        )
+    };
+    (written == expected).then(|| {
+        // SAFETY: proc_pidinfo initialized the complete record.
+        unsafe { info.assume_init() }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn process_thread_count() -> u32 {
+    macos_task_info()
+        .and_then(|info| u32::try_from(info.pti_threadnum).ok())
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+fn process_thread_count() -> u32 {
+    std::fs::read_dir("/proc/self/task")
+        .ok()
+        .and_then(|entries| u32::try_from(entries.count()).ok())
+        .unwrap_or(0)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_thread_count() -> u32 {
+    0
+}
+
+#[cfg(target_os = "macos")]
+fn process_file_descriptor_count() -> u32 {
+    use std::ffi::c_void;
+
+    // SAFETY: null and size zero form the documented PROC_PIDLISTFDS size
+    // probe. The return value is a byte count for proc_fdinfo records.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            std::process::id() as libc::pid_t,
+            libc::PROC_PIDLISTFDS,
+            0,
+            std::ptr::null_mut::<c_void>(),
+            0,
+        )
+    };
+    usize::try_from(bytes)
+        .ok()
+        .and_then(|bytes| u32::try_from(bytes / std::mem::size_of::<libc::proc_fdinfo>()).ok())
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+fn process_file_descriptor_count() -> u32 {
+    std::fs::read_dir("/proc/self/fd")
+        .ok()
+        .and_then(|entries| u32::try_from(entries.count()).ok())
+        .unwrap_or(0)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_file_descriptor_count() -> u32 {
+    0
 }
 
 #[cfg(not(unix))]

@@ -63,6 +63,59 @@ impl MemoryLimits {
     }
 }
 
+/// Resident bytes currently attributed to this process by the host kernel.
+///
+/// Runtime components use this to replace model-size estimates with observed
+/// allocations after materialization. Unsupported platforms return `None` and
+/// retain conservative configured estimates.
+pub fn current_process_resident_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(value) = line.strip_prefix("VmRSS:") {
+                let kibibytes = value
+                    .trim()
+                    .trim_end_matches(" kB")
+                    .trim()
+                    .parse::<u64>()
+                    .ok()?;
+                return Some(kibibytes.saturating_mul(1024));
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::c_void;
+        use std::mem::{MaybeUninit, size_of};
+
+        let mut info = MaybeUninit::<libc::proc_taskinfo>::zeroed();
+        let expected = i32::try_from(size_of::<libc::proc_taskinfo>()).ok()?;
+        // SAFETY: `info` is writable for the exact record size and is read
+        // only after libproc reports a complete record.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                std::process::id() as libc::pid_t,
+                libc::PROC_PIDTASKINFO,
+                0,
+                info.as_mut_ptr().cast::<c_void>(),
+                expected,
+            )
+        };
+        (written == expected).then(|| {
+            // SAFETY: a full record was initialized above.
+            unsafe { info.assume_init().pti_resident_size }
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceSnapshot {
     pub limits: MemoryLimits,
@@ -364,9 +417,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn current_process_residency_is_observable_on_release_targets() {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(
+            current_process_resident_bytes().is_some_and(|bytes| bytes > 0),
+            "resident memory must be observable for runtime accounting"
+        );
+    }
+
+    #[test]
     fn derives_expected_limits_for_current_class_of_host() {
         let limits = MemoryLimits::from_physical(128 * 1024 * 1024 * 1024);
-        assert_eq!(limits.soft_bytes, 76_8_u64 * 1024 * 1024 * 1024 / 10);
+        assert_eq!(limits.soft_bytes, 768_u64 * 1024 * 1024 * 1024 / 10);
         assert_eq!(limits.hard_bytes, 96 * 1024 * 1024 * 1024);
     }
 

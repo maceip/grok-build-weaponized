@@ -454,8 +454,8 @@ async fn live_real_worker_cancellation_stays_bounded_and_worker_recovers() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-#[ignore = "requires a GPU LoRA-capable base artifact and two compatible adapters"]
-async fn live_gpu_worker_switches_two_adapters_without_kv_cross_contamination() {
+#[ignore = "requires a real LoRA-capable base artifact and two compatible adapters"]
+async fn live_worker_switches_two_adapters_without_kv_cross_contamination() {
     let library_path =
         PathBuf::from(std::env::var("LITERT_LM_LIBRARY").expect("LITERT_LM_LIBRARY"));
     let model_path = PathBuf::from(
@@ -488,10 +488,11 @@ async fn live_gpu_worker_switches_two_adapters_without_kv_cross_contamination() 
     };
     let first = descriptor("fixture-ones", first_path);
     let second = descriptor("fixture-twos", second_path);
+    let backend = std::env::var("LITERT_LM_LORA_TEST_BACKEND").unwrap_or_else(|_| "cpu".to_owned());
     let config = LiteRtLmConfig {
         model_path,
         library_path,
-        backend: "gpu".to_owned(),
+        backend,
         max_context_tokens: Some(256),
         supported_lora_ranks: vec![rank],
         adapter_descriptor: None,
@@ -572,6 +573,14 @@ async fn live_gpu_worker_switches_two_adapters_without_kv_cross_contamination() 
     };
     let first_output = output(first_result);
     let second_output = output(second_result);
+    assert!(
+        !first_output.trim().is_empty(),
+        "first compatible adapter must produce visible output"
+    );
+    assert!(
+        !second_output.trim().is_empty(),
+        "second compatible adapter must produce visible output"
+    );
     assert_ne!(
         first_output, second_output,
         "two compatible adapters must produce observably different output"

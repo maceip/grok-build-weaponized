@@ -43,6 +43,7 @@ pub use manager::{
 pub use metrics::{InferenceLatencyStats, compute_percentiles};
 pub use resource::{
     MemoryLimits, ResourceClass, ResourceGovernor, ResourceLease, ResourceSnapshot,
+    current_process_resident_bytes,
 };
 
 pub(crate) const LOG_TARGET: &str = "xai_grok::local_runtime";

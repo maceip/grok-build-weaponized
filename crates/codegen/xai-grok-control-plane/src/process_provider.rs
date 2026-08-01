@@ -257,7 +257,9 @@ impl ExecutionProvider for ProcessExecutionProvider {
                 .ok_or_else(|| unavailable("provider worker is unavailable"))?;
             write_worker_frame(
                 &mut worker.input,
-                &ProviderWorkerRequest::Execute { dispatch },
+                &ProviderWorkerRequest::Execute {
+                    dispatch: Box::new(dispatch),
+                },
             )
             .await?;
             read_worker_frame(&mut worker.output).await

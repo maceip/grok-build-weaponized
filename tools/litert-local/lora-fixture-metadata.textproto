@@ -1,0 +1,7 @@
+start_token {
+  token_str: "BOS"
+}
+stop_tokens {
+  token_str: "z"
+}
+max_num_tokens: 128

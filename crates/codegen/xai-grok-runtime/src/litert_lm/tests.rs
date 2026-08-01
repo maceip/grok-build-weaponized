@@ -40,7 +40,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_gpu_lora_backends_and_rejects_lora_ranks_on_cpu() {
+    fn parses_lora_capable_local_backends() {
         let artisan = LiteRtLmConfig::from_base_url(
             "litert-lm:///tmp/model.litertlm?library=/tmp/lib.dylib&\
              backend=gpu_artisan&supported_lora_ranks=8,16",
@@ -58,12 +58,14 @@ mod tests {
         .unwrap();
         assert_eq!(generic_gpu.backend, "gpu");
 
-        let error = LiteRtLmConfig::from_base_url(
+        let cpu = LiteRtLmConfig::from_base_url(
             "litert-lm:///tmp/model.litertlm?library=/tmp/lib.dylib&\
              backend=cpu&supported_lora_ranks=8",
         )
-        .unwrap_err();
-        assert!(error.contains("backend=gpu"), "{error}");
+        .unwrap()
+        .unwrap();
+        assert_eq!(cpu.backend, "cpu");
+        assert_eq!(cpu.supported_lora_ranks, vec![8]);
     }
 
     #[test]

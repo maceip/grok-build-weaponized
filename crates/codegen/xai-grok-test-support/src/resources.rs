@@ -1,6 +1,6 @@
-//! Generic OS resource snapshots for soak tests. No shell types: `rss_bytes`
-//! reads `/proc` (Linux) or shells out to `ps` (macOS); the task/fd counters
-//! are Linux-only and return `None` elsewhere.
+//! Generic OS resource snapshots for soak tests. Linux reads `/proc`; macOS
+//! uses the native libproc interface. Unsupported platforms return `None` for
+//! metrics that cannot be sampled without external tools.
 
 /// RSS (bytes), live threads, and open fds sampled together. `None` marks a
 /// metric the platform can't report.
@@ -65,16 +65,7 @@ fn rss_bytes() -> Option<usize> {
 
     #[cfg(target_os = "macos")]
     {
-        use std::process::Command;
-        let output = Command::new("ps")
-            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-            .output()
-            .ok()?;
-        let kb: usize = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .ok()?;
-        Some(kb * 1024)
+        Some(macos_task_info()?.pti_resident_size as usize)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -88,7 +79,11 @@ fn thread_count() -> Option<usize> {
     {
         Some(std::fs::read_dir("/proc/self/task").ok()?.count())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        usize::try_from(macos_task_info()?.pti_threadnum).ok()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
     }
@@ -101,10 +96,58 @@ fn fd_count() -> Option<usize> {
     {
         Some(std::fs::read_dir("/proc/self/fd").ok()?.count())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::c_void;
+
+        // A null-buffer probe returns the bytes required for the process's
+        // current proc_fdinfo array. This is a point-in-time count; callers
+        // compare like-for-like snapshots and tolerate normal short-lived FDs.
+        // SAFETY: the documented size probe accepts a null buffer and size 0.
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                std::process::id() as libc::pid_t,
+                libc::PROC_PIDLISTFDS,
+                0,
+                std::ptr::null_mut::<c_void>(),
+                0,
+            )
+        };
+        if bytes < 0 {
+            return None;
+        }
+        usize::try_from(bytes)
+            .ok()
+            .map(|bytes| bytes / std::mem::size_of::<libc::proc_fdinfo>())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_task_info() -> Option<libc::proc_taskinfo> {
+    use std::ffi::c_void;
+    use std::mem::{MaybeUninit, size_of};
+
+    let mut info = MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    let expected = i32::try_from(size_of::<libc::proc_taskinfo>()).ok()?;
+    // SAFETY: `info` is writable for `expected` bytes. A full-size return is
+    // required before the initialized value is read.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            std::process::id() as libc::pid_t,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast::<c_void>(),
+            expected,
+        )
+    };
+    (written == expected).then(|| {
+        // SAFETY: the full record was initialized by proc_pidinfo above.
+        unsafe { info.assume_init() }
+    })
 }
 
 #[cfg(test)]
@@ -130,5 +173,25 @@ mod tests {
             growth.fds, None,
             "a missing baseline sample propagates None"
         );
+    }
+
+    #[test]
+    fn current_process_snapshot_reports_supported_metrics() {
+        let snapshot = ResourceSnapshot::capture();
+        assert!(
+            snapshot.rss.is_some(),
+            "RSS must be observable on release targets"
+        );
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert!(
+                snapshot.threads.is_some_and(|count| count > 0),
+                "thread count must be observable"
+            );
+            assert!(
+                snapshot.fds.is_some_and(|count| count > 0),
+                "file descriptor count must be observable"
+            );
+        }
     }
 }

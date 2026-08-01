@@ -376,7 +376,7 @@ async fn run_provider_worker(connector: &str) -> Result<(), Box<dyn std::error::
                 let request_id = dispatch.request_id.clone();
                 ProviderWorkerResponse::Execute {
                     request_id,
-                    result: worker.execute(dispatch).await,
+                    result: worker.execute(*dispatch).await,
                 }
             }
             ProviderWorkerRequest::Cancel { request_id } if negotiated => {

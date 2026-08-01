@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
-use xai_grok_runtime::{ResourceClass, ResourceGovernor, ResourceLease};
+use xai_grok_runtime::{
+    ResourceClass, ResourceGovernor, ResourceLease, current_process_resident_bytes,
+};
 
 /// Maximum retry attempts for transient API errors (429, 5xx).
 const MAX_RETRIES: usize = 3;
@@ -121,7 +123,7 @@ impl LocalModel {
 enum LocalModelState {
     Loading,
     Ready {
-        model: LocalModel,
+        model: Arc<Mutex<LocalModel>>,
         _lease: ResourceLease,
     },
     Failed(String),
@@ -152,15 +154,16 @@ pub enum LocalEmbeddingStatus {
     Failed(String),
 }
 
+type LocalEmbeddingRegistry =
+    Mutex<HashMap<(LocalEmbeddingProfile, usize), Weak<LocalEmbeddingInner>>>;
+
 impl LocalEmbeddingProvider {
     pub fn from_config(config: &xai_grok_config_types::MemoryEmbeddingConfig) -> Option<Self> {
         let model = config.model.as_deref()?;
         let profile = LocalEmbeddingProfile::from_model(model)?;
         let dimensions = config.dimensions.min(profile.maximum_dimensions()).max(1);
         let key = (profile, dimensions);
-        static REGISTRY: OnceLock<
-            Mutex<HashMap<(LocalEmbeddingProfile, usize), Weak<LocalEmbeddingInner>>>,
-        > = OnceLock::new();
+        static REGISTRY: OnceLock<LocalEmbeddingRegistry> = OnceLock::new();
         let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
         let mut registry = registry
             .lock()
@@ -256,6 +259,13 @@ impl LocalEmbeddingProvider {
         )
     }
 
+    /// Whether a local embedding inference currently owns the single model
+    /// execution slot. Exposed for capacity and soak telemetry; interactive
+    /// callers must still attempt a query and fall back immediately on busy.
+    pub fn is_busy(&self) -> bool {
+        self.inner.busy.load(Ordering::Acquire)
+    }
+
     pub fn status(&self) -> LocalEmbeddingStatus {
         match &*self
             .inner
@@ -336,17 +346,21 @@ impl LocalEmbeddingProvider {
                 }
             }
             let _reset = BusyReset(Arc::clone(&inner));
-            let mut state = inner
+            let state = inner
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let model = match &mut *state {
+            let model = match &*state {
                 LocalModelState::Loading => {
                     return Err("local embedding model is still loading".to_string());
                 }
                 LocalModelState::Failed(error) => return Err(error.clone()),
-                LocalModelState::Ready { model, .. } => model,
+                LocalModelState::Ready { model, .. } => Arc::clone(model),
             };
+            drop(state);
+            let mut model = model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut embeddings = model.embed(&prepared)?;
             for embedding in &mut embeddings {
                 truncate_and_normalize(embedding, inner.dimensions)?;
@@ -372,6 +386,7 @@ pub fn prewarm_local(config: &xai_grok_config_types::MemoryEmbeddingConfig) -> b
 fn start_local_model_load(inner: Arc<LocalEmbeddingInner>) {
     let load = move || {
         let governor = ResourceGovernor::global();
+        let resident_before = current_process_resident_bytes();
         let result = if governor.snapshot().soft_pressure {
             Err("local embedding load deferred by memory pressure".to_string())
         } else {
@@ -381,9 +396,17 @@ fn start_local_model_load(inner: Arc<LocalEmbeddingInner>) {
                     inner.profile.estimated_resident_bytes(),
                 )
                 .map_err(|error| error.to_string())
-                .and_then(|lease| {
-                    load_local_model(inner.profile).map(|model| LocalModelState::Ready {
-                        model,
+                .and_then(|mut lease| {
+                    let model = load_local_model(inner.profile)?;
+                    let observed_bytes = resident_before
+                        .zip(current_process_resident_bytes())
+                        .map(|(before, after)| after.saturating_sub(before))
+                        .unwrap_or_default();
+                    lease
+                        .resize(lease.bytes().max(observed_bytes))
+                        .map_err(|error| error.to_string())?;
+                    Ok(LocalModelState::Ready {
+                        model: Arc::new(Mutex::new(model)),
                         _lease: lease,
                     })
                 })
@@ -736,6 +759,16 @@ mod tests {
             .sum::<f32>()
             .sqrt();
         assert!((norm - 1.0).abs() < 1e-4, "embedding norm was {norm}");
+        let reserved = ResourceGovernor::global()
+            .snapshot()
+            .by_class
+            .get(&ResourceClass::Embedding)
+            .copied()
+            .unwrap_or_default();
+        assert!(
+            reserved >= LocalEmbeddingProfile::EmbeddingGemma.estimated_resident_bytes(),
+            "local embedding residency was not accounted: {reserved} bytes"
+        );
     }
 
     #[tokio::test]
