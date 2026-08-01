@@ -66,6 +66,7 @@ impl RequestJobBinding {
 pub struct NativeExecutionProvider {
     supervisor: Arc<NativeExecutionSupervisor>,
     request_jobs: RwLock<HashMap<RequestId, Arc<RequestJobBinding>>>,
+    request_changes: Notify,
     maximum_parallel: u32,
     queue_capacity: u32,
 }
@@ -94,6 +95,7 @@ impl NativeExecutionProvider {
         Ok(Arc::new(Self {
             supervisor: NativeExecutionSupervisor::open_with_limits(root, limits).await?,
             request_jobs: RwLock::new(HashMap::new()),
+            request_changes: Notify::new(),
             maximum_parallel,
             queue_capacity,
         }))
@@ -199,6 +201,7 @@ impl NativeExecutionProvider {
             ));
         }
         requests.insert(request_id, binding.clone());
+        self.request_changes.notify_waiters();
         Ok(binding)
     }
 
@@ -210,6 +213,7 @@ impl NativeExecutionProvider {
             .is_some_and(|current| Arc::ptr_eq(current, binding))
         {
             requests.remove(request_id);
+            self.request_changes.notify_waiters();
         }
     }
 
@@ -496,18 +500,22 @@ impl ExecutionProvider for NativeExecutionProvider {
     }
 
     async fn cancel(&self, request_id: &RequestId) -> Result<(), ProtocolError> {
-        let binding = self
-            .request_jobs
-            .read()
-            .await
-            .get(request_id)
-            .cloned()
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::NotFound,
-                    format!("active native request {request_id} was not found"),
-                )
-            })?;
+        let binding = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let changed = self.request_changes.notified();
+                if let Some(binding) = self.request_jobs.read().await.get(request_id).cloned() {
+                    return binding;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCode::NotFound,
+                format!("active native request {request_id} was not found"),
+            )
+        })?;
         let job_id = tokio::time::timeout(Duration::from_secs(5), binding.job_id())
             .await
             .map_err(|_| {

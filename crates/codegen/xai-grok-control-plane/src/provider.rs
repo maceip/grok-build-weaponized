@@ -3,11 +3,12 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Notify, RwLock, Semaphore};
+use tokio_util::sync::CancellationToken;
 use xai_grok_protocol::{
     CapabilityManifest, CapabilityRequirement, ExecutionMode, OperationId, PROTOCOL_VERSION,
     ProtocolError, ProtocolErrorCode, ProviderDispatch, ProviderId, RequestId, ServiceHealth,
@@ -149,6 +150,26 @@ impl Drop for QueueDepthGuard<'_> {
     }
 }
 
+const ADMISSION_QUEUED: u8 = 0;
+const ADMISSION_ACTIVE: u8 = 1;
+const ADMISSION_CANCELLED: u8 = 2;
+
+struct ProviderAdmission {
+    provider_id: ProviderId,
+    state: AtomicU8,
+    cancelled: CancellationToken,
+}
+
+impl ProviderAdmission {
+    fn queued(provider_id: ProviderId) -> Self {
+        Self {
+            provider_id,
+            state: AtomicU8::new(ADMISSION_QUEUED),
+            cancelled: CancellationToken::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ProviderCapacity {
     pub provider_id: ProviderId,
@@ -171,7 +192,8 @@ pub struct ProviderCapacity {
 pub struct ProviderRegistry {
     config: ProviderRegistryConfig,
     entries: RwLock<BTreeMap<ProviderId, Arc<ProviderEntry>>>,
-    active: RwLock<HashMap<RequestId, ProviderId>>,
+    admissions: RwLock<HashMap<RequestId, Arc<ProviderAdmission>>>,
+    admission_changes: Notify,
     generations: RwLock<HashMap<ProviderId, u64>>,
 }
 
@@ -180,7 +202,8 @@ impl ProviderRegistry {
         Self {
             config,
             entries: RwLock::new(BTreeMap::new()),
-            active: RwLock::new(HashMap::new()),
+            admissions: RwLock::new(HashMap::new()),
+            admission_changes: Notify::new(),
             generations: RwLock::new(HashMap::new()),
         }
     }
@@ -258,16 +281,16 @@ impl ProviderRegistry {
             entry.clone()
         };
         entry.draining.store(true, Ordering::Release);
-        let is_active = self
-            .active
+        let is_admitted = self
+            .admissions
             .read()
             .await
             .values()
-            .any(|active_provider| active_provider == provider_id);
+            .any(|admission| &admission.provider_id == provider_id);
         let has_admitted_work = entry.queued.load(Ordering::Acquire) != 0
             || entry.permits.available_permits()
                 != entry.manifest.concurrency.maximum_parallel as usize;
-        if is_active || has_admitted_work {
+        if is_admitted || has_admitted_work {
             entry.draining.store(false, Ordering::Release);
             return false;
         }
@@ -408,31 +431,69 @@ impl ProviderRegistry {
                 "task deadline elapsed before provider admission",
             ));
         }
-        let permit = tokio::time::timeout(
-            std::time::Duration::from_millis(remaining),
-            entry.permits.clone().acquire_owned(),
-        )
-        .await
-        .map_err(|_| {
-            ProtocolError::new(
-                ProtocolErrorCode::DeadlineExceeded,
-                "task deadline elapsed in provider queue",
+        let admission = Arc::new(ProviderAdmission::queued(provider_id.clone()));
+        {
+            let mut admissions = self.admissions.write().await;
+            if admissions.contains_key(&dispatch.request_id) {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::Conflict,
+                    format!("request {} is already admitted", dispatch.request_id),
+                ));
+            }
+            admissions.insert(dispatch.request_id.clone(), admission.clone());
+            self.admission_changes.notify_waiters();
+        }
+        let permit_result = tokio::select! {
+            biased;
+            _ = admission.cancelled.cancelled() => Err(ProtocolError::new(
+                ProtocolErrorCode::Cancelled,
+                format!("request {} was cancelled in the provider queue", dispatch.request_id),
+            )),
+            result = tokio::time::timeout(
+                std::time::Duration::from_millis(remaining),
+                entry.permits.clone().acquire_owned(),
+            ) => result
+                .map_err(|_| ProtocolError::new(
+                    ProtocolErrorCode::DeadlineExceeded,
+                    "task deadline elapsed in provider queue",
+                ))
+                .and_then(|result| result.map_err(|_| ProtocolError::new(
+                    ProtocolErrorCode::ServiceUnavailable,
+                    "provider admission semaphore closed",
+                ))),
+        };
+        let permit = match permit_result {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.remove_admission(&dispatch.request_id, &admission)
+                    .await;
+                return Err(error);
+            }
+        };
+        if admission
+            .state
+            .compare_exchange(
+                ADMISSION_QUEUED,
+                ADMISSION_ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             )
-        })?
-        .map_err(|_| {
-            ProtocolError::new(
-                ProtocolErrorCode::ServiceUnavailable,
-                "provider admission semaphore closed",
-            )
-        })?;
+            .is_err()
+        {
+            self.remove_admission(&dispatch.request_id, &admission)
+                .await;
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::Cancelled,
+                format!(
+                    "request {} was cancelled before execution",
+                    dispatch.request_id
+                ),
+            ));
+        }
         drop(queue_depth_guard);
-        self.active
-            .write()
-            .await
-            .insert(dispatch.request_id.clone(), provider_id);
         let request_id = dispatch.request_id.clone();
         let result = entry.provider.execute(dispatch).await;
-        self.active.write().await.remove(&request_id);
+        self.remove_admission(&request_id, &admission).await;
         drop(permit);
         if result.is_ok() {
             entry.completed.fetch_add(1, Ordering::Relaxed);
@@ -443,18 +504,50 @@ impl ProviderRegistry {
     }
 
     pub async fn cancel(&self, request_id: &RequestId) -> Result<(), ProtocolError> {
-        let provider_id = self
-            .active
-            .read()
-            .await
-            .get(request_id)
-            .cloned()
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ProtocolErrorCode::NotFound,
-                    format!("active request {request_id} was not found"),
-                )
-            })?;
+        let admission = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let changed = self.admission_changes.notified();
+                if let Some(admission) = self.admissions.read().await.get(request_id).cloned() {
+                    return admission;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCode::NotFound,
+                format!("admitted request {request_id} was not found"),
+            )
+        })?;
+        loop {
+            match admission.state.load(Ordering::Acquire) {
+                ADMISSION_QUEUED => {
+                    if admission
+                        .state
+                        .compare_exchange(
+                            ADMISSION_QUEUED,
+                            ADMISSION_CANCELLED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        admission.cancelled.cancel();
+                        return Ok(());
+                    }
+                }
+                ADMISSION_ACTIVE => break,
+                ADMISSION_CANCELLED => return Ok(()),
+                _ => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::Internal,
+                        format!("request {request_id} has an invalid admission state"),
+                    ));
+                }
+            }
+        }
+        let provider_id = admission.provider_id.clone();
         let provider = self
             .entries
             .read()
@@ -468,6 +561,17 @@ impl ProviderRegistry {
                 )
             })?;
         provider.cancel(request_id).await
+    }
+
+    async fn remove_admission(&self, request_id: &RequestId, admission: &Arc<ProviderAdmission>) {
+        let mut admissions = self.admissions.write().await;
+        if admissions
+            .get(request_id)
+            .is_some_and(|current| Arc::ptr_eq(current, admission))
+        {
+            admissions.remove(request_id);
+            self.admission_changes.notify_waiters();
+        }
     }
 
     pub async fn manifests(&self) -> Vec<CapabilityManifest> {
@@ -825,6 +929,111 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::DeadlineExceeded);
         assert_eq!(registry.capacity().await[0].queued, 0);
+        release.notify_one();
+        first.await.unwrap().unwrap();
+        assert!(registry.unregister(&"echo".into(), 1).await);
+    }
+
+    #[tokio::test]
+    async fn queued_cancellation_prevents_provider_execution_and_releases_capacity() {
+        let registry = Arc::new(ProviderRegistry::new(ProviderRegistryConfig::default()));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider_cancellations = Arc::new(AtomicUsize::new(0));
+        registry
+            .register(Arc::new(FunctionProvider::new(
+                manifest(),
+                {
+                    let started = started.clone();
+                    let release = release.clone();
+                    let executions = executions.clone();
+                    move |_| {
+                        let started = started.clone();
+                        let release = release.clone();
+                        let executions = executions.clone();
+                        async move {
+                            executions.fetch_add(1, Ordering::SeqCst);
+                            started.notify_one();
+                            release.notified().await;
+                            Ok(ProviderOutput::default())
+                        }
+                    }
+                },
+                {
+                    let provider_cancellations = provider_cancellations.clone();
+                    move |_| {
+                        let provider_cancellations = provider_cancellations.clone();
+                        async move {
+                            provider_cancellations.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    }
+                },
+            )))
+            .await
+            .unwrap();
+        let make_dispatch = |request_id, deadline_unix_ms| ProviderDispatch {
+            request_id,
+            engagement_id: EngagementId::new(),
+            plan_revision: 1,
+            task: ExecutionTask {
+                task_id: TaskId::new(),
+                objective: "echo".to_owned(),
+                mode: ExecutionMode::Deferred,
+                capability: CapabilityRequirement {
+                    operation_id: "echo".into(),
+                    preferred_provider: None,
+                    required_features: Vec::new(),
+                },
+                input: serde_json::json!({}),
+                deadline_unix_ms,
+                completion_tests: Vec::new(),
+                depends_on: Vec::new(),
+            },
+            provider_id: "echo".into(),
+            lease_epoch: 1,
+        };
+        let first_registry = registry.clone();
+        let first = tokio::spawn(async move {
+            first_registry
+                .dispatch(make_dispatch(RequestId::new(), now_unix_ms() + 5_000))
+                .await
+        });
+        started.notified().await;
+
+        let queued_request = RequestId::from_string("queued-cancellation");
+        let queued_registry = registry.clone();
+        let queued_request_for_dispatch = queued_request.clone();
+        let queued = tokio::spawn(async move {
+            queued_registry
+                .dispatch(make_dispatch(
+                    queued_request_for_dispatch,
+                    now_unix_ms() + 5_000,
+                ))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if registry.capacity().await[0].queued == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second dispatch did not enter the bounded queue");
+        registry.cancel(&queued_request).await.unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), queued)
+            .await
+            .expect("queued cancellation did not wake provider admission")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::Cancelled);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_cancellations.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.capacity().await[0].queued, 0);
+
         release.notify_one();
         first.await.unwrap().unwrap();
         assert!(registry.unregister(&"echo".into(), 1).await);
