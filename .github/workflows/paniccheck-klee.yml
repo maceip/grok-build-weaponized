@@ -6,6 +6,7 @@ on:
       - ".github/workflows/paniccheck-klee.yml"
       - "crates/common/xai-grok-verification-core/**"
       - "crates/common/xai-tool-runtime/src/streaming.rs"
+      - "crates/common/xai-tool-runtime/tests/streaming_mock_e2e.rs"
       - "tools/run-paniccheck-klee.sh"
       - "verification/klee/**"
   push:
@@ -15,6 +16,7 @@ on:
       - ".github/workflows/paniccheck-klee.yml"
       - "crates/common/xai-grok-verification-core/**"
       - "crates/common/xai-tool-runtime/src/streaming.rs"
+      - "crates/common/xai-tool-runtime/tests/streaming_mock_e2e.rs"
       - "tools/run-paniccheck-klee.sh"
       - "verification/klee/**"
   workflow_dispatch:
@@ -55,3 +57,11 @@ jobs:
               rustup toolchain install "$PANICCHECK_RUST_TOOLCHAIN" --profile minimal
               ./tools/run-paniccheck-klee.sh
             '
+
+      - name: Exercise verified streaming with mock command data
+        run: |
+          workspace_toolchain="$(awk -F '"' '/^channel = / { print $2; exit }' rust-toolchain.toml)"
+          rustup toolchain install "$workspace_toolchain" --profile minimal
+          rustup run "$workspace_toolchain" cargo test \
+            --package xai-tool-runtime \
+            --test streaming_mock_e2e
