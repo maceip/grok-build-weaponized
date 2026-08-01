@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -45,6 +45,10 @@ Commands:
   job result ID
   job cancel ID
   submit --workspace ID [--exercise ID] [--run ID] --session ID --request TEXT|-
+  artifact put FILE --media-type TYPE [--content-hash BLAKE3] [--chunk-bytes N]
+  artifact resume UPLOAD_ID FILE [--chunk-bytes N]
+  artifact status UPLOAD_ID
+  artifact abort UPLOAD_ID
   artifact read ID [--cursor N] [--limit N] [--all] [--raw]
   profile lint FILE
 ";
@@ -108,7 +112,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "team" => team(&control, arguments).await,
         "job" => job(&control, arguments).await,
         "submit" => submit(&control, arguments).await,
-        "artifact" => read_artifact(&control, arguments).await,
+        "artifact" => artifact(&control, arguments).await,
         _ => Err(format!("unknown command {command:?}\n{USAGE}").into()),
     }
 }
@@ -327,6 +331,209 @@ async fn invoke_native(
             Duration::from_secs(35),
         )
         .await?)
+}
+
+async fn artifact(
+    control: &ControlPlaneClient,
+    arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match arguments.front().map(String::as_str) {
+        Some("put") | Some("resume") => upload_artifact(control, arguments).await,
+        Some("status") => artifact_upload_status(control, arguments).await,
+        Some("abort") => abort_artifact_upload(control, arguments).await,
+        Some("read") => read_artifact(control, arguments).await,
+        _ => Err(format!("artifact requires put, resume, status, abort, or read\n{USAGE}").into()),
+    }
+}
+
+async fn upload_artifact(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mode = arguments
+        .pop_front()
+        .ok_or("artifact upload mode is missing")?;
+    let (resume_id, file_path) = if mode == "resume" {
+        (
+            Some(xai_grok_protocol::ArtifactUploadId::from_string(
+                arguments
+                    .pop_front()
+                    .ok_or("artifact resume requires an upload id")?,
+            )),
+            PathBuf::from(
+                arguments
+                    .pop_front()
+                    .ok_or("artifact resume requires a file")?,
+            ),
+        )
+    } else {
+        (
+            None,
+            PathBuf::from(
+                arguments
+                    .pop_front()
+                    .ok_or("artifact put requires a file")?,
+            ),
+        )
+    };
+    let mut media_type = None;
+    let mut expected_content_hash = None;
+    let mut chunk_bytes = 4 * 1024 * 1024_usize;
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--media-type" => media_type = Some(value(&mut arguments, "--media-type")?),
+            "--content-hash" => {
+                expected_content_hash = Some(value(&mut arguments, "--content-hash")?)
+            }
+            "--chunk-bytes" => {
+                chunk_bytes = value(&mut arguments, "--chunk-bytes")?.parse()?;
+            }
+            other => return Err(format!("unknown artifact upload option {other:?}").into()),
+        }
+    }
+    if chunk_bytes == 0 || chunk_bytes > 8 * 1024 * 1024 {
+        return Err("artifact --chunk-bytes must be between 1 and 8388608".into());
+    }
+    let mut file = std::fs::File::open(&file_path)?;
+    let file_metadata = file.metadata()?;
+    if !file_metadata.is_file() {
+        return Err(format!(
+            "artifact source is not a regular file: {}",
+            file_path.display()
+        )
+        .into());
+    }
+    let expected_bytes = file_metadata.len();
+    let state = if let Some(upload_id) = resume_id {
+        control
+            .send(
+                Command::InspectArtifactUpload { upload_id },
+                Duration::from_secs(10),
+            )
+            .await?
+    } else {
+        control
+            .send(
+                Command::BeginArtifactUpload {
+                    media_type: media_type.ok_or("artifact put requires --media-type")?,
+                    expected_bytes,
+                    expected_content_hash,
+                },
+                Duration::from_secs(10),
+            )
+            .await?
+    };
+    let (upload_id, expected, mut offset) = match state {
+        Response::ArtifactUploadStarted {
+            upload_id,
+            expected_bytes,
+            next_offset,
+            ..
+        }
+        | Response::ArtifactUploadState {
+            upload_id,
+            expected_bytes,
+            next_offset,
+            ..
+        } => (upload_id, expected_bytes, next_offset),
+        _ => return Err("daemon returned a non-upload response".into()),
+    };
+    if expected != expected_bytes || offset > expected_bytes {
+        return Err(format!(
+            "artifact upload {upload_id} expects {expected} bytes at offset {offset}, but {} is {expected_bytes} bytes",
+            file_path.display()
+        )
+        .into());
+    }
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    let mut buffer = vec![0_u8; chunk_bytes];
+    while offset < expected_bytes {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Err(format!("artifact source ended before offset {expected_bytes}").into());
+        }
+        let response = control
+            .send(
+                Command::UploadArtifactChunk {
+                    upload_id: upload_id.clone(),
+                    offset,
+                    bytes: buffer[..read].to_vec(),
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "artifact upload {upload_id} stopped at offset {offset}; resume with `grokctl artifact resume {upload_id} {}`: {error}",
+                    file_path.display()
+                )
+            })?;
+        let Response::ArtifactUploadProgress {
+            upload_id: response_id,
+            next_offset,
+        } = response
+        else {
+            return Err("daemon returned a non-progress response".into());
+        };
+        if response_id != upload_id || next_offset != offset.saturating_add(read as u64) {
+            return Err("daemon returned an inconsistent artifact upload offset".into());
+        }
+        offset = next_offset;
+    }
+    let response = control
+        .send(
+            Command::CommitArtifactUpload { upload_id },
+            Duration::from_secs(120),
+        )
+        .await?;
+    write_json(&response)?;
+    Ok(())
+}
+
+async fn artifact_upload_status(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    arguments.pop_front();
+    let upload_id = xai_grok_protocol::ArtifactUploadId::from_string(
+        arguments
+            .pop_front()
+            .ok_or("artifact status requires an upload id")?,
+    );
+    if !arguments.is_empty() {
+        return Err("artifact status accepts exactly one upload id".into());
+    }
+    let response = control
+        .send(
+            Command::InspectArtifactUpload { upload_id },
+            Duration::from_secs(10),
+        )
+        .await?;
+    write_json(&response)?;
+    Ok(())
+}
+
+async fn abort_artifact_upload(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    arguments.pop_front();
+    let upload_id = xai_grok_protocol::ArtifactUploadId::from_string(
+        arguments
+            .pop_front()
+            .ok_or("artifact abort requires an upload id")?,
+    );
+    if !arguments.is_empty() {
+        return Err("artifact abort accepts exactly one upload id".into());
+    }
+    let response = control
+        .send(
+            Command::AbortArtifactUpload { upload_id },
+            Duration::from_secs(10),
+        )
+        .await?;
+    write_json(&response)?;
+    Ok(())
 }
 
 async fn read_artifact(

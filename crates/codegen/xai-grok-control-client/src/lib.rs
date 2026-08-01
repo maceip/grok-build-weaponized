@@ -184,6 +184,18 @@ impl ControlPlaneClient {
                 Err(ClientError::ExpectedEvents("provider_registered"))
             }
             Response::ArtifactStored { .. } => Err(ClientError::ExpectedEvents("artifact_stored")),
+            Response::ArtifactUploadStarted { .. } => {
+                Err(ClientError::ExpectedEvents("artifact_upload_started"))
+            }
+            Response::ArtifactUploadState { .. } => {
+                Err(ClientError::ExpectedEvents("artifact_upload_state"))
+            }
+            Response::ArtifactUploadProgress { .. } => {
+                Err(ClientError::ExpectedEvents("artifact_upload_progress"))
+            }
+            Response::ArtifactUploadAborted { .. } => {
+                Err(ClientError::ExpectedEvents("artifact_upload_aborted"))
+            }
             Response::ArtifactChunk { .. } => Err(ClientError::ExpectedEvents("artifact_chunk")),
             Response::Projection(_) => Err(ClientError::ExpectedEvents("projection")),
             Response::Ack => Err(ClientError::ExpectedEvents("ack")),

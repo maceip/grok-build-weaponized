@@ -34,10 +34,10 @@ pub use exercise::{
     ScopeTarget, TargetKind, parse_scope_targets,
 };
 pub use ids::{
-    ArtifactId, ChannelId, ClientId, CommandId, EngagementId, EventId, EvidenceId, ExerciseId,
-    FindingId, MessageId, OperationId, OperationRunId, OperatorSessionId, PlaybookId, ProfileId,
-    ProviderId, RequestId, ResourceClaimId, ServiceId, TargetId, TaskId, TeamId, TeamWorkItemId,
-    TurnId, WorkspaceId,
+    ArtifactId, ArtifactUploadId, ChannelId, ClientId, CommandId, EngagementId, EventId,
+    EvidenceId, ExerciseId, FindingId, MessageId, OperationId, OperationRunId, OperatorSessionId,
+    PlaybookId, ProfileId, ProviderId, RequestId, ResourceClaimId, ServiceId, TargetId, TaskId,
+    TeamId, TeamWorkItemId, TurnId, WorkspaceId,
 };
 pub use ingress::{BuzzIngress, IngressEnvelope, IngressSource, QmIngress};
 pub use output::{

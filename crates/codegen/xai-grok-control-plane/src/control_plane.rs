@@ -1495,7 +1495,7 @@ impl ControlPlaneCore {
                     tokio::task::spawn_blocking(move || artifacts.put(media_type, &bytes))
                         .await
                         .map_err(|error| internal_error(error.to_string()))?
-                        .map_err(|error| internal_error(error.to_string()))?;
+                        .map_err(artifact_error)?;
                 self.emit(
                     None,
                     causation_id,
@@ -1513,6 +1513,99 @@ impl ControlPlaneCore {
                     content_hash: descriptor.content_hash,
                     byte_size: descriptor.byte_size,
                 })
+            }
+            Command::BeginArtifactUpload {
+                media_type,
+                expected_bytes,
+                expected_content_hash,
+            } => {
+                let artifacts = self.artifacts.clone();
+                let lease = tokio::task::spawn_blocking(move || {
+                    artifacts.begin_upload(media_type, expected_bytes, expected_content_hash)
+                })
+                .await
+                .map_err(|error| internal_error(error.to_string()))?
+                .map_err(artifact_error)?;
+                Ok(Response::ArtifactUploadStarted {
+                    upload_id: lease.upload_id,
+                    media_type: lease.media_type,
+                    expected_bytes: lease.expected_bytes,
+                    expected_content_hash: lease.expected_content_hash,
+                    next_offset: lease.next_offset,
+                    expires_unix_ms: lease.expires_unix_ms,
+                })
+            }
+            Command::UploadArtifactChunk {
+                upload_id,
+                offset,
+                bytes,
+            } => {
+                let artifacts = self.artifacts.clone();
+                let requested_upload_id = upload_id.clone();
+                let progress = tokio::task::spawn_blocking(move || {
+                    artifacts.upload_chunk(&requested_upload_id, offset, &bytes)
+                })
+                .await
+                .map_err(|error| internal_error(error.to_string()))?
+                .map_err(artifact_error)?;
+                Ok(Response::ArtifactUploadProgress {
+                    upload_id: progress.upload_id,
+                    next_offset: progress.next_offset,
+                })
+            }
+            Command::InspectArtifactUpload { upload_id } => {
+                let artifacts = self.artifacts.clone();
+                let requested_upload_id = upload_id.clone();
+                let lease = tokio::task::spawn_blocking(move || {
+                    artifacts.inspect_upload(&requested_upload_id)
+                })
+                .await
+                .map_err(|error| internal_error(error.to_string()))?
+                .map_err(artifact_error)?;
+                Ok(Response::ArtifactUploadState {
+                    upload_id: lease.upload_id,
+                    media_type: lease.media_type,
+                    expected_bytes: lease.expected_bytes,
+                    expected_content_hash: lease.expected_content_hash,
+                    next_offset: lease.next_offset,
+                    expires_unix_ms: lease.expires_unix_ms,
+                })
+            }
+            Command::CommitArtifactUpload { upload_id } => {
+                let artifacts = self.artifacts.clone();
+                let requested_upload_id = upload_id.clone();
+                let descriptor = tokio::task::spawn_blocking(move || {
+                    artifacts.commit_upload(&requested_upload_id)
+                })
+                .await
+                .map_err(|error| internal_error(error.to_string()))?
+                .map_err(artifact_error)?;
+                self.emit(
+                    None,
+                    causation_id,
+                    0,
+                    Event::ArtifactAvailable {
+                        artifact_id: descriptor.artifact_id.clone(),
+                        task_id: None,
+                        media_type: descriptor.media_type,
+                        byte_size: descriptor.byte_size,
+                    },
+                )
+                .await?;
+                Ok(Response::ArtifactStored {
+                    artifact_id: descriptor.artifact_id,
+                    content_hash: descriptor.content_hash,
+                    byte_size: descriptor.byte_size,
+                })
+            }
+            Command::AbortArtifactUpload { upload_id } => {
+                let artifacts = self.artifacts.clone();
+                let requested_upload_id = upload_id.clone();
+                tokio::task::spawn_blocking(move || artifacts.abort_upload(&requested_upload_id))
+                    .await
+                    .map_err(|error| internal_error(error.to_string()))?
+                    .map_err(artifact_error)?;
+                Ok(Response::ArtifactUploadAborted { upload_id })
             }
             Command::ReadArtifact {
                 artifact_id,
@@ -2450,6 +2543,23 @@ fn internal_error(error: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::Internal, error.to_string())
 }
 
+fn artifact_error(error: crate::artifact::ArtifactError) -> ProtocolError {
+    use crate::artifact::ArtifactError;
+    match error {
+        ArtifactError::NotFound(_) | ArtifactError::UploadNotFound(_) => {
+            ProtocolError::new(ProtocolErrorCode::NotFound, error.to_string())
+        }
+        ArtifactError::StoreFull { .. } => {
+            ProtocolError::new(ProtocolErrorCode::Overloaded, error.to_string()).retryable()
+        }
+        ArtifactError::OffsetMismatch { .. } | ArtifactError::UploadFinalizing => {
+            ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string())
+        }
+        ArtifactError::Io(_) => internal_error(error),
+        _ => ProtocolError::new(ProtocolErrorCode::InvalidEnvelope, error.to_string()),
+    }
+}
+
 fn revision_conflict(resource: &str, expected: u64, actual: u64) -> ProtocolError {
     ProtocolError::new(
         ProtocolErrorCode::Conflict,
@@ -2537,6 +2647,105 @@ mod tests {
             deadline_unix_ms: now_unix_ms() + 5_000,
             command,
         }
+    }
+
+    #[tokio::test]
+    async fn chunked_artifact_upload_resumes_across_control_plane_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().to_path_buf();
+        let upload_id = {
+            let control_plane = ControlPlane::open(ControlPlaneConfig::new(&state_path))
+                .await
+                .unwrap();
+            let handle = control_plane.handle();
+            let response = handle
+                .submit(envelope(Command::BeginArtifactUpload {
+                    media_type: "text/plain".to_owned(),
+                    expected_bytes: 6,
+                    expected_content_hash: Some(blake3::hash(b"abcdef").to_hex().to_string()),
+                }))
+                .await
+                .unwrap()
+                .response
+                .unwrap();
+            let Response::ArtifactUploadStarted { upload_id, .. } = response else {
+                panic!("expected upload lease")
+            };
+            let response = handle
+                .submit(envelope(Command::UploadArtifactChunk {
+                    upload_id: upload_id.clone(),
+                    offset: 0,
+                    bytes: b"abc".to_vec(),
+                }))
+                .await
+                .unwrap()
+                .response
+                .unwrap();
+            assert!(matches!(
+                response,
+                Response::ArtifactUploadProgress { next_offset: 3, .. }
+            ));
+            handle.shutdown_token().cancel();
+            control_plane.wait().await;
+            upload_id
+        };
+
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(&state_path))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        let state = handle
+            .submit(envelope(Command::InspectArtifactUpload {
+                upload_id: upload_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        assert!(matches!(
+            state,
+            Response::ArtifactUploadState { next_offset: 3, .. }
+        ));
+        handle
+            .submit(envelope(Command::UploadArtifactChunk {
+                upload_id: upload_id.clone(),
+                offset: 3,
+                bytes: b"def".to_vec(),
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let stored = handle
+            .submit(envelope(Command::CommitArtifactUpload { upload_id }))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::ArtifactStored {
+            artifact_id,
+            byte_size: 6,
+            ..
+        } = stored
+        else {
+            panic!("expected committed artifact")
+        };
+        let read = handle
+            .submit(envelope(Command::ReadArtifact {
+                artifact_id,
+                cursor: 0,
+                limit: 6,
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        assert!(matches!(
+            read,
+            Response::ArtifactChunk { bytes, next_cursor: None, .. } if bytes == b"abcdef"
+        ));
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
     }
 
     #[tokio::test]

@@ -12,9 +12,9 @@ use crate::{
     WorkspaceId,
 };
 
-/// Protocol v7 adds provider invocation for headless job control. It is
+/// Protocol v8 adds durable chunked artifact ingestion. It is
 /// not wire-compatible with older clients.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +93,25 @@ pub enum Command {
     PutArtifact {
         media_type: String,
         bytes: Vec<u8>,
+    },
+    BeginArtifactUpload {
+        media_type: String,
+        expected_bytes: u64,
+        expected_content_hash: Option<String>,
+    },
+    UploadArtifactChunk {
+        upload_id: crate::ArtifactUploadId,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    InspectArtifactUpload {
+        upload_id: crate::ArtifactUploadId,
+    },
+    CommitArtifactUpload {
+        upload_id: crate::ArtifactUploadId,
+    },
+    AbortArtifactUpload {
+        upload_id: crate::ArtifactUploadId,
     },
     ReadArtifact {
         artifact_id: crate::ArtifactId,
@@ -205,6 +224,29 @@ pub enum Response {
         artifact_id: crate::ArtifactId,
         content_hash: String,
         byte_size: u64,
+    },
+    ArtifactUploadStarted {
+        upload_id: crate::ArtifactUploadId,
+        media_type: String,
+        expected_bytes: u64,
+        expected_content_hash: Option<String>,
+        next_offset: u64,
+        expires_unix_ms: u64,
+    },
+    ArtifactUploadState {
+        upload_id: crate::ArtifactUploadId,
+        media_type: String,
+        expected_bytes: u64,
+        expected_content_hash: Option<String>,
+        next_offset: u64,
+        expires_unix_ms: u64,
+    },
+    ArtifactUploadProgress {
+        upload_id: crate::ArtifactUploadId,
+        next_offset: u64,
+    },
+    ArtifactUploadAborted {
+        upload_id: crate::ArtifactUploadId,
     },
     ArtifactChunk {
         artifact_id: crate::ArtifactId,

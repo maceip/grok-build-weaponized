@@ -47,6 +47,7 @@ macro_rules! string_id {
 }
 
 string_id!(ArtifactId, "art");
+string_id!(ArtifactUploadId, "upload");
 string_id!(ClientId, "client");
 string_id!(ChannelId, "channel");
 string_id!(CommandId, "cmd");
