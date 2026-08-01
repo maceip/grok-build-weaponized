@@ -16,7 +16,7 @@ use xai_grok_protocol::{
     VersionRange,
 };
 
-use crate::provider::{ExecutionProvider, ProviderOutput};
+use crate::provider::{ExecutionProvider, ProviderArtifact, ProviderOutput};
 
 pub const NATIVE_PROVIDER_ID: &str = "native-execution";
 
@@ -115,6 +115,7 @@ impl ExecutionProvider for NativeExecutionProvider {
     async fn execute(&self, dispatch: ProviderDispatch) -> Result<ProviderOutput, ProtocolError> {
         let operation = dispatch.task.capability.operation_id.as_str();
         let input = dispatch.task.input;
+        let mut artifacts = Vec::new();
         let output = match operation {
             "native.command.start" => {
                 let request: CommandRequest = parse(input)?;
@@ -150,16 +151,27 @@ impl ExecutionProvider for NativeExecutionProvider {
             }
             "native.command.wait" => {
                 let input: WaitInput = parse(input)?;
-                serde_json::to_value(
-                    self.supervisor
-                        .wait(
-                            &input.job_id,
-                            Duration::from_millis(input.wait_ms.min(30_000)),
-                        )
-                        .await
-                        .map_err(native_error)?,
-                )
-                .map_err(internal_error)?
+                let snapshot = self
+                    .supervisor
+                    .wait(
+                        &input.job_id,
+                        Duration::from_millis(input.wait_ms.min(30_000)),
+                    )
+                    .await
+                    .map_err(native_error)?;
+                if snapshot.lifecycle.is_terminal() {
+                    artifacts.extend(
+                        self.supervisor
+                            .artifacts(&input.job_id)
+                            .await
+                            .map_err(native_error)?
+                            .into_iter()
+                            .map(|artifact| {
+                                ProviderArtifact::file(artifact.media_type, artifact.path)
+                            }),
+                    );
+                }
+                serde_json::to_value(snapshot).map_err(internal_error)?
             }
             "native.command.output" => {
                 let input: OutputInput = parse(input)?;
@@ -226,10 +238,18 @@ impl ExecutionProvider for NativeExecutionProvider {
                         .collect(),
                     })
                     .collect();
+                let artifacts = self
+                    .supervisor
+                    .artifacts(&input.job_id)
+                    .await
+                    .map_err(native_error)?
+                    .into_iter()
+                    .map(|artifact| ProviderArtifact::file(artifact.media_type, artifact.path))
+                    .collect();
                 return Ok(ProviderOutput {
                     output: serde_json::to_value(result).map_err(internal_error)?,
                     observations,
-                    artifacts: Vec::new(),
+                    artifacts,
                 });
             }
             other => {
@@ -242,7 +262,7 @@ impl ExecutionProvider for NativeExecutionProvider {
         Ok(ProviderOutput {
             output,
             observations: Vec::new(),
-            artifacts: Vec::new(),
+            artifacts,
         })
     }
 
@@ -391,6 +411,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(waited.output["lifecycle"], "completed");
+        assert_eq!(waited.artifacts.len(), 1);
+        let crate::provider::ProviderArtifactSource::File { path } = &waited.artifacts[0].content
+        else {
+            panic!("native output must be exposed as a daemon-local file artifact");
+        };
+        assert!(path.is_file());
         let page = provider
             .execute(dispatch(
                 "native.command.output",

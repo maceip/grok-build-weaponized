@@ -129,6 +129,13 @@ pub struct JobSnapshot {
     pub result: Option<serde_json::Value>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobArtifact {
+    pub media_type: String,
+    pub path: PathBuf,
+    pub byte_size: u64,
+}
+
 struct JobState {
     snapshot: Mutex<JobSnapshot>,
     cancellation: CancellationToken,
@@ -255,6 +262,40 @@ impl NativeExecutionSupervisor {
         let job = self.job(job_id).await?;
         job.cancellation.cancel();
         self.wait(job_id, Duration::from_secs(2)).await
+    }
+
+    /// Return immutable file-backed artifacts only after every output reader
+    /// has stopped and the terminal snapshot has been persisted.
+    pub async fn artifacts(&self, job_id: &str) -> Result<Vec<JobArtifact>, NativeExecutionError> {
+        let job = self.job(job_id).await?;
+        let snapshot = job.snapshot.lock().await.clone();
+        if !snapshot.lifecycle.is_terminal() {
+            return Err(NativeExecutionError::NotComplete);
+        }
+        let mut artifacts = Vec::new();
+        if let Ok(metadata) = tokio::fs::symlink_metadata(&job.spool_path).await
+            && metadata.file_type().is_file()
+            && metadata.len() > 0
+        {
+            artifacts.push(JobArtifact {
+                media_type: "application/vnd.grok.native-output-spool".to_owned(),
+                path: job.spool_path.clone(),
+                byte_size: metadata.len(),
+            });
+        }
+        if snapshot.kind == JobKind::Nmap
+            && snapshot.lifecycle == JobLifecycle::Completed
+            && let Some(path) = &job.nmap_xml_path
+            && let Ok(metadata) = tokio::fs::symlink_metadata(path).await
+            && metadata.file_type().is_file()
+        {
+            artifacts.push(JobArtifact {
+                media_type: "application/xml".to_owned(),
+                path: path.clone(),
+                byte_size: metadata.len(),
+            });
+        }
+        Ok(artifacts)
     }
 
     pub async fn nmap_result(&self, job_id: &str) -> Result<NmapResult, NativeExecutionError> {

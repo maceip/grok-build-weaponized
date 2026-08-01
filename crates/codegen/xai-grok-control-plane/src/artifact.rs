@@ -210,6 +210,103 @@ impl ArtifactStore {
         Ok(descriptor)
     }
 
+    /// Import a daemon-local regular file without materializing it in memory or
+    /// carrying it through the control protocol. The source is copied into a
+    /// private temporary object while its content and typed identity hashes are
+    /// computed, so subsequent source mutation cannot corrupt the immutable
+    /// content-addressed object.
+    pub fn put_file(
+        &self,
+        media_type: impl Into<String>,
+        source: &Path,
+    ) -> Result<ArtifactDescriptor, ArtifactError> {
+        ensure_regular_file(source)?;
+        let byte_size = std::fs::metadata(source)?.len();
+        if byte_size > self.config.maximum_artifact_bytes {
+            return Err(ArtifactError::ArtifactTooLarge {
+                actual: byte_size,
+                maximum: self.config.maximum_artifact_bytes,
+            });
+        }
+        let media_type = media_type.into();
+        validate_media_type(&media_type)?;
+        self.reserve(byte_size)?;
+
+        let result = (|| {
+            let staging = self.config.root.join("staging");
+            std::fs::create_dir_all(&staging)?;
+            let mut temporary = tempfile::NamedTempFile::new_in(&staging)?;
+            let mut input = OpenOptions::new().read(true).open(source)?;
+            let mut content = blake3::Hasher::new();
+            let mut identity = blake3::Hasher::new();
+            identity.update(&(media_type.len() as u64).to_le_bytes());
+            identity.update(media_type.as_bytes());
+            let mut copied = 0_u64;
+            let mut buffer = [0_u8; 1024 * 1024];
+            loop {
+                let read = input.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                copied = copied.saturating_add(read as u64);
+                if copied > self.config.maximum_artifact_bytes {
+                    return Err(ArtifactError::ArtifactTooLarge {
+                        actual: copied,
+                        maximum: self.config.maximum_artifact_bytes,
+                    });
+                }
+                content.update(&buffer[..read]);
+                identity.update(&buffer[..read]);
+                temporary.write_all(&buffer[..read])?;
+            }
+            if copied != byte_size {
+                return Err(ArtifactError::Io(std::io::Error::other(format!(
+                    "artifact source changed size while being imported: expected {byte_size}, copied {copied}"
+                ))));
+            }
+            temporary.as_file().sync_all()?;
+            let content_hash = content.finalize().to_hex().to_string();
+            let artifact_id =
+                ArtifactId::from_string(format!("art_{}", identity.finalize().to_hex()));
+            let object_path = self.object_path(&artifact_id)?;
+            let parent = object_path.parent().expect("object path has parent");
+            std::fs::create_dir_all(parent)?;
+            let installed = match temporary.persist_noclobber(&object_path) {
+                Ok(_) => true,
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    verify_object(&object_path, &content_hash, byte_size)?;
+                    false
+                }
+                Err(error) => return Err(ArtifactError::Io(error.error)),
+            };
+            let descriptor = ArtifactDescriptor {
+                artifact_id,
+                content_hash,
+                media_type,
+                byte_size,
+            };
+            if let Err(error) = self.write_metadata(&descriptor) {
+                if installed {
+                    remove_if_exists(&object_path);
+                }
+                return Err(error);
+            }
+            Ok((descriptor, installed))
+        })();
+
+        match result {
+            Ok((descriptor, true)) => Ok(descriptor),
+            Ok((descriptor, false)) => {
+                self.release_stored(byte_size);
+                Ok(descriptor)
+            }
+            Err(error) => {
+                self.release_stored(byte_size);
+                Err(error)
+            }
+        }
+    }
+
     pub fn begin_upload(
         &self,
         media_type: impl Into<String>,
@@ -895,6 +992,32 @@ mod tests {
         let (page, next) = store.read_range(&first.artifact_id, 0, 3).unwrap();
         assert_eq!(page, b"abc");
         assert_eq!(next, Some(3));
+    }
+
+    #[test]
+    fn file_import_streams_into_an_immutable_deduplicated_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("provider-output.spool");
+        std::fs::write(&source, b"streamed-provider-output").unwrap();
+        let store =
+            ArtifactStore::open(ArtifactStoreConfig::new(directory.path().join("store"))).unwrap();
+
+        let imported = store
+            .put_file("application/vnd.grok.native-output-spool", &source)
+            .unwrap();
+        let inline = store
+            .put(
+                "application/vnd.grok.native-output-spool",
+                b"streamed-provider-output",
+            )
+            .unwrap();
+        assert_eq!(imported, inline);
+        assert_eq!(store.stored_bytes(), imported.byte_size);
+
+        std::fs::write(&source, b"mutated-after-import").unwrap();
+        let (stored, next) = store.read_range(&imported.artifact_id, 0, 1024).unwrap();
+        assert_eq!(stored, b"streamed-provider-output");
+        assert!(next.is_none());
     }
 
     #[test]

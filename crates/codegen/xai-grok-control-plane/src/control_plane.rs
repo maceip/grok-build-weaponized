@@ -23,11 +23,12 @@ use xai_grok_protocol::{
 
 use crate::SERVER_NAME;
 use crate::agent_provider::AGENT_TURN_OPERATION;
-use crate::artifact::{ArtifactStore, ArtifactStoreConfig};
+use crate::artifact::{ArtifactDescriptor, ArtifactStore, ArtifactStoreConfig};
 use crate::journal::{EventJournal, JournalError};
 use crate::projection::ProjectionStore;
 use crate::provider::{
-    ExecutionProvider, ProviderOutput, ProviderRegistry, ProviderRegistryConfig,
+    ExecutionProvider, ProviderArtifact, ProviderArtifactSource, ProviderOutput, ProviderRegistry,
+    ProviderRegistryConfig,
 };
 use crate::service::ServiceSupervisor;
 
@@ -1091,13 +1092,7 @@ impl ControlPlaneCore {
                 let provider_output = self.providers.dispatch(dispatch).await?;
                 let mut artifacts = Vec::new();
                 for artifact in provider_output.artifacts {
-                    let store = self.artifacts.clone();
-                    let descriptor = tokio::task::spawn_blocking(move || {
-                        store.put(artifact.media_type, &artifact.bytes)
-                    })
-                    .await
-                    .map_err(|error| internal_error(error.to_string()))?
-                    .map_err(|error| internal_error(error.to_string()))?;
+                    let descriptor = self.store_provider_artifact(artifact).await?;
                     self.emit(
                         None,
                         causation_id.clone(),
@@ -2027,13 +2022,7 @@ impl ControlPlaneCore {
         output: ProviderOutput,
     ) -> Result<(), ProtocolError> {
         for artifact in output.artifacts {
-            let store = self.artifacts.clone();
-            let descriptor = tokio::task::spawn_blocking(move || {
-                store.put(artifact.media_type, &artifact.bytes)
-            })
-            .await
-            .map_err(|error| internal_error(error.to_string()))?
-            .map_err(|error| internal_error(error.to_string()))?;
+            let descriptor = self.store_provider_artifact(artifact).await?;
             self.emit(
                 Some(engagement_id.clone()),
                 causation_id.clone(),
@@ -2090,6 +2079,20 @@ impl ControlPlaneCore {
             .await?;
         }
         Ok(())
+    }
+
+    async fn store_provider_artifact(
+        &self,
+        artifact: ProviderArtifact,
+    ) -> Result<ArtifactDescriptor, ProtocolError> {
+        let store = self.artifacts.clone();
+        tokio::task::spawn_blocking(move || match artifact.content {
+            ProviderArtifactSource::Inline { bytes } => store.put(artifact.media_type, &bytes),
+            ProviderArtifactSource::File { path } => store.put_file(artifact.media_type, &path),
+        })
+        .await
+        .map_err(|error| internal_error(error.to_string()))?
+        .map_err(artifact_error)
     }
 
     async fn update_dispatch_status(
@@ -3554,6 +3557,79 @@ mod tests {
         assert!(next_cursor.is_none());
         let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(output["text"], "executed: inspect the supplied evidence");
+
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+    }
+
+    #[tokio::test]
+    async fn direct_provider_file_artifact_is_streamed_into_the_daemon_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("native-output.spool");
+        std::fs::write(&source, b"real-file-backed-provider-output").unwrap();
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        handle
+            .register_provider(Arc::new(FunctionProvider::new(
+                provider_manifest(),
+                {
+                    let source = source.clone();
+                    move |_| {
+                        let source = source.clone();
+                        async move {
+                            Ok(ProviderOutput {
+                                output: serde_json::json!({"complete": true}),
+                                artifacts: vec![ProviderArtifact::file(
+                                    "application/vnd.grok.native-output-spool",
+                                    source,
+                                )],
+                                ..ProviderOutput::default()
+                            })
+                        }
+                    }
+                },
+                |_| async { Ok(()) },
+            )))
+            .await
+            .unwrap();
+
+        let response = handle
+            .submit(envelope(Command::InvokeProvider {
+                request_id: xai_grok_protocol::RequestId::new(),
+                operation_id: "test.execute".into(),
+                preferred_provider: Some("test-provider".into()),
+                input: serde_json::json!({}),
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::ProviderInvoked { output, .. } = response else {
+            panic!("expected provider invocation response");
+        };
+        let artifact_id: xai_grok_protocol::ArtifactId =
+            serde_json::from_value(output["artifacts"][0]["artifact_id"].clone()).unwrap();
+        std::fs::write(&source, b"source-mutated-after-return").unwrap();
+        let response = handle
+            .submit(envelope(Command::ReadArtifact {
+                artifact_id,
+                cursor: 0,
+                limit: 1024,
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::ArtifactChunk {
+            bytes, next_cursor, ..
+        } = response
+        else {
+            panic!("expected stored provider artifact");
+        };
+        assert_eq!(bytes, b"real-file-backed-provider-output");
+        assert!(next_cursor.is_none());
 
         handle.shutdown_token().cancel();
         control_plane.wait().await;

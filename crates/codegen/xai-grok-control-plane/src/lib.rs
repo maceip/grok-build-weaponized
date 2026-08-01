@@ -25,7 +25,8 @@ pub use projection::{
     ProviderProjection,
 };
 pub use provider::{
-    ExecutionProvider, FunctionProvider, ProviderOutput, ProviderRegistry, ProviderRegistryConfig,
+    ExecutionProvider, FunctionProvider, ProviderArtifact, ProviderArtifactSource, ProviderOutput,
+    ProviderRegistry, ProviderRegistryConfig,
 };
 pub use server::{ControlPlaneServer, ServerConfig, ServerError};
 pub use service::{ServiceRecord, ServiceSupervisor};

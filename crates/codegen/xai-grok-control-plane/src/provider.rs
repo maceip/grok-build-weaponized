@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -18,9 +19,32 @@ type ExecuteFunction =
 type CancelFunction = dyn Fn(RequestId) -> ProviderFuture<Result<(), ProtocolError>> + Send + Sync;
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ProviderArtifactSource {
+    Inline { bytes: Vec<u8> },
+    File { path: PathBuf },
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderArtifact {
     pub media_type: String,
-    pub bytes: Vec<u8>,
+    pub content: ProviderArtifactSource,
+}
+
+impl ProviderArtifact {
+    pub fn inline(media_type: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            media_type: media_type.into(),
+            content: ProviderArtifactSource::Inline { bytes },
+        }
+    }
+
+    pub fn file(media_type: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            media_type: media_type.into(),
+            content: ProviderArtifactSource::File { path: path.into() },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
