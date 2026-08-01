@@ -1,0 +1,67 @@
+name: PanicCheck KLEE
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/paniccheck-klee.yml"
+      - "crates/common/xai-grok-verification-core/**"
+      - "crates/common/xai-tool-runtime/src/streaming.rs"
+      - "crates/common/xai-tool-runtime/tests/streaming_mock_e2e.rs"
+      - "tools/run-paniccheck-klee.sh"
+      - "verification/klee/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/paniccheck-klee.yml"
+      - "crates/common/xai-grok-verification-core/**"
+      - "crates/common/xai-tool-runtime/src/streaming.rs"
+      - "crates/common/xai-tool-runtime/tests/streaming_mock_e2e.rs"
+      - "tools/run-paniccheck-klee.sh"
+      - "verification/klee/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  paniccheck:
+    name: Symbolic panic check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run pinned PanicCheck harnesses
+        run: |
+          source verification/klee/toolchain.env
+          docker run --rm \
+            --ulimit stack=-1:-1 \
+            --user root \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            "$PANICCHECK_KLEE_IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              source verification/klee/toolchain.env
+              export RUSTUP_HOME=/tmp/rustup
+              export CARGO_HOME=/tmp/cargo
+              rustup_target=x86_64-unknown-linux-gnu
+              rustup_init=/tmp/rustup-init
+              wget --https-only --quiet --output-document="$rustup_init" \
+                "https://static.rust-lang.org/rustup/archive/$PANICCHECK_RUSTUP_VERSION/$rustup_target/rustup-init"
+              echo "$PANICCHECK_RUSTUP_SHA256_X86_64  $rustup_init" | sha256sum --check
+              chmod +x "$rustup_init"
+              "$rustup_init" -y --profile minimal --default-toolchain none
+              export PATH="$CARGO_HOME/bin:$PATH"
+              rustup toolchain install "$PANICCHECK_RUST_TOOLCHAIN" --profile minimal
+              ./tools/run-paniccheck-klee.sh
+            '
+
+      - name: Exercise verified streaming with mock command data
+        run: |
+          workspace_toolchain="$(awk -F '"' '/^channel = / { print $2; exit }' rust-toolchain.toml)"
+          rustup toolchain install "$workspace_toolchain" --profile minimal
+          rustup run "$workspace_toolchain" cargo test \
+            --package xai-tool-runtime \
+            --test streaming_mock_e2e

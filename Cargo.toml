@@ -83,6 +83,7 @@ members = [
     "crates/common/xai-computer-hub-mcp-adapter",
     "crates/common/xai-computer-hub-sdk",
     "crates/common/xai-grok-compaction",
+    "crates/common/xai-grok-verification-core",
     "crates/common/xai-interjection-core",
     "crates/common/xai-test-utils",
     "crates/common/xai-tool-protocol",
@@ -311,6 +312,7 @@ xai-grok-operator-core = { path = "crates/codegen/xai-grok-operator-core" }
 xai-grok-operator-ui = { path = "crates/codegen/xai-grok-operator-ui" }
 xai-grok-protocol = { path = "crates/codegen/xai-grok-protocol" }
 xai-grok-runtime = { path = "crates/codegen/xai-grok-runtime" }
+xai-grok-verification-core = { path = "crates/common/xai-grok-verification-core" }
 xai-grok-sampler = { path = "crates/codegen/xai-grok-sampler" }
 xai-grok-secrets = { path = "crates/codegen/xai-grok-secrets" }
 xai-grok-shared = { path = "crates/codegen/xai-grok-shared" }

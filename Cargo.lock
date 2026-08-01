@@ -16489,6 +16489,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-grok-verification-core"
+version = "0.1.0"
+
+[[package]]
 name = "xai-grok-version"
 version = "0.2.112"
 dependencies = [
@@ -16796,6 +16800,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "xai-grok-tools-api",
+ "xai-grok-verification-core",
  "xai-tool-protocol",
  "xai-tool-types",
 ]
