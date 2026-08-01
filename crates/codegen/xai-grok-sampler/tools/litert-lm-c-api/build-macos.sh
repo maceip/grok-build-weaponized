@@ -90,6 +90,7 @@ patches=(
   "${script_dir}/patches/0008-json-schema-constrained-decoding.patch"
   "${script_dir}/patches/0009-constrained-decoding-padded-vocabulary.patch"
   "${script_dir}/patches/0010-llguidance-valid-eos-selection.patch"
+  "${script_dir}/patches/0011-compiled-lora-signature-selection.patch"
 )
 patch_revision="$(
   for patch in "${patches[@]}"; do

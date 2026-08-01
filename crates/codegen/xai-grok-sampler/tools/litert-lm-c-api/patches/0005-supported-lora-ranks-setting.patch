@@ -2,7 +2,7 @@ diff --git a/c/engine.cc b/c/engine.cc
 index d03ae27..bb52ebb 100644
 --- a/c/engine.cc
 +++ b/c/engine.cc
-@@ -415,6 +415,58 @@ void litert_lm_engine_settings_set_max_num_tokens(
+@@ -415,6 +415,66 @@ void litert_lm_engine_settings_set_max_num_tokens(
          max_num_tokens);
    }
  }
@@ -43,10 +43,18 @@ index d03ae27..bb52ebb 100644
 +                 executor_settings
 +                     .GetBackendConfig<litert::lm::CpuConfig>()
 +                     .ok()) {
-+        // Compiled-model GPU and CPU executors discover LoRA inputs directly
-+        // from the model. Rust enforces this declared set before load; native
-+        // materialization and probe generation validate the actual tensors.
-+        return 0;
++        // Compiled-model GPU and CPU executors select a LoRA signature with
++        // the singular lora_rank setting. Leaving it at zero selects the base
++        // signature even when the artifact contains compatible LoRA inputs.
++        // These backends therefore support one compiled rank per engine;
++        // heterogeneous resident ranks require GpuArtisanConfig.
++        if (supported_ranks.size() != 1) {
++          g_grok_last_error =
++              "compiled-model CPU/GPU backends require exactly one LoRA rank";
++        } else {
++          executor_settings.SetLoraRank(supported_ranks.front());
++          return 0;
++        }
 +      } else {
 +        g_grok_last_error =
 +            "supported LoRA ranks require a LiteRT compiled-model backend";

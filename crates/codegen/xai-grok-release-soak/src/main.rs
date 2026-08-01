@@ -27,8 +27,8 @@ use xai_grok_native_execution::{
 use xai_grok_runtime::{
     AdapterBinding, AdapterDescriptor, AdapterDtype, AdapterState, ContextOverflowStrategy,
     LiteRtLmConfig, LocalInferenceResult, MemoryLimits, PreparedConversation, ResourceClass,
-    ResourceGovernor, RuntimeEvent, RuntimeManager, RuntimeManagerConfig, RuntimeMode,
-    RuntimePriority, RuntimeRequest, RuntimeStage, hash_artifact,
+    ResourceGovernor, RuntimeChannel, RuntimeEvent, RuntimeManager, RuntimeManagerConfig,
+    RuntimeMode, RuntimePriority, RuntimeRequest, RuntimeStage, hash_artifact,
 };
 use xai_grok_test_support::ResourceSnapshot;
 use xai_grok_tools::types::memory_backend::MemoryBackend;
@@ -44,6 +44,25 @@ enum SoakProfile {
     Smoke,
     Ci,
     Release,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AdapterDtypeArg {
+    F16,
+    Bf16,
+    F32,
+    I8,
+}
+
+impl From<AdapterDtypeArg> for AdapterDtype {
+    fn from(value: AdapterDtypeArg) -> Self {
+        match value {
+            AdapterDtypeArg::F16 => Self::F16,
+            AdapterDtypeArg::Bf16 => Self::Bf16,
+            AdapterDtypeArg::F32 => Self::F32,
+            AdapterDtypeArg::I8 => Self::I8,
+        }
+    }
 }
 
 impl SoakProfile {
@@ -115,6 +134,13 @@ struct Args {
     adapter_rank: u32,
     #[arg(
         long,
+        env = "LITERT_LM_LORA_TEST_DTYPE",
+        value_enum,
+        default_value = "f16"
+    )]
+    adapter_dtype: AdapterDtypeArg,
+    #[arg(
+        long,
         env = "LITERT_LM_LORA_TEST_TENSORS",
         value_delimiter = ',',
         required = true
@@ -126,6 +152,8 @@ struct Args {
     embedding_dimensions: usize,
     #[arg(long, default_value_t = 2_048)]
     cancellation_tokens: u32,
+    #[arg(long, default_value_t = 512)]
+    adapter_probe_tokens: u32,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -276,6 +304,7 @@ struct StartRecord<'a> {
     state_dir: &'a Path,
     baseline: AggregateResources,
     adapter_selection_p95_micros: u128,
+    adapter_isolation: &'a AdapterIsolationEvidence,
     context_window: u32,
     lora_context_window: u32,
     cancellation_tokens: u32,
@@ -349,6 +378,10 @@ async fn run() -> Result<()> {
         "lora-context-window must be greater than zero"
     );
     ensure!(
+        args.adapter_probe_tokens > 0 && args.adapter_probe_tokens < args.lora_context_window,
+        "adapter probe tokens must be positive and below the LoRA context window"
+    );
+    ensure!(
         args.cancellation_tokens > 0 && args.cancellation_tokens < args.context_window,
         "cancellation-tokens must be greater than zero and smaller than context-window"
     );
@@ -416,6 +449,7 @@ async fn run() -> Result<()> {
         adapter_one_path,
         &base_hash,
         args.adapter_rank,
+        args.adapter_dtype.into(),
         &args.adapter_tensor_name,
     )?;
     let second = adapter_descriptor(
@@ -423,6 +457,7 @@ async fn run() -> Result<()> {
         adapter_two_path,
         &base_hash,
         args.adapter_rank,
+        args.adapter_dtype.into(),
         &args.adapter_tensor_name,
     )?;
 
@@ -446,7 +481,14 @@ async fn run() -> Result<()> {
         Duration::from_millis(args.max_resident_adapter_selection_ms),
     )
     .await?;
-    qualify_adapter_isolation(&manager, &lora_config, &first, &second).await?;
+    let adapter_isolation = qualify_adapter_isolation(
+        &manager,
+        &lora_config,
+        &first,
+        &second,
+        args.adapter_probe_tokens,
+    )
+    .await?;
 
     let memory = initialize_memory(&args, &state_dir).await?;
     qualify_busy_embedding_fallback(&memory, args.max_memory_query_ms).await?;
@@ -503,6 +545,7 @@ async fn run() -> Result<()> {
                 state_dir: &state_dir,
                 baseline,
                 adapter_selection_p95_micros: selection_p95.as_micros(),
+                adapter_isolation: &adapter_isolation,
                 context_window: args.context_window,
                 lora_context_window: args.lora_context_window,
                 cancellation_tokens: args.cancellation_tokens,
@@ -544,7 +587,7 @@ async fn run() -> Result<()> {
 
         let selected = if adapter_toggle { &first } else { &second };
         adapter_toggle = !adapter_toggle;
-        let adapter_output = generate(
+        let adapter_output = generate_maybe_empty(
             &manager,
             "soak-lora",
             &lora_config,
@@ -556,8 +599,13 @@ async fn run() -> Result<()> {
         )
         .await?;
         ensure!(
-            !adapter_output.trim().is_empty(),
-            "adapter generation {cycle} was empty"
+            !adapter_output.visible.trim().is_empty()
+                || !adapter_output.reasoning.trim().is_empty(),
+            "adapter generation {cycle} emitted neither visible nor reasoning output"
+        );
+        ensure!(
+            adapter_output.completion_tokens > 0,
+            "adapter generation {cycle} reported zero completion tokens"
         );
         manager
             .release_session(&format!("adapter-session-{cycle}"))
@@ -758,6 +806,7 @@ fn adapter_descriptor(
     path: PathBuf,
     base_model_hash: &str,
     rank: u32,
+    dtype: AdapterDtype,
     tensor_names: &[String],
 ) -> Result<AdapterDescriptor> {
     let descriptor = AdapterDescriptor {
@@ -768,7 +817,7 @@ fn adapter_descriptor(
         byte_size: std::fs::metadata(&path)?.len(),
         path,
         rank,
-        dtype: AdapterDtype::F16,
+        dtype,
         tensor_names: tensor_names.to_vec(),
     };
     descriptor.validate()?;
@@ -819,6 +868,63 @@ async fn generate(
     prompt: &str,
     max_output_tokens: u32,
 ) -> Result<String> {
+    let output = generate_maybe_empty(
+        manager,
+        model_id,
+        config,
+        request_id,
+        session_id,
+        adapter,
+        prompt,
+        max_output_tokens,
+    )
+    .await?;
+    ensure!(
+        !output.visible.trim().is_empty(),
+        "native generation {request_id} returned no assistant text"
+    );
+    Ok(output.visible)
+}
+
+#[derive(Debug)]
+struct ProbeGeneration {
+    visible: String,
+    reasoning: String,
+    completion_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct AdapterIsolationEvidence {
+    attempt: usize,
+    first_visible_bytes: usize,
+    second_visible_bytes: usize,
+    first_reasoning_bytes: usize,
+    second_reasoning_bytes: usize,
+    first_completion_tokens: u32,
+    second_completion_tokens: u32,
+    first_output_hash: String,
+    second_output_hash: String,
+}
+
+fn probe_output_hash(output: &ProbeGeneration) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(output.visible.len() as u64).to_le_bytes());
+    hasher.update(output.visible.as_bytes());
+    hasher.update(&(output.reasoning.len() as u64).to_le_bytes());
+    hasher.update(output.reasoning.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+async fn generate_maybe_empty(
+    manager: &RuntimeManager,
+    model_id: &str,
+    config: &LiteRtLmConfig,
+    request_id: &str,
+    session_id: &str,
+    adapter: Option<AdapterBinding>,
+    prompt: &str,
+    max_output_tokens: u32,
+) -> Result<ProbeGeneration> {
     let conversation = prepared(session_id, prompt, max_output_tokens);
     let deadline = Instant::now() + OPERATION_TIMEOUT;
     let measured = manager
@@ -850,20 +956,32 @@ async fn generate(
         )
         .await
         .with_context(|| format!("native generation {request_id}"))?;
-    let events = std::iter::from_fn(|| event_rx.try_recv().ok()).count();
+    let mut events = 0_u64;
+    let mut streamed_reasoning = String::new();
+    while let Ok(event) = event_rx.try_recv() {
+        events = events.saturating_add(1);
+        if let RuntimeEvent::ChannelToken {
+            channel: RuntimeChannel::Reasoning,
+            text,
+            ..
+        } = event
+        {
+            streamed_reasoning.push_str(&text);
+        }
+    }
     ensure!(
         events > 0,
         "native generation {request_id} emitted no stream events"
     );
     match result {
-        LocalInferenceResult::Completed { response, .. } => {
-            let output = response.assistant_text();
-            ensure!(
-                !output.trim().is_empty(),
-                "native generation {request_id} returned no assistant text"
-            );
-            Ok(output)
-        }
+        LocalInferenceResult::Completed { response, .. } => Ok(ProbeGeneration {
+            visible: response.assistant_text(),
+            reasoning: streamed_reasoning,
+            completion_tokens: response
+                .usage
+                .as_ref()
+                .map_or(0, |usage| usage.completion_tokens),
+        }),
         LocalInferenceResult::Cancelled => bail!("native generation {request_id} was cancelled"),
     }
 }
@@ -896,49 +1014,82 @@ async fn qualify_adapter_isolation(
     config: &LiteRtLmConfig,
     first: &AdapterDescriptor,
     second: &AdapterDescriptor,
-) -> Result<()> {
-    let first_future = generate(
-        manager,
-        "soak-lora",
-        config,
-        "adapter-isolation-one",
-        "adapter-isolation-session-one",
-        Some(binding(first)),
-        "Generate one short token sequence.",
-        16,
-    );
-    let second_future = generate(
-        manager,
-        "soak-lora",
-        config,
-        "adapter-isolation-two",
-        "adapter-isolation-session-two",
-        Some(binding(second)),
-        "Generate one short token sequence.",
-        16,
-    );
-    let (first_output, second_output) = tokio::try_join!(first_future, second_future)?;
-    ensure!(
-        first_output != second_output,
-        "two real adapters produced identical outputs"
-    );
-    manager
-        .release_session("adapter-isolation-session-one")
-        .await?;
-    manager
-        .release_session("adapter-isolation-session-two")
-        .await?;
-    let status = manager.status().await?;
-    ensure!(
-        status
-            .adapters
-            .iter()
-            .filter(|adapter| adapter_is_resident(adapter))
-            .count()
-            >= 2,
-        "two real adapters are not resident after qualification"
-    );
-    Ok(())
+    max_output_tokens: u32,
+) -> Result<AdapterIsolationEvidence> {
+    const PROBES: [&str; 3] = [
+        "/no_think\nName your specialist domain in one short sentence. Answer immediately.",
+        "/no_think\nState one task you are best suited to perform. Answer immediately.",
+        "/no_think\nGive one concise operational recommendation. Answer immediately.",
+    ];
+    let mut evidence = Vec::with_capacity(PROBES.len());
+    for (attempt, prompt) in PROBES.iter().enumerate() {
+        let first_request = format!("adapter-isolation-one-{attempt}");
+        let second_request = format!("adapter-isolation-two-{attempt}");
+        let first_session = format!("adapter-isolation-session-one-{attempt}");
+        let second_session = format!("adapter-isolation-session-two-{attempt}");
+        let first_future = generate_maybe_empty(
+            manager,
+            "soak-lora",
+            config,
+            &first_request,
+            &first_session,
+            Some(binding(first)),
+            prompt,
+            max_output_tokens,
+        );
+        let second_future = generate_maybe_empty(
+            manager,
+            "soak-lora",
+            config,
+            &second_request,
+            &second_session,
+            Some(binding(second)),
+            prompt,
+            max_output_tokens,
+        );
+        let results = tokio::try_join!(first_future, second_future);
+        manager.release_session(&first_session).await?;
+        manager.release_session(&second_session).await?;
+        let (first_output, second_output) = results?;
+        let first_nonempty = !first_output.visible.trim().is_empty();
+        let second_nonempty = !second_output.visible.trim().is_empty();
+        evidence.push((
+            attempt,
+            first_output.visible.len(),
+            second_output.visible.len(),
+            first_output.reasoning.len(),
+            second_output.reasoning.len(),
+            first_output.completion_tokens,
+            second_output.completion_tokens,
+            first_output.visible == second_output.visible,
+        ));
+        if first_nonempty && second_nonempty && first_output.visible != second_output.visible {
+            let status = manager.status().await?;
+            ensure!(
+                status
+                    .adapters
+                    .iter()
+                    .filter(|adapter| adapter_is_resident(adapter))
+                    .count()
+                    >= 2,
+                "two real adapters are not resident after qualification"
+            );
+            return Ok(AdapterIsolationEvidence {
+                attempt,
+                first_visible_bytes: first_output.visible.len(),
+                second_visible_bytes: second_output.visible.len(),
+                first_reasoning_bytes: first_output.reasoning.len(),
+                second_reasoning_bytes: second_output.reasoning.len(),
+                first_completion_tokens: first_output.completion_tokens,
+                second_completion_tokens: second_output.completion_tokens,
+                first_output_hash: probe_output_hash(&first_output),
+                second_output_hash: probe_output_hash(&second_output),
+            });
+        }
+    }
+    bail!(
+        "two real adapters did not produce distinct nonempty outputs across bounded probes: {evidence:?}"
+    )
 }
 
 async fn cancel_generation(

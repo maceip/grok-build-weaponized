@@ -1,0 +1,648 @@
+diff --git a/runtime/components/lora.cc b/runtime/components/lora.cc
+index 142880b9..7e4ca563 100644
+--- a/runtime/components/lora.cc
++++ b/runtime/components/lora.cc
+@@ -28,19 +28,12 @@
+
+ namespace litert::lm {
+
+-namespace {
+-
+-// Names of the signature runners, used to get the signature runners from the
+-// interpreter.
+-// TODO: b/450616365 - Consolidate constant definitions.
+-constexpr char kDecodeSignatureRunner[] = "decode";
+-
+-}  // namespace
+-
+ absl::StatusOr<std::unique_ptr<LoRA>> LoRA::Create(
+     std::unique_ptr<LoraData> lora_data,
+-    const litert::CompiledModel& compiled_model) {
+-  auto lora = absl::WrapUnique(new LoRA(std::move(lora_data), compiled_model));
++    const litert::CompiledModel& compiled_model,
++    absl::string_view decode_signature_key) {
++  auto lora = absl::WrapUnique(new LoRA(
++      std::move(lora_data), compiled_model, decode_signature_key));
+   RETURN_IF_ERROR(lora->Init());
+   return lora;
+ }
+@@ -49,7 +42,7 @@ absl::Status LoRA::Init() {
+   // Get the input names from the default signature.
+   LITERT_ASSIGN_OR_RETURN(
+       auto input_names,
+-      compiled_model_.GetSignatureInputNames(kDecodeSignatureRunner));
++      compiled_model_.GetSignatureInputNames(decode_signature_key_));
+
+   for (const auto& input_name : input_names) {
+     if (!IsLoRAInputName(input_name)) {
+@@ -58,7 +51,7 @@ absl::Status LoRA::Init() {
+     // Create the input buffer for the LoRA tensor.
+     LITERT_ASSIGN_OR_RETURN(
+         litert::TensorBuffer tensor_buffer,
+-        compiled_model_.CreateInputBuffer(kDecodeSignatureRunner, input_name));
++        compiled_model_.CreateInputBuffer(decode_signature_key_, input_name));
+
+     LITERT_ASSIGN_OR_RETURN(
+         auto lock_and_addr, litert::TensorBufferScopedLock::Create(
+diff --git a/runtime/components/lora.h b/runtime/components/lora.h
+index 04f0e59f..9c9d7472 100644
+--- a/runtime/components/lora.h
++++ b/runtime/components/lora.h
+@@ -48,7 +48,8 @@ class LoRA {
+   // @return A unique_ptr to the LoRA instance, or an error status.
+   static absl::StatusOr<std::unique_ptr<LoRA>> Create(
+       std::unique_ptr<LoraData> lora_data,
+-      const litert::CompiledModel& compiled_model);
++      const litert::CompiledModel& compiled_model,
++      absl::string_view decode_signature_key = "decode");
+
+   virtual ~LoRA() = default;
+
+@@ -67,8 +68,11 @@ class LoRA {
+
+  private:
+   LoRA(std::unique_ptr<LoraData> lora_data,
+-       const litert::CompiledModel& compiled_model)
+-      : lora_data_(std::move(lora_data)), compiled_model_(compiled_model) {}
++       const litert::CompiledModel& compiled_model,
++       absl::string_view decode_signature_key)
++      : lora_data_(std::move(lora_data)),
++        compiled_model_(compiled_model),
++        decode_signature_key_(decode_signature_key) {}
+
+   // Initializes the LoRA object by creating TensorBuffers for all LoRA inputs
+   // and copying the data from LoraData.
+@@ -76,6 +80,7 @@ class LoRA {
+
+   std::unique_ptr<LoraData> lora_data_;
+   const litert::CompiledModel& compiled_model_;
++  std::string decode_signature_key_;
+   absl::flat_hash_map<std::string, litert::TensorBuffer> lora_buffers_;
+ };
+
+diff --git a/runtime/components/lora_manager.cc b/runtime/components/lora_manager.cc
+index c74b3ee1..969102eb 100644
+--- a/runtime/components/lora_manager.cc
++++ b/runtime/components/lora_manager.cc
+@@ -34,12 +34,16 @@
+ namespace litert::lm {
+
+ absl::StatusOr<std::unique_ptr<LoraManager>> LoraManager::Create(
+-    const litert::CompiledModel& compiled_model) {
+-  return absl::WrapUnique(new LoraManager(compiled_model));
++    const litert::CompiledModel& compiled_model,
++    absl::string_view decode_signature_key) {
++  return absl::WrapUnique(
++      new LoraManager(compiled_model, decode_signature_key));
+ }
+
+-LoraManager::LoraManager(const litert::CompiledModel& compiled_model)
+-    : compiled_model_(compiled_model) {}
++LoraManager::LoraManager(const litert::CompiledModel& compiled_model,
++                         absl::string_view decode_signature_key)
++    : compiled_model_(compiled_model),
++      decode_signature_key_(decode_signature_key) {}
+
+ absl::Status LoraManager::LoadLoRA(uint32_t lora_id,
+                                    const ModelAssets& model_assets) {
+@@ -58,7 +62,8 @@ absl::Status LoraManager::UseLoRA(uint32_t lora_id) {
+   }
+   if (!loras_.contains(lora_id)) {
+     ASSIGN_OR_RETURN(auto lora, LoRA::Create(std::move(lora_data_[lora_id]),
+-                                             compiled_model_));
++                                             compiled_model_,
++                                             decode_signature_key_));
+     loras_[lora_id] = std::move(lora);
+     lora_data_.erase(lora_id);
+   }
+diff --git a/runtime/components/lora_manager.h b/runtime/components/lora_manager.h
+index 43abb3d5..087ae91d 100644
+--- a/runtime/components/lora_manager.h
++++ b/runtime/components/lora_manager.h
+@@ -18,6 +18,7 @@
+ #include <cstdint>
+ #include <memory>
+ #include <optional>
++#include <string>
+
+ #include "absl/container/flat_hash_map.h"  // from @com_google_absl
+ #include "absl/status/status.h"  // from @com_google_absl
+@@ -43,7 +44,8 @@ class LoraManager {
+   // information. It is used for creating backend resources for model buffers.
+   // It also contains the LoRA input signature information
+   static absl::StatusOr<std::unique_ptr<LoraManager>> Create(
+-      const litert::CompiledModel& compiled_model);
++      const litert::CompiledModel& compiled_model,
++      absl::string_view decode_signature_key = "decode");
+
+   // Returns the current LoRA ID.
+   std::optional<uint32_t> GetCurrentLoRAId() const { return current_lora_id_; }
+@@ -71,9 +73,11 @@ class LoraManager {
+   GetLoRABuffers() const;
+
+  private:
+-  explicit LoraManager(const litert::CompiledModel& compiled_model);
++  LoraManager(const litert::CompiledModel& compiled_model,
++              absl::string_view decode_signature_key);
+
+   const litert::CompiledModel& compiled_model_;
++  std::string decode_signature_key_;
+
+   absl::flat_hash_map<uint32_t, std::unique_ptr<LoraData>> lora_data_;
+   absl::flat_hash_map<uint32_t, std::unique_ptr<LoRA>> loras_;
+diff --git a/runtime/executor/llm_litert_compiled_model_executor.cc b/runtime/executor/llm_litert_compiled_model_executor.cc
+index c54b7604..9834ed89 100644
+--- a/runtime/executor/llm_litert_compiled_model_executor.cc
++++ b/runtime/executor/llm_litert_compiled_model_executor.cc
+@@ -82,6 +82,75 @@ constexpr absl::string_view kPrefillSignatureRunner = "prefill";
+ constexpr absl::string_view kDecodeSignatureRunner = "decode";
+ constexpr int kDynamicDimValue = -1;
+
++struct SelectedCompiledSignatures {
++  std::string decode_key;
++  std::string prefill_suffix;
++};
++
++absl::StatusOr<SelectedCompiledSignatures> SelectCompiledSignatures(
++    const Model& model, uint32_t lora_rank) {
++  if (lora_rank == 0) {
++    return SelectedCompiledSignatures{std::string(kDecodeSignatureRunner), ""};
++  }
++  const std::string suffix = absl::StrCat("_lora_r", lora_rank);
++  const std::string candidate =
++      absl::StrCat(kDecodeSignatureRunner, suffix);
++  for (int index = 0; index < model.GetNumSignatures(); ++index) {
++    LITERT_ASSIGN_OR_RETURN(auto signature, model.GetSignature(index));
++    if (signature.Key() == candidate) {
++      return SelectedCompiledSignatures{candidate, suffix};
++    }
++  }
++  // Some compiled artifacts expose LoRA tensors directly on the canonical
++  // decode/prefill signatures. Preserve compatibility with those artifacts;
++  // LoraManager rejects the model later if the canonical signatures do not
++  // actually contain LoRA inputs.
++  return SelectedCompiledSignatures{std::string(kDecodeSignatureRunner), ""};
++}
++
++bool MatchesSelectedPrefillSignature(absl::string_view key,
++                                     absl::string_view lora_suffix) {
++  if (!absl::StartsWith(key, kPrefillSignatureRunner)) {
++    return false;
++  }
++  if (lora_suffix.empty()) {
++    return !absl::StrContains(key, "_lora_r");
++  }
++  return absl::EndsWith(key, lora_suffix);
++}
++
++absl::StatusOr<SortedPrefillSignatureMap> GetSelectedPrefillRunnerSet(
++    const Model& model, absl::string_view lora_suffix,
++    absl::string_view input_positions_name) {
++  SortedPrefillSignatureMap runners;
++  for (int index = 0; index < model.GetNumSignatures(); ++index) {
++    LITERT_ASSIGN_OR_RETURN(auto signature, model.GetSignature(index));
++    if (!MatchesSelectedPrefillSignature(signature.Key(), lora_suffix)) {
++      continue;
++    }
++    LITERT_ASSIGN_OR_RETURN(
++        auto input_positions_tensor,
++        signature.InputTensor(input_positions_name));
++    LITERT_ASSIGN_OR_RETURN(auto ranked_tensor_type,
++                            input_positions_tensor.RankedTensorType());
++    const auto dimensions = ranked_tensor_type.Layout().Dimensions();
++    if (ranked_tensor_type.Layout().Rank() == 2) {
++      runners[dimensions[1]] = std::string(signature.Key());
++    } else if (ranked_tensor_type.Layout().Rank() == 1) {
++      runners[dimensions[0]] = std::string(signature.Key());
++    } else {
++      return absl::FailedPreconditionError(
++          "Unsupported input positions tensor dimension.");
++    }
++  }
++  if (runners.empty()) {
++    return absl::FailedPreconditionError(absl::StrCat(
++        "No prefill signature matches selected LoRA suffix '", lora_suffix,
++        "'."));
++  }
++  return runners;
++}
++
+ absl::Status InitializeEmbeddingLookups(
+     litert::Environment& env, ModelResources& resources,
+     std::unique_ptr<EmbeddingLookupManager>& embedding_lookup,
+@@ -385,7 +454,9 @@ absl::StatusOr<TensorBuffer> CreateFP16OutputBuffer(
+ }  // namespace
+
+ absl::Status LlmLiteRtCompiledModelExecutorBase::InitializeLoraManager() {
+-  ASSIGN_OR_RETURN(auto manager, LoraManager::Create(compiled_model_));
++  ASSIGN_OR_RETURN(
++      auto manager,
++      LoraManager::Create(compiled_model_, decode_signature_key_));
+   lora_manager_ = std::move(manager);
+   return absl::OkStatus();
+ }
+@@ -1011,7 +1082,7 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::BindTensorsAndRunDecode(
+
+   bool async = true;
+   LITERT_RETURN_IF_ERROR(
+-      compiled_model_.RunAsync(kDecodeSignatureRunner, decode_input_buffers,
++      compiled_model_.RunAsync(decode_signature_key_, decode_input_buffers,
+                                decode_output_buffers, async));
+
+   if (!gpu_optimized_single_buffer_cache_) {
+@@ -1332,13 +1403,13 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::InitializeSampler(
+     if (!decode_prev_input_pos_) {
+       LITERT_ASSIGN_OR_RETURN(
+           decode_prev_input_pos_,
+-          compiled_model_.CreateInputBuffer(kDecodeSignatureRunner,
++          compiled_model_.CreateInputBuffer(decode_signature_key_,
+                                             signatures_.input_positions));
+     }
+     if (!decode_prev_mask_ && signatures_.input_attn_mask.has_value()) {
+       LITERT_ASSIGN_OR_RETURN(
+           decode_prev_mask_,
+-          compiled_model_.CreateInputBuffer(kDecodeSignatureRunner,
++          compiled_model_.CreateInputBuffer(decode_signature_key_,
+                                             *signatures_.input_attn_mask));
+     }
+     // Set, then reset the input handling to get the underlying model ready, but
+@@ -1556,15 +1627,24 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
+     return absl::InternalError("Failed to build LiteRt model");
+   }
+
+-  absl::string_view prefill_signature_key = "";
++  ASSIGN_OR_RETURN(
++      auto selected_signatures,
++      SelectCompiledSignatures(*litert_model, executor_settings.GetLoraRank()));
++
++  std::string prefill_signature_key;
+   for (int i = 0; i < litert_model->GetNumSignatures(); ++i) {
+     LITERT_ASSIGN_OR_RETURN(auto sig, litert_model->GetSignature(i));
+     absl::string_view key = sig.Key();
+-    if (absl::StartsWith(key, kPrefillSignatureRunner)) {
+-      prefill_signature_key = key;
++    if (MatchesSelectedPrefillSignature(
++            key, selected_signatures.prefill_suffix)) {
++      prefill_signature_key = std::string(key);
+       break;
+     }
+   }
++  if (prefill_signature_key.empty()) {
++    return absl::FailedPreconditionError(
++        "No prefill signature matches the selected LoRA rank.");
++  }
+   LITERT_ASSIGN_OR_RETURN(auto prefill_signature,
+                           litert_model->FindSignature(prefill_signature_key));
+   std::string kv_cache_k_root_name;
+@@ -1573,7 +1653,8 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
+       prefill_signature.InputNames(), prefill_signature.OutputNames(),
+       kv_cache_k_root_name, kv_cache_v_root_name));
+   LITERT_ASSIGN_OR_RETURN(auto decode_signature,
+-                          litert_model->FindSignature(kDecodeSignatureRunner));
++                          litert_model->FindSignature(
++                              selected_signatures.decode_key));
+   ASSIGN_OR_RETURN(
+       ModelSignatures signatures,
+       GetModelSignaturesFromInputOutputNames(decode_signature.InputNames(),
+@@ -1672,7 +1753,8 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
+     }
+     LITERT_ASSIGN_OR_RETURN(
+         auto input_buffer,
+-        compiled_model.CreateInputBuffer(kDecodeSignatureRunner, input_name));
++        compiled_model.CreateInputBuffer(selected_signatures.decode_key,
++                                         input_name));
+     decode_input_buffers[input_name] = std::move(input_buffer);
+   }
+   auto output_names = decode_signature.OutputNames();
+@@ -1692,7 +1774,7 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
+         sampler_backend.ok() && *sampler_backend == Backend::GPU) {
+       LITERT_ASSIGN_OR_RETURN(
+           size_t signature_index,
+-          compiled_model.GetSignatureIndex(kDecodeSignatureRunner));
++          compiled_model.GetSignatureIndex(selected_signatures.decode_key));
+       LITERT_ASSIGN_OR_RETURN(
+           auto output_buffer,
+           CreateFP16OutputBuffer(lrt_env, compiled_model, signature_index,
+@@ -1701,7 +1783,7 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
+     } else {
+       LITERT_ASSIGN_OR_RETURN(auto output_buffer,
+                               compiled_model.CreateOutputBuffer(
+-                                  kDecodeSignatureRunner, output_name));
++                                  selected_signatures.decode_key, output_name));
+
+       decode_output_buffers[output_name] = std::move(output_buffer);
+     }
+@@ -1732,7 +1814,8 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
+           absl::StartsWith(input_name, kv_cache_v_root_name)) {
+         LITERT_ASSIGN_OR_RETURN(auto input_buffer,
+                                 compiled_model.CreateInputBuffer(
+-                                    kDecodeSignatureRunner, input_name));
++                                    selected_signatures.decode_key,
++                                    input_name));
+         if (clear_kv_cache_before_prefill) {
+           LITERT_RETURN_IF_ERROR(input_buffer.Clear());
+         }
+@@ -1744,18 +1827,19 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
+           absl::StartsWith(output_name, kv_cache_v_root_name)) {
+         LITERT_ASSIGN_OR_RETURN(auto output_buffer,
+                                 compiled_model.CreateOutputBuffer(
+-                                    kDecodeSignatureRunner, output_name));
++                                    selected_signatures.decode_key,
++                                    output_name));
+         (*decode_output_kv_cache_buffers)[output_name] =
+             std::move(output_buffer);
+       }
+     }
+   }
+
+-  ASSIGN_OR_RETURN(auto prefill_runner_set,
+-                   GetPrefillRunnerSetFromModel(
+-                       *litert_model, kPrefillSignatureRunner,
+-                       /*input_positions_name=*/signatures.input_positions));
+-  RET_CHECK(!prefill_runner_set.empty()) << "No prefill runner available.";
++  ASSIGN_OR_RETURN(
++      auto prefill_runner_set,
++      GetSelectedPrefillRunnerSet(
++          *litert_model, selected_signatures.prefill_suffix,
++          /*input_positions_name=*/signatures.input_positions));
+
+   std::unique_ptr<EmbeddingLookupManager> embedding_lookup;
+   std::unique_ptr<EmbeddingLookupManager> per_layer_embedding_lookup;
+@@ -1782,7 +1866,8 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
+
+   auto executor = absl::WrapUnique(new LlmLiteRtCompiledModelExecutorStatic(
+       std::move(executor_settings), lrt_env, litert_model,
+-      std::move(compiled_model), std::move(decode_input_buffers),
++      std::move(compiled_model), std::move(selected_signatures.decode_key),
++      std::move(decode_input_buffers),
+       std::move(decode_output_buffers), std::move(input_kv_cache_buffers),
+       std::move(output_kv_cache_buffers),
+       std::move(decode_input_kv_cache_buffers),
+@@ -1855,22 +1940,26 @@ absl::Status LlmLiteRtCompiledModelExecutorDynamic::PrefillInternal(
+         !executor_settings_.GetAdvancedSettings() ||
+         executor_settings_.GetAdvancedSettings()->clear_kv_cache_before_prefill;
+     for (const auto& k_cache_input_name : key_cache_input_names_) {
+-      RETURN_IF_ERROR(ResolveDynamicShape(model_, compiled_model_, "prefill",
++      RETURN_IF_ERROR(ResolveDynamicShape(model_, compiled_model_,
++                                          prefill_signature_key_,
+                                           k_cache_input_name, prefill_length));
+       LITERT_ASSIGN_OR_RETURN(
+           auto input_buffer,
+-          compiled_model_.CreateInputBuffer("prefill", k_cache_input_name));
++          compiled_model_.CreateInputBuffer(prefill_signature_key_,
++                                            k_cache_input_name));
+       if (clear_kv_cache_before_prefill) {
+         LITERT_RETURN_IF_ERROR(input_buffer.Clear());
+       }
+       kv_cache_buffers_1_[k_cache_input_name] = std::move(input_buffer);
+     }
+     for (const auto& v_cache_input_name : value_cache_input_names_) {
+-      RETURN_IF_ERROR(ResolveDynamicShape(model_, compiled_model_, "prefill",
++      RETURN_IF_ERROR(ResolveDynamicShape(model_, compiled_model_,
++                                          prefill_signature_key_,
+                                           v_cache_input_name, prefill_length));
+       LITERT_ASSIGN_OR_RETURN(
+           auto input_buffer,
+-          compiled_model_.CreateInputBuffer("prefill", v_cache_input_name));
++          compiled_model_.CreateInputBuffer(prefill_signature_key_,
++                                            v_cache_input_name));
+       if (clear_kv_cache_before_prefill) {
+         LITERT_RETURN_IF_ERROR(input_buffer.Clear());
+       }
+@@ -1892,18 +1981,18 @@ absl::Status LlmLiteRtCompiledModelExecutorDynamic::PrefillInternal(
+       int new_kv_seq_len = kv_length + prefill_length;
+       int entries_to_add = new_kv_seq_len - kv_length;
+       for (const auto& k_cache_input_name : key_cache_input_names_) {
+-        RETURN_IF_ERROR(ResolveDynamicShape(model_, compiled_model_, "prefill",
+-                                            k_cache_input_name,
+-                                            new_kv_seq_len));
++        RETURN_IF_ERROR(ResolveDynamicShape(
++            model_, compiled_model_, prefill_signature_key_,
++            k_cache_input_name, new_kv_seq_len));
+         ASSIGN_OR_RETURN(kv_cache_buffers_1_[k_cache_input_name],
+                          ResizeKVCacheTensorBuffer(
+                              env_, kv_cache_buffers_1_[k_cache_input_name],
+                              key_dynamic_dim_index_, entries_to_add));
+       }
+       for (const auto& v_cache_input_name : value_cache_input_names_) {
+-        RETURN_IF_ERROR(ResolveDynamicShape(model_, compiled_model_, "prefill",
+-                                            v_cache_input_name,
+-                                            new_kv_seq_len));
++        RETURN_IF_ERROR(ResolveDynamicShape(
++            model_, compiled_model_, prefill_signature_key_,
++            v_cache_input_name, new_kv_seq_len));
+         ASSIGN_OR_RETURN(kv_cache_buffers_1_[v_cache_input_name],
+                          ResizeKVCacheTensorBuffer(
+                              env_, kv_cache_buffers_1_[v_cache_input_name],
+@@ -1914,15 +2003,16 @@ absl::Status LlmLiteRtCompiledModelExecutorDynamic::PrefillInternal(
+   }
+
+   absl::flat_hash_map<absl::string_view, TensorBuffer> prefill_input_buffers;
+-  RETURN_IF_ERROR(CreatePrefillInputBuffers("prefill", prefill_length,
+-                                            kv_length, prefill_input_buffers));
++  RETURN_IF_ERROR(CreatePrefillInputBuffers(
++      prefill_signature_key_, prefill_length, kv_length,
++      prefill_input_buffers));
+
+   input_kv_cache_buffers_ = &kv_cache_buffers_1_;
+   output_kv_cache_buffers_ = &kv_cache_buffers_1_;
+
+   bool async = !params.GetWaitForCompletion();
+   return LlmLiteRtCompiledModelExecutorBase::PrefillInternal(
+-      "prefill", prefill_input_buffers, ids, async);
++      prefill_signature_key_, prefill_input_buffers, ids, async);
+ }
+
+ absl::Status LlmLiteRtCompiledModelExecutorDynamic::DecodeInternal(
+@@ -1943,7 +2033,8 @@ absl::Status LlmLiteRtCompiledModelExecutorDynamic::DecodeInternal(
+     int entries_to_add = kv_increament_size_;
+     int new_kv_len = current_kv_len + entries_to_add;
+     for (const auto& k_cache_input_name : key_cache_input_names_) {
+-      RETURN_IF_ERROR(ResolveDynamicShape(model_, compiled_model_, "decode",
++      RETURN_IF_ERROR(ResolveDynamicShape(model_, compiled_model_,
++                                          decode_signature_key_,
+                                           k_cache_input_name, new_kv_len));
+       ASSIGN_OR_RETURN(kv_cache_buffers_1_[k_cache_input_name],
+                        ResizeKVCacheTensorBuffer(
+@@ -1951,7 +2042,8 @@ absl::Status LlmLiteRtCompiledModelExecutorDynamic::DecodeInternal(
+                            key_dynamic_dim_index_, entries_to_add));
+     }
+     for (const auto& v_cache_input_name : value_cache_input_names_) {
+-      RETURN_IF_ERROR(ResolveDynamicShape(model_, compiled_model_, "decode",
++      RETURN_IF_ERROR(ResolveDynamicShape(model_, compiled_model_,
++                                          decode_signature_key_,
+                                           v_cache_input_name, new_kv_len));
+       ASSIGN_OR_RETURN(kv_cache_buffers_1_[v_cache_input_name],
+                        ResizeKVCacheTensorBuffer(
+@@ -1961,12 +2053,13 @@ absl::Status LlmLiteRtCompiledModelExecutorDynamic::DecodeInternal(
+     current_kv_len = new_kv_len;
+   }
+
+-  RETURN_IF_ERROR(ResolveDynamicShape(model_, compiled_model_, "decode",
++  RETURN_IF_ERROR(ResolveDynamicShape(model_, compiled_model_,
++                                      decode_signature_key_,
+                                       signatures_.input_attn_mask.value(),
+                                       current_kv_len));
+   LITERT_ASSIGN_OR_RETURN(
+       decode_input_buffers_[signatures_.input_attn_mask.value()],
+-      compiled_model_.CreateInputBuffer("decode",
++      compiled_model_.CreateInputBuffer(decode_signature_key_,
+                                         signatures_.input_attn_mask.value()));
+
+   return LlmLiteRtCompiledModelExecutorBase::DecodeInternal(token,
+@@ -1981,6 +2074,9 @@ LlmLiteRtCompiledModelExecutorDynamic::Create(
+     ModelResources& resources) {
+   ASSIGN_OR_RETURN(auto litert_model,
+                    resources.GetTFLiteModel(ModelType::kTfLitePrefillDecode));
++  ASSIGN_OR_RETURN(
++      auto selected_signatures,
++      SelectCompiledSignatures(*litert_model, executor_settings.GetLoraRank()));
+   ASSIGN_OR_RETURN(
+       auto compilation_options,
+       CreateCompilationOptions(executor_settings, ActivationDataType::FLOAT32,
+@@ -2036,7 +2132,8 @@ LlmLiteRtCompiledModelExecutorDynamic::Create(
+   absl::flat_hash_map<absl::string_view, TensorBuffer> decode_output_buffers;
+
+   LITERT_ASSIGN_OR_RETURN(auto decode_signature,
+-                          litert_model->FindSignature(kDecodeSignatureRunner));
++                          litert_model->FindSignature(
++                              selected_signatures.decode_key));
+   std::string kv_cache_k_root_name;
+   std::string kv_cache_v_root_name;
+   RETURN_IF_ERROR(GetKVCacheRootNames(
+@@ -2070,7 +2167,8 @@ LlmLiteRtCompiledModelExecutorDynamic::Create(
+         !IsLoRAInputName(input_name)) {
+       LITERT_ASSIGN_OR_RETURN(
+           auto input_buffer,
+-          compiled_model.CreateInputBuffer(kDecodeSignatureRunner, input_name));
++          compiled_model.CreateInputBuffer(selected_signatures.decode_key,
++                                           input_name));
+       decode_input_buffers[input_name] = std::move(input_buffer);
+     }
+   }
+@@ -2079,17 +2177,32 @@ LlmLiteRtCompiledModelExecutorDynamic::Create(
+         !absl::StartsWith(output_name, kv_cache_v_root_name)) {
+       LITERT_ASSIGN_OR_RETURN(auto output_buffer,
+                               compiled_model.CreateOutputBuffer(
+-                                  kDecodeSignatureRunner, output_name));
++                                  selected_signatures.decode_key,
++                                  output_name));
+       decode_output_buffers[output_name] = std::move(output_buffer);
+     }
+   }
+
+-  ASSIGN_OR_RETURN(
+-      int k_dynamic_dim,
+-      GetDynamicDimIndex(*litert_model, "prefill", key_cache_input_names[0]));
+-  ASSIGN_OR_RETURN(
+-      int v_dynamic_dim,
+-      GetDynamicDimIndex(*litert_model, "prefill", value_cache_input_names[0]));
++  std::string prefill_signature_key;
++  for (int index = 0; index < litert_model->GetNumSignatures(); ++index) {
++    LITERT_ASSIGN_OR_RETURN(auto signature,
++                            litert_model->GetSignature(index));
++    if (MatchesSelectedPrefillSignature(
++            signature.Key(), selected_signatures.prefill_suffix)) {
++      prefill_signature_key = std::string(signature.Key());
++      break;
++    }
++  }
++  if (prefill_signature_key.empty()) {
++    return absl::FailedPreconditionError(
++        "No dynamic prefill signature matches the selected LoRA rank.");
++  }
++  ASSIGN_OR_RETURN(int k_dynamic_dim,
++                   GetDynamicDimIndex(*litert_model, prefill_signature_key,
++                                      key_cache_input_names[0]));
++  ASSIGN_OR_RETURN(int v_dynamic_dim,
++                   GetDynamicDimIndex(*litert_model, prefill_signature_key,
++                                      value_cache_input_names[0]));
+
+   LITERT_ASSIGN_OR_RETURN(
+       auto output_logits_buffer,
+@@ -2106,7 +2219,8 @@ LlmLiteRtCompiledModelExecutorDynamic::Create(
+       lrt_env, resources, embedding_lookup, per_layer_embedding_lookup));
+   auto executor = absl::WrapUnique(new LlmLiteRtCompiledModelExecutorDynamic(
+       std::move(executor_settings), lrt_env, litert_model,
+-      std::move(compiled_model), std::move(decode_input_buffers),
++      std::move(compiled_model), std::move(selected_signatures.decode_key),
++      std::move(prefill_signature_key), std::move(decode_input_buffers),
+       std::move(decode_output_buffers), prefill_chunk_size, k_dynamic_dim,
+       v_dynamic_dim, kv_increament_size, std::move(key_cache_input_names),
+       std::move(value_cache_input_names), signatures, batch_size,
+diff --git a/runtime/executor/llm_litert_compiled_model_executor.h b/runtime/executor/llm_litert_compiled_model_executor.h
+index 5989ecb8..257ba133 100644
+--- a/runtime/executor/llm_litert_compiled_model_executor.h
++++ b/runtime/executor/llm_litert_compiled_model_executor.h
+@@ -139,6 +139,7 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
+   LlmLiteRtCompiledModelExecutorBase(
+       LlmExecutorSettings executor_settings, Environment& env,
+       const Model* absl_nonnull model, CompiledModel compiled_model,
++      std::string decode_signature_key,
+       absl::flat_hash_map<absl::string_view, TensorBuffer> decode_input_buffers,
+       absl::flat_hash_map<absl::string_view, TensorBuffer>
+           decode_output_buffers,
+@@ -160,6 +161,7 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
+         env_(env),
+         model_(*model),
+         compiled_model_(std::move(compiled_model)),
++        decode_signature_key_(std::move(decode_signature_key)),
+         decode_input_buffers_(std::move(decode_input_buffers)),
+         decode_output_buffers_(std::move(decode_output_buffers)),
+         kv_cache_buffers_1_(std::move(input_kv_cache_buffers)),
+@@ -283,6 +285,7 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
+   Environment& env_;
+   const Model& model_;
+   CompiledModel compiled_model_;
++  std::string decode_signature_key_;
+   std::unique_ptr<LoraManager> lora_manager_;
+
+   absl::flat_hash_map<absl::string_view, TensorBuffer> decode_input_buffers_;
+@@ -362,6 +365,7 @@ class LlmLiteRtCompiledModelExecutorStatic
+   LlmLiteRtCompiledModelExecutorStatic(
+       LlmExecutorSettings executor_settings, Environment& env,
+       const Model* absl_nonnull model, CompiledModel compiled_model,
++      std::string decode_signature_key,
+       absl::flat_hash_map<absl::string_view, TensorBuffer> decode_input_buffers,
+       absl::flat_hash_map<absl::string_view, TensorBuffer>
+           decode_output_buffers,
+@@ -384,6 +388,7 @@ class LlmLiteRtCompiledModelExecutorStatic
+       std::unique_ptr<LlmLiteRtMtpDrafter> mtp_drafter = nullptr)
+       : LlmLiteRtCompiledModelExecutorBase(
+             std::move(executor_settings), env, model, std::move(compiled_model),
++            std::move(decode_signature_key),
+             std::move(decode_input_buffers), std::move(decode_output_buffers),
+             std::move(input_kv_cache_buffers),
+             std::move(output_kv_cache_buffers),
+@@ -423,6 +428,7 @@ class LlmLiteRtCompiledModelExecutorDynamic
+   LlmLiteRtCompiledModelExecutorDynamic(
+       LlmExecutorSettings executor_settings, Environment& env,
+       const Model* absl_nonnull model, CompiledModel compiled_model,
++      std::string decode_signature_key, std::string prefill_signature_key,
+       absl::flat_hash_map<absl::string_view, TensorBuffer> decode_input_buffers,
+       absl::flat_hash_map<absl::string_view, TensorBuffer>
+           decode_output_buffers,
+@@ -440,6 +446,7 @@ class LlmLiteRtCompiledModelExecutorDynamic
+       std::unique_ptr<LlmLiteRtMtpDrafter> mtp_drafter = nullptr)
+       : LlmLiteRtCompiledModelExecutorBase(
+             std::move(executor_settings), env, model, std::move(compiled_model),
++            std::move(decode_signature_key),
+             std::move(decode_input_buffers), std::move(decode_output_buffers),
+             /*input_kv_cache_buffers=*/{},
+             /*output_kv_cache_buffers=*/{},
+@@ -448,6 +455,7 @@ class LlmLiteRtCompiledModelExecutorDynamic
+             output_batch_size, std::move(weight_cache_path),
+             std::move(embedding_lookup), std::move(per_layer_embedding_lookup),
+             use_fp16_precision, logits_data_type, std::move(mtp_drafter)),
++        prefill_signature_key_(std::move(prefill_signature_key)),
+         prefill_chunk_size_(prefill_chunk_size),
+         key_dynamic_dim_index_(key_dynamic_dim_index),
+         value_dynamic_dim_index_(value_dynamic_dim_index),
+@@ -463,6 +471,7 @@ class LlmLiteRtCompiledModelExecutorDynamic
+       const std::vector<std::shared_ptr<TokenData>>& token,
+       TensorBuffer& output_logits) override;
+
++  std::string prefill_signature_key_;
+   int prefill_chunk_size_;
+   int key_dynamic_dim_index_;
+   int value_dynamic_dim_index_;
