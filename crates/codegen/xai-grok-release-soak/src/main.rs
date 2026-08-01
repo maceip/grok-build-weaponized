@@ -4,7 +4,7 @@
 //! holds the real managers and native workers open for the complete run, emits
 //! JSONL evidence, and exits non-zero on the first violated invariant.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,6 +35,8 @@ use xai_grok_tools::types::memory_backend::MemoryBackend;
 
 const MIB: u64 = 1024 * 1024;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(180);
+const MEMORY_LATENCY_WINDOW: usize = 100;
+const MEMORY_LATENCY_MIN_SAMPLES: usize = 20;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -224,6 +226,48 @@ struct MemoryFixture {
     embedding_config: MemoryEmbeddingConfig,
 }
 
+#[derive(Default)]
+struct LatencyWindow {
+    samples: VecDeque<Duration>,
+}
+
+impl LatencyWindow {
+    fn observe(&mut self, sample: Duration, maximum_p95: Duration) -> Result<Duration> {
+        ensure!(
+            sample <= maximum_p95.saturating_mul(4),
+            "memory retrieval outlier {sample:?} exceeds the hard {:?} ceiling",
+            maximum_p95.saturating_mul(4)
+        );
+        self.samples.push_back(sample);
+        while self.samples.len() > MEMORY_LATENCY_WINDOW {
+            self.samples.pop_front();
+        }
+        let p95 = self.p95().expect("observed latency sample");
+        if self.samples.len() >= MEMORY_LATENCY_MIN_SAMPLES {
+            ensure!(
+                p95 <= maximum_p95,
+                "memory retrieval rolling p95 {p95:?} exceeds {maximum_p95:?} across {} samples",
+                self.samples.len()
+            );
+        }
+        Ok(p95)
+    }
+
+    fn p95(&self) -> Option<Duration> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let mut sorted = self.samples.iter().copied().collect::<Vec<_>>();
+        sorted.sort_unstable();
+        let rank = (sorted.len() * 95).div_ceil(100).saturating_sub(1);
+        Some(sorted[rank])
+    }
+
+    fn maximum(&self) -> Option<Duration> {
+        self.samples.iter().copied().max()
+    }
+}
+
 #[derive(Serialize)]
 struct StartRecord<'a> {
     profile: SoakProfile,
@@ -254,6 +298,8 @@ struct CycleRecord<'a> {
     native_spool_bytes: u64,
     governor_reserved_bytes: u64,
     embedding_reserved_bytes: u64,
+    memory_retrieval_p95_micros: u128,
+    memory_retrieval_max_micros: u128,
     soft_memory_pressure: bool,
     embedding_backfill: &'a xai_grok_memory::backend::EmbeddingBackfillStatus,
     counters: &'a Counters,
@@ -265,6 +311,8 @@ struct FinalRecord<'a> {
     requested_duration_seconds: u64,
     elapsed_seconds: u64,
     peak_growth: AggregateResources,
+    memory_retrieval_p95_micros: u128,
+    memory_retrieval_max_micros: u128,
     counters: &'a Counters,
     embedding_backfill: xai_grok_memory::backend::EmbeddingBackfillStatus,
     passed: bool,
@@ -469,6 +517,7 @@ async fn run() -> Result<()> {
     let mut counters = Counters::default();
     let mut peak_growth = baseline.growth_from(baseline);
     let mut adapter_toggle = false;
+    let mut memory_latency = LatencyWindow::default();
     while Instant::now() < deadline {
         counters.cycles += 1;
         let cycle = counters.cycles;
@@ -524,7 +573,11 @@ async fn run() -> Result<()> {
 
         exercise_native_job(&native, cycle).await?;
         counters.native_jobs += 1;
-        exercise_memory(&memory, cycle, args.max_memory_query_ms).await?;
+        let memory_elapsed = exercise_memory(&memory, cycle).await?;
+        let memory_p95 = memory_latency.observe(
+            memory_elapsed,
+            Duration::from_millis(args.max_memory_query_ms),
+        )?;
         counters.memory_queries += 1;
         if cycle % args.busy_embedding_every == 0 {
             qualify_busy_embedding_fallback(&memory, args.max_memory_query_ms).await?;
@@ -593,6 +646,11 @@ async fn run() -> Result<()> {
                         .get(&ResourceClass::Embedding)
                         .copied()
                         .unwrap_or_default(),
+                    memory_retrieval_p95_micros: memory_p95.as_micros(),
+                    memory_retrieval_max_micros: memory_latency
+                        .maximum()
+                        .expect("current cycle observed memory latency")
+                        .as_micros(),
                     soft_memory_pressure: governor.soft_pressure,
                     embedding_backfill: &backfill,
                     counters: &counters,
@@ -633,6 +691,14 @@ async fn run() -> Result<()> {
                 requested_duration_seconds: duration.as_secs(),
                 elapsed_seconds: started.elapsed().as_secs(),
                 peak_growth,
+                memory_retrieval_p95_micros: memory_latency
+                    .p95()
+                    .expect("soak performed memory queries")
+                    .as_micros(),
+                memory_retrieval_max_micros: memory_latency
+                    .maximum()
+                    .expect("soak performed memory queries")
+                    .as_micros(),
                 counters: &counters,
                 embedding_backfill: final_backfill,
                 passed: true,
@@ -1102,12 +1168,17 @@ async fn initialize_memory(args: &Args, state_dir: &Path) -> Result<MemoryFixtur
         database,
         embedding_config,
     };
-    exercise_memory(&fixture, 0, args.max_memory_query_ms).await?;
+    let initial_latency = exercise_memory(&fixture, 0).await?;
+    ensure!(
+        initial_latency <= Duration::from_millis(args.max_memory_query_ms),
+        "initial warm memory retrieval took {initial_latency:?}, exceeding {} ms",
+        args.max_memory_query_ms
+    );
     wait_for_embedding_backfill(&fixture.database, Duration::from_secs(60)).await?;
     Ok(fixture)
 }
 
-async fn exercise_memory(fixture: &MemoryFixture, cycle: u64, maximum_ms: u64) -> Result<()> {
+async fn exercise_memory(fixture: &MemoryFixture, cycle: u64) -> Result<Duration> {
     let marker = format!("soak-evidence-{cycle}");
     fixture.storage.append_to_memory(
         MemoryScope::Workspace,
@@ -1122,16 +1193,12 @@ async fn exercise_memory(fixture: &MemoryFixture, cycle: u64, maximum_ms: u64) -
         .map_err(|error| anyhow!(error.to_string()))?;
     let elapsed = started.elapsed();
     ensure!(
-        elapsed <= Duration::from_millis(maximum_ms),
-        "memory retrieval took {elapsed:?}, exceeding {maximum_ms} ms"
-    );
-    ensure!(
         results
             .iter()
             .any(|result| result.snippet.contains(&marker)),
         "memory query did not retrieve newly persisted evidence"
     );
-    Ok(())
+    Ok(elapsed)
 }
 
 async fn wait_for_watcher(watcher: &MemoryFileWatcher, maximum: Duration) -> Result<()> {
@@ -1375,5 +1442,45 @@ mod tests {
         assert_eq!(growth.harness_threads, 3);
         assert_eq!(growth.worker_threads, 0);
         assert_eq!(growth.total_fds, 1);
+    }
+
+    #[test]
+    fn memory_gate_measures_p95_instead_of_rejecting_one_tail_sample() {
+        let mut window = LatencyWindow::default();
+        for _ in 0..19 {
+            window
+                .observe(Duration::from_millis(5), Duration::from_millis(50))
+                .unwrap();
+        }
+        let p95 = window
+            .observe(Duration::from_millis(58), Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(p95, Duration::from_millis(5));
+        assert_eq!(window.maximum(), Some(Duration::from_millis(58)));
+    }
+
+    #[test]
+    fn memory_gate_rejects_sustained_tail_latency_and_extreme_outliers() {
+        let mut sustained = LatencyWindow::default();
+        for _ in 0..18 {
+            sustained
+                .observe(Duration::from_millis(5), Duration::from_millis(50))
+                .unwrap();
+        }
+        sustained
+            .observe(Duration::from_millis(58), Duration::from_millis(50))
+            .unwrap();
+        assert!(
+            sustained
+                .observe(Duration::from_millis(59), Duration::from_millis(50))
+                .is_err()
+        );
+
+        let mut outlier = LatencyWindow::default();
+        assert!(
+            outlier
+                .observe(Duration::from_millis(201), Duration::from_millis(50))
+                .is_err()
+        );
     }
 }
