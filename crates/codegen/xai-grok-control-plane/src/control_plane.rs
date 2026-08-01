@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -244,6 +244,33 @@ impl PlanStore {
         Ok(plans)
     }
 
+    fn stale_running_dispatches(
+        &self,
+        owner_epoch: &str,
+    ) -> Result<Vec<DispatchRecord>, ProtocolError> {
+        let _guard = self
+            .dispatch_lock
+            .lock()
+            .map_err(|_| internal_error("dispatch ledger lock is poisoned"))?;
+        let mut stale = Vec::new();
+        for entry in std::fs::read_dir(&self.dispatch_root).map_err(internal_error)? {
+            let entry = entry.map_err(internal_error)?;
+            if !entry.file_type().map_err(internal_error)?.is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let record: DispatchRecord =
+                serde_json::from_slice(&std::fs::read(entry.path()).map_err(internal_error)?)
+                    .map_err(internal_error)?;
+            if record.status == DispatchLedgerStatus::Running && record.owner_epoch != owner_epoch {
+                stale.push(record);
+            }
+        }
+        stale.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        Ok(stale)
+    }
+
     fn claim_dispatch(
         &self,
         dispatch: &ProviderDispatch,
@@ -383,6 +410,7 @@ enum DispatchLedgerStatus {
     Completed,
     Failed,
     Cancelled,
+    Lost,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -416,6 +444,8 @@ struct ControlPlaneCore {
     event_cache: Mutex<VecDeque<EventEnvelope>>,
     event_cache_capacity: usize,
     responses: Mutex<ResponseCache>,
+    dispatch_recovery: Mutex<()>,
+    dispatch_recovery_complete: AtomicBool,
     owner_epoch: String,
     auto_schedule_plans: bool,
     shutdown: CancellationToken,
@@ -1997,6 +2027,40 @@ impl ControlPlaneCore {
     }
 
     async fn resume_all_plans(self: &Arc<Self>) -> Result<(), ProtocolError> {
+        let _recovery_guard = self.dispatch_recovery.lock().await;
+        if !self.dispatch_recovery_complete.load(Ordering::Acquire) {
+            let plans = self.plans.clone();
+            let owner_epoch = self.owner_epoch.clone();
+            let stale =
+                tokio::task::spawn_blocking(move || plans.stale_running_dispatches(&owner_epoch))
+                    .await
+                    .map_err(|error| internal_error(error.to_string()))??;
+            for record in stale {
+                if self
+                    .projections
+                    .task_statuses(&record.engagement_id)
+                    .await
+                    .get(&record.task_id)
+                    != Some(&TaskStatus::Lost)
+                {
+                    self.emit(
+                        Some(record.engagement_id.clone()),
+                        Some(format!("recovery:{}", record.request_id)),
+                        0,
+                        Event::TaskStatus {
+                            task_id: record.task_id.clone(),
+                            status: TaskStatus::Lost,
+                            provider_id: Some(record.provider_id.clone()),
+                        },
+                    )
+                    .await?;
+                }
+                self.update_dispatch_status(record.request_id, DispatchLedgerStatus::Lost)
+                    .await?;
+            }
+            self.dispatch_recovery_complete
+                .store(true, Ordering::Release);
+        }
         if !self.auto_schedule_plans {
             return Ok(());
         }
@@ -2520,6 +2584,8 @@ impl ControlPlane {
             ),
             event_cache_capacity: config.event_capacity.max(1),
             responses: Mutex::new(ResponseCache::new(config.response_cache_capacity)),
+            dispatch_recovery: Mutex::new(()),
+            dispatch_recovery_complete: AtomicBool::new(false),
             owner_epoch: uuid::Uuid::new_v4().simple().to_string(),
             auto_schedule_plans: config.auto_schedule_plans,
             shutdown: CancellationToken::new(),
@@ -4380,5 +4446,177 @@ mod tests {
         assert_eq!(executions.load(Ordering::SeqCst), 1);
         handle.shutdown_token().cancel();
         control_plane.wait().await;
+    }
+
+    #[tokio::test]
+    async fn interrupted_dispatch_is_durably_lost_and_never_replayed_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let first_task_id = TaskId::from_string("interrupted-task");
+        let dependent_task_id = TaskId::from_string("dependent-task");
+        let engagement_id;
+
+        {
+            let mut config = ControlPlaneConfig::new(&state);
+            config.auto_schedule_plans = false;
+            let control_plane = ControlPlane::open(config).await.unwrap();
+            let handle = control_plane.handle();
+            let accepted = handle
+                .submit(envelope(Command::SubmitIngress(IngressEnvelope {
+                    command_id: CommandId::new(),
+                    source: IngressSource::Cli,
+                    source_event_id: "interrupted-dispatch-ingress".to_owned(),
+                    workspace_id: WorkspaceId::from_string("workspace"),
+                    exercise_id: None,
+                    operation_run_id: None,
+                    operator_session_id: None,
+                    session_id: "interrupted-session".to_owned(),
+                    prompt_id: "interrupted-prompt".to_owned(),
+                    request: "execute without replay after a crash".to_owned(),
+                    team: None,
+                    metadata: serde_json::Map::new(),
+                })))
+                .await
+                .unwrap()
+                .response
+                .unwrap();
+            let Response::Accepted {
+                engagement_id: accepted_id,
+                ..
+            } = accepted
+            else {
+                panic!("expected accepted engagement");
+            };
+            engagement_id = accepted_id;
+            let task = |task_id: TaskId, depends_on: Vec<TaskId>| ExecutionTask {
+                task_id,
+                objective: "execute".to_owned(),
+                mode: ExecutionMode::Deferred,
+                capability: CapabilityRequirement {
+                    operation_id: "test.execute".into(),
+                    preferred_provider: Some("test-provider".into()),
+                    required_features: Vec::new(),
+                },
+                input: serde_json::json!({}),
+                deadline_unix_ms: now_unix_ms() + 60_000,
+                completion_tests: Vec::new(),
+                depends_on,
+            };
+            let interrupted = task(first_task_id.clone(), Vec::new());
+            let plan = TaskingPlan {
+                engagement_id: engagement_id.clone(),
+                revision: 1,
+                objective: "recover interrupted graph".to_owned(),
+                tasks: vec![
+                    interrupted.clone(),
+                    task(dependent_task_id.clone(), vec![first_task_id.clone()]),
+                ],
+            };
+            handle
+                .submit(envelope(Command::SubmitPlan(plan)))
+                .await
+                .unwrap()
+                .response
+                .unwrap();
+            let dispatch = ProviderDispatch {
+                request_id: RequestId::from_string("interrupted-request"),
+                engagement_id: engagement_id.clone(),
+                plan_revision: 1,
+                task: interrupted,
+                provider_id: "test-provider".into(),
+                lease_epoch: 1,
+            };
+            assert!(matches!(
+                handle
+                    .core
+                    .plans
+                    .claim_dispatch(&dispatch, &handle.core.owner_epoch)
+                    .unwrap(),
+                DispatchClaim::New
+            ));
+            handle
+                .core
+                .emit(
+                    Some(engagement_id.clone()),
+                    Some("pre-crash-dispatch".to_owned()),
+                    1,
+                    Event::TaskStatus {
+                        task_id: first_task_id.clone(),
+                        status: TaskStatus::Running,
+                        provider_id: Some("test-provider".into()),
+                    },
+                )
+                .await
+                .unwrap();
+            handle.shutdown_token().cancel();
+            control_plane.wait().await;
+        }
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(&state))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        register_counting_provider(&handle, executions.clone()).await;
+
+        let graph = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = handle
+                    .submit(envelope(Command::QueryProjection(
+                        ProjectionQuery::TaskGraph {
+                            engagement_id: engagement_id.clone(),
+                        },
+                    )))
+                    .await
+                    .unwrap()
+                    .response
+                    .unwrap();
+                let Response::Projection(snapshot) = response else {
+                    panic!("expected task graph projection");
+                };
+                let graph: TaskGraphProjection = serde_json::from_value(snapshot.value).unwrap();
+                let interrupted = graph
+                    .tasks
+                    .iter()
+                    .find(|task| task.task.task_id == first_task_id)
+                    .unwrap();
+                let dependent = graph
+                    .tasks
+                    .iter()
+                    .find(|task| task.task.task_id == dependent_task_id)
+                    .unwrap();
+                if interrupted.status == TaskStatus::Lost
+                    && dependent.status == TaskStatus::Suspended
+                {
+                    break graph;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery must terminate the interrupted graph");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+
+        let reopened = ControlPlane::open(ControlPlaneConfig::new(&state))
+            .await
+            .unwrap();
+        let response = reopened
+            .handle()
+            .submit(envelope(Command::QueryProjection(
+                ProjectionQuery::TaskGraph { engagement_id },
+            )))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Projection(snapshot) = response else {
+            panic!("expected replayed task graph projection");
+        };
+        let replayed: TaskGraphProjection = serde_json::from_value(snapshot.value).unwrap();
+        assert_eq!(replayed, graph);
+        reopened.handle().shutdown_token().cancel();
+        reopened.wait().await;
     }
 }

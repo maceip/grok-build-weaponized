@@ -473,6 +473,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fts_keeps_numeric_identifier_under_repeated_text_pressure() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = test_index(&tmp);
+
+        for cycle in 0..64 {
+            let file_path = tmp.path().join(format!("cycle_{cycle}.md"));
+            std::fs::write(
+                &file_path,
+                format!("# Cycle {cycle}\n\nsoak-evidence-{cycle}: HTTP 200 and port 443 open."),
+            )
+            .unwrap();
+            idx.reindex_file(&file_path, "workspace").unwrap();
+        }
+
+        let config = MemorySearchConfig {
+            max_results: 8,
+            min_score: 0.0,
+            ..Default::default()
+        };
+        let results = hybrid_search(&idx, None, "soak-evidence-63", &config)
+            .await
+            .unwrap();
+
+        assert!(
+            results
+                .iter()
+                .any(|result| result.snippet.contains("soak-evidence-63")),
+            "the exact numeric identifier must not be crowded out by repeated lexical terms"
+        );
+    }
+
+    #[tokio::test]
     async fn test_hybrid_search_empty_index() {
         let tmp = TempDir::new().unwrap();
         let idx = test_index(&tmp);

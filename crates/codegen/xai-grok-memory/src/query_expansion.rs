@@ -159,9 +159,11 @@ static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 /// Extract meaningful keywords from a conversational query by removing stop words.
 ///
 /// Returns keywords in order of appearance, deduplicated. Words shorter than
-/// 2 characters and pure-numeric tokens are filtered out. The 2-char minimum
-/// preserves meaningful short terms like "go", "js", "ui", "db", "ai", "ml"
-/// while stop words handle the common 2-letter noise ("is", "it", "do", "we").
+/// 2 characters are filtered out. Numeric tokens of at least two characters
+/// are retained because they carry primary identity in operational memory:
+/// ports, status codes, CVE years, IP components, task suffixes, and versions.
+/// The 2-char minimum preserves meaningful short terms like "go", "js", "ui",
+/// "db", "ai", and "ml" while stop words handle common 2-letter noise.
 ///
 /// Returns an empty vec when all words are stop words or the query contains
 /// no meaningful content — the caller should fall back to vector search.
@@ -172,7 +174,6 @@ pub fn extract_keywords(query: &str) -> Vec<String> {
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|w| w.len() >= 2)
         .filter(|w| !STOP_WORDS.contains(w))
-        .filter(|w| !w.chars().all(|c| c.is_numeric()))
         .filter(|w| seen.insert(*w))
         .map(|w| w.to_string())
         .collect()
@@ -222,9 +223,9 @@ mod tests {
     }
 
     #[test]
-    fn test_filters_pure_numbers() {
+    fn test_preserves_operational_numbers() {
         let kw = extract_keywords("port 8080 and 443 config");
-        assert_eq!(kw, vec!["port", "config"]);
+        assert_eq!(kw, vec!["port", "8080", "443", "config"]);
     }
 
     #[test]
