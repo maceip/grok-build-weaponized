@@ -7,6 +7,7 @@
 
 pub mod agent_provider;
 pub mod artifact;
+mod completion;
 pub mod control_plane;
 pub mod journal;
 pub mod native_provider;

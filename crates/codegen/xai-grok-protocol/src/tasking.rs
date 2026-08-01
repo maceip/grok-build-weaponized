@@ -43,6 +43,176 @@ pub struct CompletionTest {
     pub mandatory: bool,
 }
 
+/// Bounded deterministic predicate language for provider-result admission.
+///
+/// `CompletionTest` retains its JSON value on the wire for protocol evolution;
+/// plans must parse that value into this enum before they can be admitted.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompletionPredicate {
+    JsonPointerExists {
+        pointer: String,
+    },
+    JsonPointerEquals {
+        pointer: String,
+        value: serde_json::Value,
+    },
+    ObservationCount {
+        minimum: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finding_contains: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum_confidence: Option<f32>,
+    },
+    ArtifactCount {
+        minimum: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_type: Option<String>,
+    },
+    All {
+        predicates: Vec<CompletionPredicate>,
+    },
+    Any {
+        predicates: Vec<CompletionPredicate>,
+    },
+    Not {
+        predicate: Box<CompletionPredicate>,
+    },
+}
+
+impl CompletionPredicate {
+    pub fn parse(value: &serde_json::Value) -> Result<Self, String> {
+        let predicate: Self = serde_json::from_value(value.clone())
+            .map_err(|error| format!("invalid completion predicate: {error}"))?;
+        let mut nodes = 0;
+        predicate.validate_at_depth(0, &mut nodes)?;
+        Ok(predicate)
+    }
+
+    fn validate_at_depth(&self, depth: usize, nodes: &mut usize) -> Result<(), String> {
+        const MAX_DEPTH: usize = 16;
+        const MAX_CHILDREN: usize = 64;
+        const MAX_NODES: usize = 1_024;
+        const MAX_EXPECTED_JSON_BYTES: usize = 64 * 1_024;
+        if depth > MAX_DEPTH {
+            return Err(format!(
+                "completion predicate nesting exceeds {MAX_DEPTH} levels"
+            ));
+        }
+        *nodes = nodes.saturating_add(1);
+        if *nodes > MAX_NODES {
+            return Err(format!(
+                "completion predicate contains more than {MAX_NODES} nodes"
+            ));
+        }
+        match self {
+            Self::JsonPointerExists { pointer } => validate_json_pointer(pointer),
+            Self::JsonPointerEquals { pointer, value } => {
+                validate_json_pointer(pointer)?;
+                let byte_size = serde_json::to_vec(value)
+                    .map_err(|error| format!("completion expected value is invalid: {error}"))?
+                    .len();
+                if byte_size > MAX_EXPECTED_JSON_BYTES {
+                    return Err(format!(
+                        "completion expected value is {byte_size} bytes; maximum is {MAX_EXPECTED_JSON_BYTES}"
+                    ));
+                }
+                Ok(())
+            }
+            Self::ObservationCount {
+                minimum,
+                finding_contains,
+                minimum_confidence,
+            } => {
+                if *minimum == 0 {
+                    return Err("observation_count minimum must be greater than zero".to_owned());
+                }
+                if let Some(needle) = finding_contains
+                    && (needle.trim().is_empty() || needle.len() > 4_096)
+                {
+                    return Err(
+                        "observation_count finding_contains must contain 1..=4096 bytes".to_owned(),
+                    );
+                }
+                if minimum_confidence.is_some_and(|value| {
+                    !value.is_finite() || !(0.0_f32..=1.0_f32).contains(&value)
+                }) {
+                    return Err(
+                        "observation_count minimum_confidence must be finite and within 0..=1"
+                            .to_owned(),
+                    );
+                }
+                Ok(())
+            }
+            Self::ArtifactCount {
+                minimum,
+                media_type,
+            } => {
+                if *minimum == 0 {
+                    return Err("artifact_count minimum must be greater than zero".to_owned());
+                }
+                if let Some(media_type) = media_type
+                    && (media_type.trim().is_empty() || media_type.len() > 255)
+                {
+                    return Err("artifact_count media_type must contain 1..=255 bytes".to_owned());
+                }
+                Ok(())
+            }
+            Self::All { predicates } | Self::Any { predicates } => {
+                if predicates.is_empty() || predicates.len() > MAX_CHILDREN {
+                    return Err(format!(
+                        "completion predicate groups must contain 1..={MAX_CHILDREN} children"
+                    ));
+                }
+                for predicate in predicates {
+                    predicate.validate_at_depth(depth + 1, nodes)?;
+                }
+                Ok(())
+            }
+            Self::Not { predicate } => predicate.validate_at_depth(depth + 1, nodes),
+        }
+    }
+}
+
+fn validate_json_pointer(pointer: &str) -> Result<(), String> {
+    if pointer.is_empty() || !pointer.starts_with('/') || pointer.len() > 4_096 {
+        return Err(
+            "completion JSON pointer must contain 1..=4096 bytes and start with '/'".into(),
+        );
+    }
+    // RFC 6901 permits only ~0 and ~1 escape sequences.
+    let bytes = pointer.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'~' {
+            let Some(escaped) = bytes.get(index + 1) else {
+                return Err("completion JSON pointer ends with an incomplete escape".to_owned());
+            };
+            if !matches!(escaped, b'0' | b'1') {
+                return Err("completion JSON pointer contains an invalid escape".to_owned());
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionTestResult {
+    pub description: String,
+    pub mandatory: bool,
+    pub passed: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCompletionProjection {
+    pub sequence: u64,
+    pub mandatory_passed: bool,
+    pub results: Vec<CompletionTestResult>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionTask {
     pub task_id: TaskId,
@@ -67,6 +237,8 @@ pub struct TaskingPlan {
 
 impl TaskingPlan {
     pub fn validate(&self) -> Result<(), String> {
+        const MAX_COMPLETION_TESTS_PER_TASK: usize = 64;
+        const MAX_COMPLETION_DESCRIPTION_BYTES: usize = 512;
         if self.objective.trim().is_empty() {
             return Err("plan objective must not be empty".to_owned());
         }
@@ -112,15 +284,28 @@ impl TaskingPlan {
                     task.task_id
                 ));
             }
-            if task
-                .completion_tests
-                .iter()
-                .any(|test| test.description.trim().is_empty())
-            {
+            if task.completion_tests.len() > MAX_COMPLETION_TESTS_PER_TASK {
                 return Err(format!(
-                    "task {} has an unnamed completion test",
+                    "task {} has more than {MAX_COMPLETION_TESTS_PER_TASK} completion tests",
                     task.task_id
                 ));
+            }
+            if task.completion_tests.iter().any(|test| {
+                test.description.trim().is_empty()
+                    || test.description.len() > MAX_COMPLETION_DESCRIPTION_BYTES
+            }) {
+                return Err(format!(
+                    "task {} has a completion test description outside 1..={MAX_COMPLETION_DESCRIPTION_BYTES} bytes",
+                    task.task_id
+                ));
+            }
+            for test in &task.completion_tests {
+                CompletionPredicate::parse(&test.predicate).map_err(|error| {
+                    format!(
+                        "task {} has an invalid completion test {:?}: {error}",
+                        task.task_id, test.description
+                    )
+                })?;
             }
         }
         let mut remaining_dependencies = self
@@ -212,6 +397,8 @@ pub struct TaskProjection {
     pub observations: Vec<TaskObservationProjection>,
     #[serde(default)]
     pub artifacts: Vec<TaskArtifactProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<TaskCompletionProjection>,
     pub last_sequence: u64,
 }
 
@@ -259,6 +446,32 @@ pub enum CompletionDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn task_with_completion_tests(completion_tests: Vec<CompletionTest>) -> ExecutionTask {
+        ExecutionTask {
+            task_id: "one".into(),
+            objective: "run".to_owned(),
+            mode: ExecutionMode::Deferred,
+            capability: CapabilityRequirement {
+                operation_id: "scan".into(),
+                preferred_provider: None,
+                required_features: Vec::new(),
+            },
+            input: serde_json::json!({}),
+            deadline_unix_ms: 1,
+            completion_tests,
+            depends_on: Vec::new(),
+        }
+    }
+
+    fn plan_with_completion_tests(completion_tests: Vec<CompletionTest>) -> TaskingPlan {
+        TaskingPlan {
+            engagement_id: "eng".into(),
+            revision: 1,
+            objective: "test".to_owned(),
+            tasks: vec![task_with_completion_tests(completion_tests)],
+        }
+    }
 
     #[test]
     fn plan_rejects_unknown_dependencies() {
@@ -310,5 +523,103 @@ mod tests {
             plan.validate().unwrap_err(),
             "task dependency graph contains a cycle"
         );
+    }
+
+    #[test]
+    fn plan_accepts_nested_bounded_completion_predicates() {
+        let plan = plan_with_completion_tests(vec![CompletionTest {
+            description: "successful output and retained evidence".to_owned(),
+            mandatory: true,
+            predicate: serde_json::json!({
+                "op":"all",
+                "predicates":[
+                    {
+                        "op":"json_pointer_equals",
+                        "pointer":"/status~1code",
+                        "value":200
+                    },
+                    {
+                        "op":"any",
+                        "predicates":[
+                            {"op":"observation_count","minimum":1},
+                            {"op":"artifact_count","minimum":1,"media_type":"application/xml"}
+                        ]
+                    }
+                ]
+            }),
+        }]);
+        plan.validate().unwrap();
+    }
+
+    #[test]
+    fn plan_rejects_malformed_or_unbounded_completion_predicates() {
+        for predicate in [
+            serde_json::json!({"op":"json_pointer_exists","pointer":"not-a-pointer"}),
+            serde_json::json!({"op":"json_pointer_exists","pointer":"/bad~2escape"}),
+            serde_json::json!({"op":"observation_count","minimum":0}),
+            serde_json::json!({"op":"all","predicates":[]}),
+        ] {
+            let plan = plan_with_completion_tests(vec![CompletionTest {
+                description: "invalid".to_owned(),
+                mandatory: true,
+                predicate,
+            }]);
+            assert!(plan.validate().is_err());
+        }
+
+        let mut predicate = serde_json::json!({
+            "op":"json_pointer_exists",
+            "pointer":"/value"
+        });
+        for _ in 0..17 {
+            predicate = serde_json::json!({"op":"not","predicate":predicate});
+        }
+        let plan = plan_with_completion_tests(vec![CompletionTest {
+            description: "too deep".to_owned(),
+            mandatory: true,
+            predicate,
+        }]);
+        assert!(plan.validate().is_err());
+
+        let tests = (0..65)
+            .map(|index| CompletionTest {
+                description: format!("criterion {index}"),
+                mandatory: false,
+                predicate: serde_json::json!({
+                    "op":"json_pointer_exists",
+                    "pointer":"/value"
+                }),
+            })
+            .collect();
+        assert!(plan_with_completion_tests(tests).validate().is_err());
+
+        let plan = plan_with_completion_tests(vec![CompletionTest {
+            description: "oversized expected JSON".to_owned(),
+            mandatory: true,
+            predicate: serde_json::json!({
+                "op":"json_pointer_equals",
+                "pointer":"/value",
+                "value":"x".repeat(65 * 1024)
+            }),
+        }]);
+        assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn older_task_projection_defaults_completion_to_none() {
+        let projection = TaskProjection {
+            task: task_with_completion_tests(Vec::new()),
+            status: TaskStatus::Prepared,
+            provider_id: None,
+            execution: None,
+            observations: Vec::new(),
+            artifacts: Vec::new(),
+            completion: None,
+            last_sequence: 1,
+        };
+        let mut serialized = serde_json::to_value(&projection).unwrap();
+        serialized.as_object_mut().unwrap().remove("completion");
+        let replayed: TaskProjection = serde_json::from_value(serialized).unwrap();
+        assert_eq!(replayed.completion, None);
     }
 }

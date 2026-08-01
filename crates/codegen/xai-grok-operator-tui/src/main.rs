@@ -635,7 +635,7 @@ impl App {
                         task.engagement_id == graph.engagement_id
                             && task.task_id == node.task.task_id
                     });
-                    ListItem::new(Line::from(vec![
+                    let mut spans = vec![
                         Span::styled(
                             if selected { " ▶ " } else { "   " },
                             Style::default()
@@ -670,8 +670,36 @@ impl App {
                             node.task.objective.clone(),
                             Style::default().fg(color(ON_SURFACE_VARIANT)),
                         ),
-                    ]))
-                    .style(if selected {
+                    ];
+                    if let Some(completion) = &node.completion {
+                        let passed = completion
+                            .results
+                            .iter()
+                            .filter(|result| result.passed)
+                            .count();
+                        let completion_tone = if completion.mandatory_passed {
+                            SemanticTone::Live
+                        } else {
+                            SemanticTone::Error
+                        };
+                        spans.push(Span::styled(
+                            format!(
+                                "  CHECK {}/{} {} ",
+                                passed,
+                                completion.results.len(),
+                                if completion.mandatory_passed {
+                                    "PASS"
+                                } else {
+                                    "FAIL"
+                                }
+                            ),
+                            Style::default()
+                                .fg(tone_color(completion_tone))
+                                .bg(color(SURFACE_LOW))
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    ListItem::new(Line::from(spans)).style(if selected {
                         Style::default().bg(color(SURFACE)).fg(color(ON_SURFACE))
                     } else {
                         Style::default().bg(color(OBSIDIAN)).fg(color(ON_SURFACE))

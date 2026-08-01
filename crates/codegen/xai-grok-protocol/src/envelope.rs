@@ -14,7 +14,7 @@ use crate::{
 
 /// Protocol v8 adds durable chunked artifact ingestion. It is
 /// not wire-compatible with older clients.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +361,11 @@ pub enum Event {
         task_id: TaskId,
         artifact_id: crate::ArtifactId,
     },
+    CompletionEvaluated {
+        task_id: TaskId,
+        mandatory_passed: bool,
+        results: Vec<crate::CompletionTestResult>,
+    },
     Overload {
         component: String,
         queue_depth: u32,
@@ -444,9 +449,9 @@ mod tests {
     }
 
     #[test]
-    fn older_versions_are_rejected_after_exercise_upgrade() {
+    fn older_protocol_versions_are_rejected() {
         let envelope = CommandEnvelope {
-            protocol_version: 2,
+            protocol_version: PROTOCOL_VERSION - 1,
             command_id: CommandId::new(),
             causation_id: None,
             deadline_unix_ms: 20,

@@ -24,6 +24,7 @@ use xai_grok_protocol::{
 use crate::SERVER_NAME;
 use crate::agent_provider::AGENT_TURN_OPERATION;
 use crate::artifact::{ArtifactDescriptor, ArtifactStore, ArtifactStoreConfig};
+use crate::completion::evaluate_completion_tests;
 use crate::journal::{EventJournal, JournalError};
 use crate::projection::ProjectionStore;
 use crate::provider::{
@@ -1972,6 +1973,7 @@ impl ControlPlaneCore {
             let request_id = dispatch.request_id.clone();
             let plan_revision = dispatch.plan_revision;
             let generation = dispatch.lease_epoch;
+            let completion_tests = dispatch.task.completion_tests.clone();
             if let Err(error) = core
                 .emit(
                     Some(engagement_id.clone()),
@@ -2008,18 +2010,48 @@ impl ControlPlaneCore {
             if !cancelled {
                 match dispatch_result {
                     Ok(output) => {
+                        let completion = evaluate_completion_tests(
+                            &completion_tests,
+                            &output.output,
+                            &output.observations,
+                            &output.artifacts,
+                        );
+                        let completion_passed =
+                            completion.mandatory_passed && completion.contract_valid;
                         let provider_status = output
                             .terminal_status
                             .map_or(TaskStatus::Completed, |status| status.task_status());
-                        let recorded = core
-                            .record_provider_output(
+                        let provider_status =
+                            if provider_status == TaskStatus::Completed && !completion_passed {
+                                TaskStatus::Failed
+                            } else {
+                                provider_status
+                            };
+                        let recorded = async {
+                            core.record_provider_output(
                                 engagement_id.clone(),
                                 task_id.clone(),
                                 generation,
                                 causation_id.clone(),
                                 output,
                             )
-                            .await;
+                            .await?;
+                            if !completion_tests.is_empty() {
+                                core.emit(
+                                    Some(engagement_id.clone()),
+                                    causation_id.clone(),
+                                    generation,
+                                    Event::CompletionEvaluated {
+                                        task_id: task_id.clone(),
+                                        mandatory_passed: completion_passed,
+                                        results: completion.results,
+                                    },
+                                )
+                                .await?;
+                            }
+                            Ok::<(), ProtocolError>(())
+                        }
+                        .await;
                         let status = recorded
                             .as_ref()
                             .map_or(TaskStatus::Failed, |_| provider_status);
@@ -3866,7 +3898,13 @@ mod tests {
                     .unwrap()
             })
         };
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.core.events.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("event reader did not subscribe");
         handle
             .submit(envelope(Command::SubmitIngress(IngressEnvelope {
                 command_id: CommandId::new(),
@@ -3914,7 +3952,13 @@ mod tests {
                     .unwrap()
             })
         };
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.core.events.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("filtered event reader did not subscribe");
         handle
             .submit(envelope(Command::SubmitIngress(IngressEnvelope {
                 command_id: CommandId::new(),
@@ -4570,6 +4614,247 @@ mod tests {
             panic!("expected replayed task graph projection");
         };
         let replayed: TaskGraphProjection = serde_json::from_value(snapshot.value).unwrap();
+        assert_eq!(replayed, graph);
+        reopened.handle().shutdown_token().cancel();
+        reopened.wait().await;
+    }
+
+    #[tokio::test]
+    async fn completion_contract_controls_terminal_status_dependencies_and_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        let mandatory_id = TaskId::from_string("mandatory-criterion");
+        let dependent_id = TaskId::from_string("dependent-work");
+        let optional_id = TaskId::from_string("optional-criterion");
+        let executions = Arc::new(StdMutex::new(Vec::<TaskId>::new()));
+        handle
+            .register_provider(Arc::new(FunctionProvider::new(
+                provider_manifest(),
+                {
+                    let executions = executions.clone();
+                    let mandatory_id = mandatory_id.clone();
+                    move |dispatch| {
+                        let executions = executions.clone();
+                        let mandatory_id = mandatory_id.clone();
+                        async move {
+                            executions
+                                .lock()
+                                .unwrap()
+                                .push(dispatch.task.task_id.clone());
+                            if dispatch.task.task_id == mandatory_id {
+                                Ok(ProviderOutput {
+                                    output: serde_json::json!({
+                                        "exit_code": 7,
+                                        "status": "process_exited"
+                                    }),
+                                    observations: vec![EvidenceObservation {
+                                        finding: "tcp/443 is open: nginx".to_owned(),
+                                        confidence: 0.96,
+                                        artifact_id: None,
+                                        attributes: serde_json::Map::new(),
+                                    }],
+                                    artifacts: vec![ProviderArtifact::inline(
+                                        "application/xml",
+                                        b"<scan><port protocol=\"tcp\" portid=\"443\"/></scan>"
+                                            .to_vec(),
+                                    )],
+                                    ..ProviderOutput::default()
+                                })
+                            } else {
+                                Ok(ProviderOutput {
+                                    output: serde_json::json!({"ok": true}),
+                                    ..ProviderOutput::default()
+                                })
+                            }
+                        }
+                    }
+                },
+                |_| async { Ok(()) },
+            )))
+            .await
+            .unwrap();
+
+        let accepted = handle
+            .submit(envelope(Command::SubmitIngress(IngressEnvelope {
+                command_id: CommandId::new(),
+                source: IngressSource::Cli,
+                source_event_id: "completion-contract-ingress".to_owned(),
+                workspace_id: WorkspaceId::from_string("workspace"),
+                exercise_id: None,
+                operation_run_id: None,
+                operator_session_id: None,
+                session_id: "completion-contract-session".to_owned(),
+                prompt_id: "completion-contract-prompt".to_owned(),
+                request: "run the completion contract plan".to_owned(),
+                team: None,
+                metadata: serde_json::Map::new(),
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Accepted { engagement_id, .. } = accepted else {
+            panic!("expected accepted ingress");
+        };
+
+        let task = |task_id: TaskId,
+                    completion_tests: Vec<xai_grok_protocol::CompletionTest>,
+                    depends_on: Vec<TaskId>| ExecutionTask {
+            task_id,
+            objective: "execute and verify".to_owned(),
+            mode: ExecutionMode::Deferred,
+            capability: CapabilityRequirement {
+                operation_id: "test.execute".into(),
+                preferred_provider: Some("test-provider".into()),
+                required_features: Vec::new(),
+            },
+            input: serde_json::json!({}),
+            deadline_unix_ms: now_unix_ms() + 10_000,
+            completion_tests,
+            depends_on,
+        };
+        let completion_test = |description: &str, mandatory: bool, predicate: serde_json::Value| {
+            xai_grok_protocol::CompletionTest {
+                description: description.to_owned(),
+                predicate,
+                mandatory,
+            }
+        };
+        handle
+            .submit(envelope(Command::SubmitPlan(TaskingPlan {
+                engagement_id: engagement_id.clone(),
+                revision: 2,
+                objective: "durably enforce completion criteria".to_owned(),
+                tasks: vec![
+                    task(
+                        mandatory_id.clone(),
+                        vec![
+                            completion_test(
+                                "process exits successfully",
+                                true,
+                                serde_json::json!({
+                                    "op":"json_pointer_equals",
+                                    "pointer":"/exit_code",
+                                    "value":0
+                                }),
+                            ),
+                            completion_test(
+                                "XML evidence is retained",
+                                false,
+                                serde_json::json!({
+                                    "op":"artifact_count",
+                                    "minimum":1,
+                                    "media_type":"application/xml"
+                                }),
+                            ),
+                        ],
+                        Vec::new(),
+                    ),
+                    task(dependent_id.clone(), Vec::new(), vec![mandatory_id.clone()]),
+                    task(
+                        optional_id.clone(),
+                        vec![completion_test(
+                            "optional service banner is present",
+                            false,
+                            serde_json::json!({
+                                "op":"json_pointer_exists",
+                                "pointer":"/service_banner"
+                            }),
+                        )],
+                        Vec::new(),
+                    ),
+                ],
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+
+        let graph = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let graph = task_graph(&handle, engagement_id.clone()).await;
+                let status = |task_id: &TaskId| {
+                    graph
+                        .tasks
+                        .iter()
+                        .find(|task| task.task.task_id == *task_id)
+                        .map(|task| task.status)
+                };
+                if status(&mandatory_id) == Some(TaskStatus::Failed)
+                    && status(&dependent_id) == Some(TaskStatus::Suspended)
+                    && status(&optional_id) == Some(TaskStatus::Completed)
+                {
+                    break graph;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completion results did not reach durable terminal projections");
+
+        let mandatory = graph
+            .tasks
+            .iter()
+            .find(|task| task.task.task_id == mandatory_id)
+            .unwrap();
+        assert_eq!(mandatory.status, TaskStatus::Failed);
+        assert_eq!(mandatory.observations.len(), 1);
+        assert_eq!(mandatory.artifacts.len(), 2);
+        assert!(mandatory.artifacts.iter().any(|artifact| {
+            artifact.media_type == "application/xml" && !artifact.provider_output
+        }));
+        let mandatory_completion = mandatory.completion.as_ref().unwrap();
+        assert!(!mandatory_completion.mandatory_passed);
+        assert_eq!(mandatory_completion.results.len(), 2);
+        assert!(!mandatory_completion.results[0].passed);
+        assert!(mandatory_completion.results[1].passed);
+
+        let dependent = graph
+            .tasks
+            .iter()
+            .find(|task| task.task.task_id == dependent_id)
+            .unwrap();
+        assert_eq!(dependent.status, TaskStatus::Suspended);
+        assert!(dependent.execution.is_none());
+        assert!(dependent.completion.is_none());
+
+        let optional = graph
+            .tasks
+            .iter()
+            .find(|task| task.task.task_id == optional_id)
+            .unwrap();
+        assert_eq!(optional.status, TaskStatus::Completed);
+        let optional_completion = optional.completion.as_ref().unwrap();
+        assert!(optional_completion.mandatory_passed);
+        assert_eq!(optional_completion.results.len(), 1);
+        assert!(!optional_completion.results[0].passed);
+
+        let executed = executions.lock().unwrap().clone();
+        assert_eq!(executed.len(), 2);
+        assert!(executed.contains(&mandatory_id));
+        assert!(executed.contains(&optional_id));
+        assert!(!executed.contains(&dependent_id));
+
+        let events = all_events(&handle).await;
+        let completion_events = events
+            .iter()
+            .filter(|event| {
+                event.engagement_id.as_ref() == Some(&engagement_id)
+                    && matches!(event.event, Event::CompletionEvaluated { .. })
+            })
+            .count();
+        assert_eq!(completion_events, 2);
+
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+
+        let reopened = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
+            .await
+            .unwrap();
+        let replayed = task_graph(&reopened.handle(), engagement_id).await;
         assert_eq!(replayed, graph);
         reopened.handle().shutdown_token().cancel();
         reopened.wait().await;

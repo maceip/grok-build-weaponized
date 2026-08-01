@@ -152,6 +152,15 @@ pub mod theme {
                 ServiceHealth::Stopped | ServiceHealth::Failed => SemanticTone::Error,
             },
             Event::Overload { .. } => SemanticTone::Error,
+            Event::CompletionEvaluated {
+                mandatory_passed, ..
+            } => {
+                if *mandatory_passed {
+                    SemanticTone::Live
+                } else {
+                    SemanticTone::Error
+                }
+            }
             Event::Observation { .. }
             | Event::EvidenceRecorded { .. }
             | Event::ProviderOutput { .. }
@@ -888,6 +897,7 @@ async fn client_loop(
                                         ..
                                     }
                                     | xai_grok_protocol::Event::ProviderOutput { .. }
+                                    | xai_grok_protocol::Event::CompletionEvaluated { .. }
                             )
                             .then(|| event.engagement_id.clone())
                             .flatten()
@@ -1212,6 +1222,7 @@ pub fn event_name(event: &EventEnvelope) -> &'static str {
         xai_grok_protocol::Event::ProviderState { .. } => "provider state",
         xai_grok_protocol::Event::ArtifactAvailable { .. } => "artifact available",
         xai_grok_protocol::Event::ProviderOutput { .. } => "provider output",
+        xai_grok_protocol::Event::CompletionEvaluated { .. } => "completion evaluated",
         xai_grok_protocol::Event::Overload { .. } => "overload",
     }
 }
@@ -1243,6 +1254,20 @@ pub fn event_summary(event: &EventEnvelope) -> String {
             "task {} produced {}",
             task_id.as_str(),
             artifact_id.as_str()
+        ),
+        xai_grok_protocol::Event::CompletionEvaluated {
+            task_id,
+            mandatory_passed,
+            results,
+        } => format!(
+            "task {} completion {} ({} criteria)",
+            task_id.as_str(),
+            if *mandatory_passed {
+                "passed"
+            } else {
+                "failed"
+            },
+            results.len()
         ),
         xai_grok_protocol::Event::ArtifactAvailable {
             artifact_id,
@@ -1443,6 +1468,7 @@ mod tests {
                     execution: Some(receipt("active", "active")),
                     observations: Vec::new(),
                     artifacts: Vec::new(),
+                    completion: None,
                     last_sequence: 4,
                 },
                 TaskProjection {
@@ -1452,6 +1478,7 @@ mod tests {
                     execution: Some(receipt("terminal", "terminal")),
                     observations: Vec::new(),
                     artifacts: Vec::new(),
+                    completion: None,
                     last_sequence: 5,
                 },
                 TaskProjection {
@@ -1461,6 +1488,7 @@ mod tests {
                     execution: Some(receipt("mismatch", "different-task")),
                     observations: Vec::new(),
                     artifacts: Vec::new(),
+                    completion: None,
                     last_sequence: 6,
                 },
             ],

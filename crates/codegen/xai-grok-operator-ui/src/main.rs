@@ -469,6 +469,59 @@ impl OperatorApp {
                                 .color(theme::color(GOLD)),
                             );
                         }
+                        if let Some(completion) = &node.completion {
+                            let completion_tone = if completion.mandatory_passed {
+                                SemanticTone::Live
+                            } else {
+                                SemanticTone::Error
+                            };
+                            let passed = completion
+                                .results
+                                .iter()
+                                .filter(|result| result.passed)
+                                .count();
+                            ui.horizontal_wrapped(|ui| {
+                                theme::status_chip(
+                                    ui,
+                                    if completion.mandatory_passed {
+                                        "completion passed"
+                                    } else {
+                                        "completion failed"
+                                    },
+                                    completion_tone,
+                                );
+                                ui.monospace(format!(
+                                    "{} / {} CRITERIA",
+                                    passed,
+                                    completion.results.len()
+                                ));
+                            });
+                            for result in &completion.results {
+                                let result_tone = if result.passed {
+                                    SemanticTone::Live
+                                } else if result.mandatory {
+                                    SemanticTone::Error
+                                } else {
+                                    SemanticTone::Interrupt
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} {} [{}] — {}",
+                                        if result.passed { "✓" } else { "✗" },
+                                        result.description,
+                                        if result.mandatory {
+                                            "required"
+                                        } else {
+                                            "optional"
+                                        },
+                                        result.detail
+                                    ))
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(theme::color(shared_theme::tone_rgb(result_tone))),
+                                );
+                            }
+                        }
                     });
                 }
             });

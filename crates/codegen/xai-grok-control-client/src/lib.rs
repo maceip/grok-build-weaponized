@@ -338,6 +338,9 @@ fn event_reference(envelope: &xai_grok_protocol::EventEnvelope) -> SourceEventRe
             Some(task_id.clone()),
             Some(artifact_id.clone()),
         ),
+        Event::CompletionEvaluated { task_id, .. } => {
+            ("completion_evaluated", Some(task_id.clone()), None)
+        }
         Event::Overload { .. } => ("overload", None, None),
     };
     SourceEventReference {

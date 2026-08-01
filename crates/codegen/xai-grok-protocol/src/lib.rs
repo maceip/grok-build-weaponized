@@ -55,8 +55,9 @@ pub use provider_worker::{
     ProviderWorkerResponse,
 };
 pub use tasking::{
-    CapabilityRequirement, CompletionDecision, CompletionTest, EvidenceObservation, ExecutionMode,
-    ExecutionTask, ProviderDispatch, TaskArtifactProjection, TaskGraphProjection,
+    CapabilityRequirement, CompletionDecision, CompletionPredicate, CompletionTest,
+    CompletionTestResult, EvidenceObservation, ExecutionMode, ExecutionTask, ProviderDispatch,
+    TaskArtifactProjection, TaskCompletionProjection, TaskGraphProjection,
     TaskObservationProjection, TaskProjection, TaskStatus, TaskingPlan,
 };
 pub use team::{

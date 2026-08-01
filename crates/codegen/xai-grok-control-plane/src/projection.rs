@@ -234,6 +234,7 @@ impl ProjectionStore {
                                         .map_or_else(Vec::new, |node| node.observations.clone()),
                                     artifacts: previous
                                         .map_or_else(Vec::new, |node| node.artifacts.clone()),
+                                    completion: previous.and_then(|node| node.completion.clone()),
                                     last_sequence: envelope.sequence,
                                 }
                             })
@@ -375,6 +376,31 @@ impl ProjectionStore {
                             {
                                 artifact.provider_output = true;
                             }
+                            node.last_sequence = envelope.sequence;
+                        }
+                        graph.last_sequence = envelope.sequence;
+                    }
+                }
+            }
+            Event::CompletionEvaluated {
+                task_id,
+                mandatory_passed,
+                results,
+            } => {
+                if let Some(engagement_id) = &envelope.engagement_id {
+                    let projection = engagement(&mut state, engagement_id);
+                    projection.last_sequence = envelope.sequence;
+                    if let Some(graph) = state.task_graphs.get_mut(engagement_id) {
+                        if let Some(node) = graph
+                            .tasks
+                            .iter_mut()
+                            .find(|node| node.task.task_id == *task_id)
+                        {
+                            node.completion = Some(xai_grok_protocol::TaskCompletionProjection {
+                                sequence: envelope.sequence,
+                                mandatory_passed: *mandatory_passed,
+                                results: results.clone(),
+                            });
                             node.last_sequence = envelope.sequence;
                         }
                         graph.last_sequence = envelope.sequence;
