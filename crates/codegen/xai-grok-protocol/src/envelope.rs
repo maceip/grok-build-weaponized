@@ -335,6 +335,10 @@ pub enum Event {
         task_id: TaskId,
         status: crate::TaskStatus,
         provider_id: Option<ProviderId>,
+        /// Present when a provider dispatch is first durably admitted. Later
+        /// status events omit it; projections retain the admitted receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution: Option<crate::ExecutionReceipt>,
     },
     Observation {
         task_id: TaskId,
@@ -408,6 +412,21 @@ pub struct ProjectionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_status_from_an_older_journal_defaults_the_execution_receipt() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "event": "task_status",
+            "task_id": "task-1",
+            "status": "running",
+            "provider_id": "provider-1"
+        }))
+        .unwrap();
+        let Event::TaskStatus { execution, .. } = event else {
+            panic!("expected task status event");
+        };
+        assert!(execution.is_none());
+    }
 
     #[test]
     fn envelope_rejects_expired_deadline() {

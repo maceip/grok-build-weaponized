@@ -229,6 +229,7 @@ impl ProjectionStore {
                                     status: previous
                                         .map_or(TaskStatus::Prepared, |node| node.status),
                                     provider_id: previous.and_then(|node| node.provider_id.clone()),
+                                    execution: previous.and_then(|node| node.execution.clone()),
                                     observations: previous
                                         .map_or_else(Vec::new, |node| node.observations.clone()),
                                     artifacts: previous
@@ -261,6 +262,7 @@ impl ProjectionStore {
                 task_id,
                 status,
                 provider_id,
+                execution,
             } => {
                 if let Some(engagement_id) = &envelope.engagement_id {
                     let projection = engagement(&mut state, engagement_id);
@@ -273,7 +275,12 @@ impl ProjectionStore {
                             .find(|node| node.task.task_id == *task_id)
                     }) {
                         node.status = *status;
-                        node.provider_id.clone_from(provider_id);
+                        if provider_id.is_some() {
+                            node.provider_id.clone_from(provider_id);
+                        }
+                        if execution.is_some() {
+                            node.execution.clone_from(execution);
+                        }
                         node.last_sequence = envelope.sequence;
                     }
                     if let Some(graph) = state.task_graphs.get_mut(engagement_id) {

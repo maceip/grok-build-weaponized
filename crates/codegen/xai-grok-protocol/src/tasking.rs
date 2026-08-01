@@ -203,6 +203,11 @@ pub struct TaskProjection {
     pub task: ExecutionTask,
     pub status: TaskStatus,
     pub provider_id: Option<ProviderId>,
+    /// Durable mode-specific dispatch identity. This is populated once the
+    /// task is admitted to a provider and retained through terminal status
+    /// changes so a new client can reattach or cancel after reconnecting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<crate::ExecutionReceipt>,
     #[serde(default)]
     pub observations: Vec<TaskObservationProjection>,
     #[serde(default)]

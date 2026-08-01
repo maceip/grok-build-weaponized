@@ -1,11 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xai_grok_engagement::{
     ControlCommandClaim, EngagementCheckpoint, EngagementCoordinator, NewEngagement, QueuePriority,
@@ -305,13 +305,14 @@ impl PlanStore {
                     ),
                 ));
             }
-            return Ok(DispatchClaim::Existing(record));
+            return Ok(DispatchClaim::Existing(Box::new(record)));
         }
         let record = DispatchRecord {
             request_id: dispatch.request_id.clone(),
             engagement_id: dispatch.engagement_id.clone(),
             task_id: dispatch.task.task_id.clone(),
             provider_id: dispatch.provider_id.clone(),
+            execution: Some(ExecutionReceipt::from_dispatch(dispatch)),
             dispatch_hash,
             owner_epoch: owner_epoch.to_owned(),
             status: DispatchLedgerStatus::Running,
@@ -346,6 +347,24 @@ impl PlanStore {
         record.status = status;
         record.updated_unix_ms = now_unix_ms();
         self.write_dispatch(&path, &record, false)
+    }
+
+    fn dispatch_status(
+        &self,
+        request_id: &xai_grok_protocol::RequestId,
+    ) -> Result<Option<DispatchLedgerStatus>, ProtocolError> {
+        let _guard = self
+            .dispatch_lock
+            .lock()
+            .map_err(|_| internal_error("dispatch ledger lock is poisoned"))?;
+        let path = self.dispatch_path(request_id);
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice::<DispatchRecord>(&bytes)
+                .map(|record| Some(record.status))
+                .map_err(internal_error),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(internal_error(error)),
+        }
     }
 
     fn release_unstarted(
@@ -419,6 +438,8 @@ struct DispatchRecord {
     engagement_id: EngagementId,
     task_id: xai_grok_protocol::TaskId,
     provider_id: ProviderId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution: Option<ExecutionReceipt>,
     dispatch_hash: String,
     owner_epoch: String,
     status: DispatchLedgerStatus,
@@ -427,7 +448,42 @@ struct DispatchRecord {
 
 enum DispatchClaim {
     New,
-    Existing(DispatchRecord),
+    Existing(Box<DispatchRecord>),
+}
+
+const CANCELLATION_PENDING: u8 = 0;
+const CANCELLATION_CONFIRMED: u8 = 1;
+const CANCELLATION_REJECTED: u8 = 2;
+
+struct CancellationIntent {
+    outcome: AtomicU8,
+    changed: Notify,
+}
+
+impl CancellationIntent {
+    fn pending() -> Self {
+        Self {
+            outcome: AtomicU8::new(CANCELLATION_PENDING),
+            changed: Notify::new(),
+        }
+    }
+
+    fn resolve(&self, outcome: u8) {
+        self.outcome.store(outcome, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    async fn confirmed(&self) -> bool {
+        loop {
+            let changed = self.changed.notified();
+            match self.outcome.load(Ordering::Acquire) {
+                CANCELLATION_PENDING => changed.await,
+                CANCELLATION_CONFIRMED => return true,
+                CANCELLATION_REJECTED => return false,
+                _ => unreachable!("cancellation intent has an invalid outcome"),
+            }
+        }
+    }
 }
 
 struct ControlPlaneCore {
@@ -446,6 +502,7 @@ struct ControlPlaneCore {
     responses: Mutex<ResponseCache>,
     dispatch_recovery: Mutex<()>,
     dispatch_recovery_complete: AtomicBool,
+    cancellation_intents: Mutex<HashMap<xai_grok_protocol::RequestId, Arc<CancellationIntent>>>,
     owner_epoch: String,
     auto_schedule_plans: bool,
     shutdown: CancellationToken,
@@ -1411,6 +1468,7 @@ impl ControlPlaneCore {
                                 task_id: plan.tasks[0].task_id.clone(),
                                 status: TaskStatus::Prepared,
                                 provider_id: None,
+                                execution: None,
                             },
                         )
                         .await?;
@@ -1467,6 +1525,7 @@ impl ControlPlaneCore {
                                 task_id: task.task_id.clone(),
                                 status: TaskStatus::Prepared,
                                 provider_id: None,
+                                execution: None,
                             },
                         )
                         .await?;
@@ -1536,12 +1595,16 @@ impl ControlPlaneCore {
                 .map_err(|error| internal_error(error.to_string()))??;
                 if let DispatchClaim::Existing(record) = claim {
                     dispatch.provider_id = record.provider_id.clone();
+                    let receipt = record
+                        .execution
+                        .unwrap_or_else(|| ExecutionReceipt::from_dispatch(&dispatch));
                     return Ok(Response::DispatchAccepted {
                         request_id: record.request_id,
                         provider_id: record.provider_id,
-                        receipt: ExecutionReceipt::from_dispatch(&dispatch),
+                        receipt,
                     });
                 }
+                let receipt = ExecutionReceipt::from_dispatch(&dispatch);
                 if let Err(error) = self
                     .emit(
                         Some(dispatch.engagement_id.clone()),
@@ -1551,6 +1614,7 @@ impl ControlPlaneCore {
                             task_id: dispatch.task.task_id.clone(),
                             status: TaskStatus::Dispatched,
                             provider_id: Some(provider_id.clone()),
+                            execution: Some(receipt.clone()),
                         },
                     )
                     .await
@@ -1564,7 +1628,6 @@ impl ControlPlaneCore {
                     .await;
                     return Err(error);
                 }
-                let receipt = ExecutionReceipt::from_dispatch(&dispatch);
                 self.spawn_dispatch(dispatch, causation_id);
                 Ok(Response::DispatchAccepted {
                     request_id,
@@ -1577,20 +1640,47 @@ impl ControlPlaneCore {
                 task_id,
                 request_id,
             } => {
-                self.providers.cancel(&request_id).await?;
-                self.update_dispatch_status(request_id.clone(), DispatchLedgerStatus::Cancelled)
+                let intent = Arc::new(CancellationIntent::pending());
+                {
+                    let mut intents = self.cancellation_intents.lock().await;
+                    if intents.contains_key(&request_id) {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::Conflict,
+                            format!("request {request_id} already has a cancellation in progress"),
+                        ));
+                    }
+                    intents.insert(request_id.clone(), intent.clone());
+                }
+                if let Err(error) = self.providers.cancel(&request_id).await {
+                    intent.resolve(CANCELLATION_REJECTED);
+                    self.cancellation_intents.lock().await.remove(&request_id);
+                    return Err(error);
+                }
+                let persisted = async {
+                    self.update_dispatch_status(
+                        request_id.clone(),
+                        DispatchLedgerStatus::Cancelled,
+                    )
                     .await?;
-                self.emit(
-                    Some(engagement_id),
-                    causation_id,
-                    0,
-                    Event::TaskStatus {
-                        task_id,
-                        status: TaskStatus::Cancelled,
-                        provider_id: None,
-                    },
-                )
-                .await?;
+                    self.emit(
+                        Some(engagement_id),
+                        causation_id,
+                        0,
+                        Event::TaskStatus {
+                            task_id,
+                            status: TaskStatus::Cancelled,
+                            provider_id: None,
+                            execution: None,
+                        },
+                    )
+                    .await?;
+                    Ok::<(), ProtocolError>(())
+                }
+                .await;
+                // Once the provider acknowledges cancellation, its late output
+                // must be fenced even if persisting the terminal event fails.
+                intent.resolve(CANCELLATION_CONFIRMED);
+                persisted?;
                 Ok(Response::Ack)
             }
             Command::RegisterProvider { manifest } => {
@@ -1891,6 +1981,7 @@ impl ControlPlaneCore {
                         task_id: task_id.clone(),
                         status: TaskStatus::Running,
                         provider_id: Some(provider_id.clone()),
+                        execution: None,
                     },
                 )
                 .await
@@ -1904,89 +1995,104 @@ impl ControlPlaneCore {
                 .await;
                 return;
             }
-            match core.providers.dispatch(dispatch).await {
-                Ok(output) => {
-                    let recorded = core
-                        .record_provider_output(
-                            engagement_id.clone(),
-                            task_id.clone(),
-                            generation,
-                            causation_id.clone(),
-                            output,
-                        )
-                        .await;
-                    let status = if recorded.is_ok() {
-                        TaskStatus::Completed
-                    } else {
-                        TaskStatus::Failed
-                    };
-                    if let Err(error) = recorded {
-                        tracing::error!(%error, "failed to persist provider output");
-                    }
-                    let ledger_status = if status == TaskStatus::Completed {
-                        DispatchLedgerStatus::Completed
-                    } else {
-                        DispatchLedgerStatus::Failed
-                    };
-                    if let Err(error) = core.update_dispatch_status(request_id, ledger_status).await
-                    {
-                        tracing::error!(%error, "failed to update dispatch ledger");
-                    }
-                    if let Err(error) = core
-                        .emit(
-                            Some(engagement_id),
-                            causation_id,
-                            generation,
-                            Event::TaskStatus {
-                                task_id,
-                                status,
-                                provider_id: Some(provider_id),
-                            },
-                        )
-                        .await
-                    {
-                        tracing::error!(%error, "failed to persist completed task event");
-                    }
-                }
+            let dispatch_result = core.providers.dispatch(dispatch).await;
+            let cancelled = match core.dispatch_was_cancelled(&request_id).await {
+                Ok(cancelled) => cancelled,
                 Err(error) => {
-                    let observation = EvidenceObservation {
-                        finding: error.to_string(),
-                        confidence: 1.0,
-                        artifact_id: None,
-                        attributes: serde_json::Map::from_iter([(
-                            "protocol_error_code".to_owned(),
-                            format!("{:?}", error.code).into(),
-                        )]),
-                    };
-                    if let Err(ledger_error) = core
-                        .update_dispatch_status(request_id, DispatchLedgerStatus::Failed)
-                        .await
-                    {
-                        tracing::error!(%ledger_error, "failed to update failed dispatch ledger");
+                    tracing::error!(%error, %request_id, "failed to fence dispatch completion against cancellation");
+                    // Fail closed: retaining Running for recovery is safer than
+                    // publishing output whose cancellation state is unknown.
+                    true
+                }
+            };
+            if !cancelled {
+                match dispatch_result {
+                    Ok(output) => {
+                        let recorded = core
+                            .record_provider_output(
+                                engagement_id.clone(),
+                                task_id.clone(),
+                                generation,
+                                causation_id.clone(),
+                                output,
+                            )
+                            .await;
+                        let status = if recorded.is_ok() {
+                            TaskStatus::Completed
+                        } else {
+                            TaskStatus::Failed
+                        };
+                        if let Err(error) = recorded {
+                            tracing::error!(%error, "failed to persist provider output");
+                        }
+                        let ledger_status = if status == TaskStatus::Completed {
+                            DispatchLedgerStatus::Completed
+                        } else {
+                            DispatchLedgerStatus::Failed
+                        };
+                        if let Err(error) =
+                            core.update_dispatch_status(request_id, ledger_status).await
+                        {
+                            tracing::error!(%error, "failed to update dispatch ledger");
+                        }
+                        if let Err(error) = core
+                            .emit(
+                                Some(engagement_id),
+                                causation_id,
+                                generation,
+                                Event::TaskStatus {
+                                    task_id,
+                                    status,
+                                    provider_id: Some(provider_id),
+                                    execution: None,
+                                },
+                            )
+                            .await
+                        {
+                            tracing::error!(%error, "failed to persist completed task event");
+                        }
                     }
-                    let _ = core
-                        .emit(
-                            Some(engagement_id.clone()),
-                            causation_id.clone(),
-                            generation,
-                            Event::Observation {
-                                task_id: task_id.clone(),
-                                observation,
-                            },
-                        )
-                        .await;
-                    let _ = core
-                        .emit(
-                            Some(engagement_id),
-                            causation_id,
-                            generation,
-                            Event::TaskStatus {
-                                task_id,
-                                status: TaskStatus::Failed,
-                                provider_id: Some(provider_id),
-                            },
-                        )
-                        .await;
+                    Err(error) => {
+                        let observation = EvidenceObservation {
+                            finding: error.to_string(),
+                            confidence: 1.0,
+                            artifact_id: None,
+                            attributes: serde_json::Map::from_iter([(
+                                "protocol_error_code".to_owned(),
+                                format!("{:?}", error.code).into(),
+                            )]),
+                        };
+                        if let Err(ledger_error) = core
+                            .update_dispatch_status(request_id, DispatchLedgerStatus::Failed)
+                            .await
+                        {
+                            tracing::error!(%ledger_error, "failed to update failed dispatch ledger");
+                        }
+                        let _ = core
+                            .emit(
+                                Some(engagement_id.clone()),
+                                causation_id.clone(),
+                                generation,
+                                Event::Observation {
+                                    task_id: task_id.clone(),
+                                    observation,
+                                },
+                            )
+                            .await;
+                        let _ = core
+                            .emit(
+                                Some(engagement_id),
+                                causation_id,
+                                generation,
+                                Event::TaskStatus {
+                                    task_id,
+                                    status: TaskStatus::Failed,
+                                    provider_id: Some(provider_id),
+                                    execution: None,
+                                },
+                            )
+                            .await;
+                    }
                 }
             }
             let plans = core.plans.clone();
@@ -2051,6 +2157,7 @@ impl ControlPlaneCore {
                             task_id: record.task_id.clone(),
                             status: TaskStatus::Lost,
                             provider_id: Some(record.provider_id.clone()),
+                            execution: record.execution.clone(),
                         },
                     )
                     .await?;
@@ -2115,6 +2222,7 @@ impl ControlPlaneCore {
                             task_id: task.task_id.clone(),
                             status: TaskStatus::Suspended,
                             provider_id: None,
+                            execution: None,
                         },
                     )
                     .await?;
@@ -2172,6 +2280,7 @@ impl ControlPlaneCore {
             if matches!(claim, DispatchClaim::Existing(_)) {
                 continue;
             }
+            let receipt = ExecutionReceipt::from_dispatch(&dispatch);
             if let Err(error) = self
                 .emit(
                     Some(plan.engagement_id.clone()),
@@ -2181,6 +2290,7 @@ impl ControlPlaneCore {
                         task_id: task.task_id.clone(),
                         status: TaskStatus::Dispatched,
                         provider_id: Some(provider_id),
+                        execution: Some(receipt),
                     },
                 )
                 .await
@@ -2290,6 +2400,40 @@ impl ControlPlaneCore {
         tokio::task::spawn_blocking(move || plans.update_dispatch(&request_id, status))
             .await
             .map_err(|error| internal_error(error.to_string()))?
+    }
+
+    async fn dispatch_was_cancelled(
+        &self,
+        request_id: &xai_grok_protocol::RequestId,
+    ) -> Result<bool, ProtocolError> {
+        let intent = self
+            .cancellation_intents
+            .lock()
+            .await
+            .get(request_id)
+            .cloned();
+        if let Some(intent) = intent {
+            let confirmed = intent.confirmed().await;
+            let mut intents = self.cancellation_intents.lock().await;
+            if intents
+                .get(request_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &intent))
+            {
+                intents.remove(request_id);
+            }
+            if confirmed {
+                return Ok(true);
+            }
+        }
+        let plans = self.plans.clone();
+        let request_id = request_id.clone();
+        let status = tokio::task::spawn_blocking(move || plans.dispatch_status(&request_id))
+            .await
+            .map_err(|error| internal_error(error.to_string()))??;
+        Ok(matches!(
+            status,
+            Some(DispatchLedgerStatus::Cancelled | DispatchLedgerStatus::Lost)
+        ))
     }
 
     async fn emit(
@@ -2586,6 +2730,7 @@ impl ControlPlane {
             responses: Mutex::new(ResponseCache::new(config.response_cache_capacity)),
             dispatch_recovery: Mutex::new(()),
             dispatch_recovery_complete: AtomicBool::new(false),
+            cancellation_intents: Mutex::new(HashMap::new()),
             owner_epoch: uuid::Uuid::new_v4().simple().to_string(),
             auto_schedule_plans: config.auto_schedule_plans,
             shutdown: CancellationToken::new(),
@@ -2862,6 +3007,24 @@ mod tests {
             deadline_unix_ms: now_unix_ms() + 5_000,
             command,
         }
+    }
+
+    async fn task_graph(
+        handle: &ControlPlaneHandle,
+        engagement_id: EngagementId,
+    ) -> TaskGraphProjection {
+        let response = handle
+            .submit(envelope(Command::QueryProjection(
+                ProjectionQuery::TaskGraph { engagement_id },
+            )))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Projection(snapshot) = response else {
+            panic!("expected task graph projection");
+        };
+        serde_json::from_value(snapshot.value).expect("task graph must exist")
     }
 
     #[tokio::test]
@@ -4282,6 +4445,15 @@ mod tests {
                 .iter()
                 .any(|artifact| artifact.provider_output)
         }));
+        for node in &graph.tasks {
+            let Some(ExecutionReceipt::Interactive(session)) = node.execution.as_ref() else {
+                panic!("scheduled interactive task must retain its durable receipt");
+            };
+            assert_eq!(session.engagement_id, graph.engagement_id);
+            assert_eq!(session.task_id, node.task.task_id);
+            assert_eq!(session.provider_id.as_str(), "test-provider");
+            assert_eq!(session.lease_epoch, 1);
+        }
 
         handle.shutdown_token().cancel();
         control_plane.wait().await;
@@ -4364,7 +4536,7 @@ mod tests {
             let task = ExecutionTask {
                 task_id: TaskId::new(),
                 objective: "execute".to_owned(),
-                mode: ExecutionMode::Interactive,
+                mode: ExecutionMode::Deferred,
                 capability: CapabilityRequirement {
                     operation_id: "test.execute".into(),
                     preferred_provider: Some("test-provider".into()),
@@ -4427,6 +4599,28 @@ mod tests {
             })
             .await
             .unwrap();
+            let response = handle
+                .submit(envelope(Command::QueryProjection(
+                    ProjectionQuery::TaskGraph {
+                        engagement_id: dispatch.engagement_id.clone(),
+                    },
+                )))
+                .await
+                .unwrap()
+                .response
+                .unwrap();
+            let Response::Projection(snapshot) = response else {
+                panic!("expected task graph projection");
+            };
+            let graph: TaskGraphProjection = serde_json::from_value(snapshot.value).unwrap();
+            let Some(ExecutionReceipt::Deferred(receipt)) = graph.tasks[0].execution.as_ref()
+            else {
+                panic!("completed deferred task must retain its durable receipt");
+            };
+            assert_eq!(receipt.request_id, dispatch.request_id);
+            assert_eq!(receipt.task_id, dispatch.task.task_id);
+            assert_eq!(receipt.provider_id, dispatch.provider_id);
+            assert_eq!(receipt.lease_epoch, dispatch.lease_epoch);
             handle.shutdown_token().cancel();
             control_plane.wait().await;
         }
@@ -4446,6 +4640,190 @@ mod tests {
         assert_eq!(executions.load(Ordering::SeqCst), 1);
         handle.shutdown_token().cancel();
         control_plane.wait().await;
+    }
+
+    #[tokio::test]
+    async fn deferred_task_can_be_rediscovered_cancelled_and_replayed_from_its_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        let mut config = ControlPlaneConfig::new(&state);
+        config.auto_schedule_plans = false;
+        let control_plane = ControlPlane::open(config).await.unwrap();
+        let handle = control_plane.handle();
+        let cancellation = CancellationToken::new();
+        let cancelled_requests = Arc::new(StdMutex::new(Vec::<RequestId>::new()));
+        handle
+            .register_provider(Arc::new(FunctionProvider::new(
+                provider_manifest(),
+                {
+                    let cancellation = cancellation.clone();
+                    move |_| {
+                        let cancellation = cancellation.clone();
+                        async move {
+                            cancellation.cancelled().await;
+                            // A cooperative provider may observe cancellation only
+                            // after it has already produced a late result. The
+                            // control plane must fence that result rather than let
+                            // it overwrite the durable Cancelled state.
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            Ok(ProviderOutput {
+                                output: serde_json::json!({"late": true}),
+                                ..ProviderOutput::default()
+                            })
+                        }
+                    }
+                },
+                {
+                    let cancellation = cancellation.clone();
+                    let cancelled_requests = cancelled_requests.clone();
+                    move |request_id| {
+                        let cancellation = cancellation.clone();
+                        let cancelled_requests = cancelled_requests.clone();
+                        async move {
+                            cancelled_requests.lock().unwrap().push(request_id);
+                            cancellation.cancel();
+                            Ok(())
+                        }
+                    }
+                },
+            )))
+            .await
+            .unwrap();
+        let accepted = handle
+            .submit(envelope(Command::SubmitIngress(IngressEnvelope {
+                command_id: CommandId::new(),
+                source: IngressSource::Cli,
+                source_event_id: "reattach-deferred-ingress".to_owned(),
+                workspace_id: WorkspaceId::from_string("workspace"),
+                exercise_id: None,
+                operation_run_id: None,
+                operator_session_id: None,
+                session_id: "reattach-session".to_owned(),
+                prompt_id: "reattach-prompt".to_owned(),
+                request: "run until a reconnecting client cancels it".to_owned(),
+                team: None,
+                metadata: serde_json::Map::new(),
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Accepted { engagement_id, .. } = accepted else {
+            panic!("expected accepted engagement");
+        };
+        let task = ExecutionTask {
+            task_id: TaskId::from_string("reattach-deferred-task"),
+            objective: "remain active until cancelled".to_owned(),
+            mode: ExecutionMode::Deferred,
+            capability: CapabilityRequirement {
+                operation_id: "test.execute".into(),
+                preferred_provider: Some("test-provider".into()),
+                required_features: Vec::new(),
+            },
+            input: serde_json::json!({}),
+            deadline_unix_ms: now_unix_ms() + 10_000,
+            completion_tests: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        handle
+            .submit(envelope(Command::SubmitPlan(TaskingPlan {
+                engagement_id: engagement_id.clone(),
+                revision: 1,
+                objective: "durable deferred execution".to_owned(),
+                tasks: vec![task.clone()],
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let dispatch = ProviderDispatch {
+            request_id: RequestId::from_string("reattach-deferred-request"),
+            engagement_id: engagement_id.clone(),
+            plan_revision: 1,
+            task,
+            provider_id: "test-provider".into(),
+            lease_epoch: 1,
+        };
+        let _discarded_initial_response = handle
+            .submit(envelope(Command::Dispatch(dispatch)))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+
+        let receipt = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let graph = task_graph(&handle, engagement_id.clone()).await;
+                let node = &graph.tasks[0];
+                if node.status == TaskStatus::Running
+                    && let Some(ExecutionReceipt::Deferred(receipt)) = &node.execution
+                {
+                    break receipt.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred dispatch must become discoverable");
+        assert_eq!(receipt.request_id.as_str(), "reattach-deferred-request");
+        assert_eq!(receipt.result_cursor, 0);
+
+        handle
+            .submit(envelope(Command::CancelTask {
+                engagement_id: receipt.engagement_id.clone(),
+                task_id: receipt.task_id.clone(),
+                request_id: receipt.request_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let graph = task_graph(&handle, engagement_id.clone()).await;
+                let capacity = handle.providers().capacity().await;
+                if graph.tasks[0].status == TaskStatus::Cancelled
+                    && capacity[0].available_permits == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled provider must release its execution slot");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let terminal = task_graph(&handle, engagement_id.clone()).await;
+        assert_eq!(terminal.tasks[0].status, TaskStatus::Cancelled);
+        assert!(
+            terminal.tasks[0].artifacts.is_empty(),
+            "late provider output must be fenced after cancellation"
+        );
+        assert_eq!(
+            *cancelled_requests.lock().unwrap(),
+            vec![receipt.request_id.clone()]
+        );
+        assert_eq!(
+            terminal.tasks[0]
+                .provider_id
+                .as_ref()
+                .map(ProviderId::as_str),
+            Some("test-provider")
+        );
+        assert_eq!(
+            terminal.tasks[0].execution,
+            Some(ExecutionReceipt::Deferred(receipt))
+        );
+
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+        let reopened = ControlPlane::open(ControlPlaneConfig::new(&state))
+            .await
+            .unwrap();
+        let replayed = task_graph(&reopened.handle(), engagement_id).await;
+        assert_eq!(replayed, terminal);
+        reopened.handle().shutdown_token().cancel();
+        reopened.wait().await;
     }
 
     #[tokio::test]
@@ -4544,6 +4922,7 @@ mod tests {
                         task_id: first_task_id.clone(),
                         status: TaskStatus::Running,
                         provider_id: Some("test-provider".into()),
+                        execution: Some(ExecutionReceipt::from_dispatch(&dispatch)),
                     },
                 )
                 .await
@@ -4596,6 +4975,17 @@ mod tests {
         .await
         .expect("recovery must terminate the interrupted graph");
         assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let interrupted = graph
+            .tasks
+            .iter()
+            .find(|task| task.task.task_id == first_task_id)
+            .unwrap();
+        let Some(ExecutionReceipt::Deferred(receipt)) = interrupted.execution.as_ref() else {
+            panic!("lost deferred task must retain its durable receipt");
+        };
+        assert_eq!(receipt.request_id.as_str(), "interrupted-request");
+        assert_eq!(receipt.provider_id.as_str(), "test-provider");
+        assert_eq!(interrupted.provider_id.as_ref(), Some(&receipt.provider_id));
         handle.shutdown_token().cancel();
         control_plane.wait().await;
 
