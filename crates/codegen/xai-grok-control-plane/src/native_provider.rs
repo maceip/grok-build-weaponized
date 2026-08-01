@@ -64,6 +64,12 @@ impl NativeExecutionProvider {
         let operations = vec![
             operation("native.command.start", "Start native command", true),
             operation("native.command.status", "Read native command status", false),
+            operation("native.command.list", "List native commands", false),
+            operation(
+                "native.command.metadata",
+                "Update native command metadata",
+                false,
+            ),
             operation("native.command.wait", "Wait for native command", true),
             operation("native.command.output", "Read native command output", true),
             operation("native.command.stdin", "Write native command stdin", true),
@@ -147,10 +153,10 @@ impl ExecutionProvider for NativeExecutionProvider {
         let mut artifacts = Vec::new();
         let output = match operation {
             "native.command.start" => {
-                let request: CommandRequest = parse(input)?;
+                let input: StartCommandInput = parse(input)?;
                 let snapshot = self
                     .supervisor
-                    .start_command_for(owner_id, request)
+                    .start_command_for(input.owner_id.unwrap_or(owner_id), input.request)
                     .await
                     .map_err(native_error)?;
                 self.remember(dispatch.request_id, snapshot.job_id.clone())
@@ -173,6 +179,25 @@ impl ExecutionProvider for NativeExecutionProvider {
                 serde_json::to_value(
                     self.supervisor
                         .snapshot(&input.job_id)
+                        .await
+                        .map_err(native_error)?,
+                )
+                .map_err(internal_error)?
+            }
+            "native.command.list" => {
+                let input: ListInput = parse(input)?;
+                serde_json::to_value(
+                    self.supervisor
+                        .list(input.owner_id.as_deref(), input.cursor, input.limit)
+                        .await,
+                )
+                .map_err(internal_error)?
+            }
+            "native.command.metadata" => {
+                let input: MetadataInput = parse(input)?;
+                serde_json::to_value(
+                    self.supervisor
+                        .update_metadata(&input.job_id, input.metadata)
                         .await
                         .map_err(native_error)?,
                 )
@@ -333,6 +358,35 @@ struct JobInput {
 }
 
 #[derive(Deserialize)]
+struct StartCommandInput {
+    #[serde(flatten)]
+    request: CommandRequest,
+    #[serde(default)]
+    owner_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ListInput {
+    #[serde(default)]
+    owner_id: Option<String>,
+    #[serde(default)]
+    cursor: usize,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+}
+
+#[derive(Deserialize)]
+struct MetadataInput {
+    job_id: String,
+    #[serde(default)]
+    metadata: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+fn default_list_limit() -> usize {
+    128
+}
+
+#[derive(Deserialize)]
 struct WaitInput {
     job_id: String,
     #[serde(default = "default_wait_ms")]
@@ -455,7 +509,8 @@ mod tests {
                 serde_json::json!({
                     "executable": "/bin/sh",
                     "args": ["-c", "printf provider-stdout; printf provider-stderr >&2"],
-                    "timeout_ms": 5000
+                    "timeout_ms": 5000,
+                    "metadata": {"is_backgrounded": false}
                 }),
             ))
             .await
@@ -489,8 +544,40 @@ mod tests {
             .unwrap();
         let records = page.output["records"].as_array().unwrap();
         assert_eq!(records.len(), 2);
+        assert!(page.output["end_cursor"].as_u64().unwrap() > 0);
+        assert!(page.output["next_cursor"].is_null());
         assert!(records.iter().any(|record| record["stream"] == "stdout"));
         assert!(records.iter().any(|record| record["stream"] == "stderr"));
+
+        let updated = provider
+            .execute(dispatch(
+                "native.command.metadata",
+                serde_json::json!({
+                    "job_id": job_id,
+                    "metadata": {
+                        "is_backgrounded": true,
+                        "owner_session_id": "reparented-session"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(updated.output["metadata"]["is_backgrounded"], true);
+        assert_eq!(
+            updated.output["metadata"]["owner_session_id"],
+            "reparented-session"
+        );
+        let listed = provider
+            .execute(dispatch(
+                "native.command.list",
+                serde_json::json!({"cursor": 0, "limit": 10}),
+            ))
+            .await
+            .unwrap();
+        assert!(listed.output.as_array().unwrap().iter().any(|snapshot| {
+            snapshot["job_id"] == job_id
+                && snapshot["metadata"]["owner_session_id"] == "reparented-session"
+        }));
 
         let cleanup = provider
             .execute(dispatch(

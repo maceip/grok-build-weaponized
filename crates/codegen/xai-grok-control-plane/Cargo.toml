@@ -28,6 +28,7 @@ xai-acp-lib = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+xai-grok-tools = { workspace = true }
 
 [[bin]]
 name = "grokd"

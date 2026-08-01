@@ -657,12 +657,18 @@ pub(crate) async fn spawn_session_actor(
     );
     let tool_context_for_handle = tool_context.clone();
     let cursor_harness = false;
+    let daemon_socket = (std::env::var("GROK_EXECUTION_BACKEND").as_deref() == Ok("daemon"))
+        .then(|| std::env::var_os("GROKD_SOCKET"))
+        .flatten()
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute());
     let terminal_backend_kind = select_terminal_backend_kind(
         startup_hints.is_subagent,
         parent_terminal_backend.is_some(),
         client_terminal_capable,
         tool_context.gateway.is_some(),
         cursor_harness,
+        daemon_socket.is_some(),
     );
     let effective_cfg = matches!(
         terminal_backend_kind,
@@ -693,6 +699,11 @@ pub(crate) async fn spawn_session_actor(
                     tool_context.session_id.clone().unwrap(),
                 ))
                     as std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend>
+            }
+            TerminalBackendKind::Daemon => {
+                std::sync::Arc::new(xai_grok_tools::computer::local::DaemonTerminalBackend::new(
+                    daemon_socket.expect("Daemon is selected only with an absolute socket path"),
+                ))
             }
             TerminalBackendKind::LocalPersistent => {
                 std::sync::Arc::new(LocalTerminalBackend::new_local_with_persistent_shell(
@@ -2554,6 +2565,7 @@ impl crate::session::mcp_restart::RestartActions for SessionRestartActions {
 enum TerminalBackendKind {
     ReuseParent,
     AcpClient,
+    Daemon,
     LocalPersistent,
     LocalNonPersistent,
 }
@@ -2563,11 +2575,14 @@ fn select_terminal_backend_kind(
     client_terminal_capable: bool,
     has_gateway: bool,
     cursor_harness: bool,
+    daemon_available: bool,
 ) -> TerminalBackendKind {
     if is_subagent && has_parent_backend {
         TerminalBackendKind::ReuseParent
     } else if client_terminal_capable && has_gateway {
         TerminalBackendKind::AcpClient
+    } else if daemon_available {
+        TerminalBackendKind::Daemon
     } else if cursor_harness {
         TerminalBackendKind::LocalPersistent
     } else {
@@ -2641,48 +2656,64 @@ mod terminal_backend_select_tests {
     #[test]
     fn subagent_with_parent_reuses_parent() {
         assert_eq!(
-            select_terminal_backend_kind(true, true, true, true, true),
+            select_terminal_backend_kind(true, true, true, true, true, true),
             TerminalBackendKind::ReuseParent
         );
     }
     #[test]
     fn subagent_without_parent_falls_through() {
         assert_eq!(
-            select_terminal_backend_kind(true, false, true, true, true),
+            select_terminal_backend_kind(true, false, true, true, true, true),
             TerminalBackendKind::AcpClient
         );
         assert_eq!(
-            select_terminal_backend_kind(true, false, false, true, true),
-            TerminalBackendKind::LocalPersistent
+            select_terminal_backend_kind(true, false, false, true, true, true),
+            TerminalBackendKind::Daemon
         );
     }
     #[test]
     fn non_subagent_never_reuses_parent() {
         assert_eq!(
-            select_terminal_backend_kind(false, true, false, false, true),
+            select_terminal_backend_kind(false, true, false, false, true, false),
             TerminalBackendKind::LocalPersistent
         );
     }
     #[test]
     fn client_terminal_uses_acp_only_with_gateway() {
         assert_eq!(
-            select_terminal_backend_kind(false, false, true, true, true),
+            select_terminal_backend_kind(false, false, true, true, true, true),
             TerminalBackendKind::AcpClient
         );
         assert_eq!(
-            select_terminal_backend_kind(false, false, true, false, true),
-            TerminalBackendKind::LocalPersistent
+            select_terminal_backend_kind(false, false, true, false, true, true),
+            TerminalBackendKind::Daemon
         );
     }
     #[test]
     fn local_session_cursor_harness_selects_persistent_backend() {
         assert_eq!(
-            select_terminal_backend_kind(false, false, false, false, true),
+            select_terminal_backend_kind(false, false, false, false, true, false),
             TerminalBackendKind::LocalPersistent
         );
         assert_eq!(
-            select_terminal_backend_kind(false, false, false, false, false),
+            select_terminal_backend_kind(false, false, false, false, false, false),
             TerminalBackendKind::LocalNonPersistent
+        );
+    }
+
+    #[test]
+    fn daemon_precedes_local_backends_but_not_remote_or_parent_execution() {
+        assert_eq!(
+            select_terminal_backend_kind(false, false, false, false, false, true),
+            TerminalBackendKind::Daemon
+        );
+        assert_eq!(
+            select_terminal_backend_kind(false, false, true, true, false, true),
+            TerminalBackendKind::AcpClient
+        );
+        assert_eq!(
+            select_terminal_backend_kind(true, true, false, false, false, true),
+            TerminalBackendKind::ReuseParent
         );
     }
 }

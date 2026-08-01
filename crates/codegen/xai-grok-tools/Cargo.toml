@@ -17,6 +17,8 @@ async-openai = { workspace = true }
 xai-tty-utils = { workspace = true }
 xai-grok-config = { path = "../xai-grok-config" }
 xai-grok-engagement = { workspace = true }
+xai-grok-control-client = { workspace = true }
+xai-grok-native-execution = { workspace = true }
 xai-grok-protocol = { workspace = true }
 xai-grok-tools-api = { path = "../xai-grok-tools-api" }
 xai-grok-workspace-types = { path = "../xai-grok-workspace-types" }

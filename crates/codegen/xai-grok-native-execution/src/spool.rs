@@ -47,6 +47,11 @@ pub struct OutputRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputPage {
     pub cursor: u64,
+    /// Byte offset immediately after the last complete returned record.
+    /// Unlike `next_cursor`, this advances even when the reader caught up to
+    /// the current end of a still-growing spool.
+    #[serde(default)]
+    pub end_cursor: u64,
     pub next_cursor: Option<u64>,
     pub records: Vec<OutputRecord>,
 }
@@ -217,6 +222,7 @@ pub(crate) async fn read_page(
     }
     Ok(OutputPage {
         cursor,
+        end_cursor: position,
         next_cursor: (position < length).then_some(position),
         records,
     })

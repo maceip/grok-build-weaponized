@@ -15459,6 +15459,7 @@ dependencies = [
  "xai-grok-engagement",
  "xai-grok-native-execution",
  "xai-grok-protocol",
+ "xai-grok-tools",
 ]
 
 [[package]]
@@ -16454,8 +16455,10 @@ dependencies = [
  "xai-computer-hub-sdk",
  "xai-file-utils",
  "xai-grok-config",
+ "xai-grok-control-client",
  "xai-grok-engagement",
  "xai-grok-env",
+ "xai-grok-native-execution",
  "xai-grok-protocol",
  "xai-grok-sandbox",
  "xai-grok-test-support",

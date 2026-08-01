@@ -87,6 +87,10 @@ pub struct CommandRequest {
     pub timeout_ms: u64,
     #[serde(default)]
     pub stdin: CommandStdin,
+    /// Durable caller metadata used to reconstruct operator-facing task state
+    /// after the client reconnects. It never changes process launch semantics.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
 fn default_timeout() -> u64 {
@@ -145,6 +149,8 @@ pub struct JobSnapshot {
     pub stdin: CommandStdin,
     #[serde(default)]
     pub stdin_closed: bool,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
 enum JobStdinState {
@@ -262,6 +268,7 @@ impl NativeExecutionSupervisor {
             None,
             None,
             request.stdin,
+            request.metadata,
         )
         .await
     }
@@ -296,6 +303,7 @@ impl NativeExecutionSupervisor {
             Some(request.target),
             Some(xml_path),
             CommandStdin::Null,
+            BTreeMap::new(),
         )
         .await
     }
@@ -340,6 +348,50 @@ impl NativeExecutionSupervisor {
             maximum_bytes.clamp(1, MAX_PAGE_BYTES),
         )
         .await?)
+    }
+
+    pub async fn list(
+        &self,
+        owner_id: Option<&str>,
+        cursor: usize,
+        limit: usize,
+    ) -> Vec<JobSnapshot> {
+        let jobs = self.jobs.read().await.values().cloned().collect::<Vec<_>>();
+        let mut snapshots = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let snapshot = job.snapshot.lock().await.clone();
+            if owner_id.is_none_or(|expected| snapshot.owner_id == expected) {
+                snapshots.push(snapshot);
+            }
+        }
+        snapshots.sort_by(|left, right| {
+            left.created_unix_ms
+                .cmp(&right.created_unix_ms)
+                .then_with(|| left.job_id.cmp(&right.job_id))
+        });
+        snapshots
+            .into_iter()
+            .skip(cursor)
+            .take(limit.clamp(1, 512))
+            .collect()
+    }
+
+    /// Merge caller-owned presentation metadata into a durable job snapshot.
+    ///
+    /// Process launch fields and accounting ownership are intentionally not
+    /// mutable. This operation exists so a reconnecting terminal client can
+    /// recover backgrounding, notification routing, and session presentation
+    /// state without owning the subprocess itself.
+    pub async fn update_metadata(
+        &self,
+        job_id: &str,
+        metadata: BTreeMap<String, serde_json::Value>,
+    ) -> Result<JobSnapshot, NativeExecutionError> {
+        let job = self.job(job_id).await?;
+        let mut snapshot = job.snapshot.lock().await;
+        snapshot.metadata.extend(metadata);
+        persist_snapshot(&job.metadata_path, &snapshot).await?;
+        Ok(snapshot.clone())
     }
 
     pub async fn cancel(&self, job_id: &str) -> Result<JobSnapshot, NativeExecutionError> {
@@ -515,6 +567,7 @@ impl NativeExecutionSupervisor {
         nmap_target: Option<String>,
         nmap_xml_path: Option<PathBuf>,
         stdin: CommandStdin,
+        metadata: BTreeMap<String, serde_json::Value>,
     ) -> Result<JobSnapshot, NativeExecutionError> {
         self.start_process_with_id(
             new_job_id(),
@@ -528,6 +581,7 @@ impl NativeExecutionSupervisor {
             nmap_target,
             nmap_xml_path,
             stdin,
+            metadata,
         )
         .await
     }
@@ -546,6 +600,7 @@ impl NativeExecutionSupervisor {
         nmap_target: Option<String>,
         nmap_xml_path: Option<PathBuf>,
         stdin: CommandStdin,
+        metadata: BTreeMap<String, serde_json::Value>,
     ) -> Result<JobSnapshot, NativeExecutionError> {
         if self.jobs.read().await.len() >= self.maximum_jobs {
             return Err(NativeExecutionError::Overloaded);
@@ -574,6 +629,7 @@ impl NativeExecutionSupervisor {
             owner_id,
             stdin,
             stdin_closed: stdin == CommandStdin::Null,
+            metadata,
         };
         persist_snapshot(&metadata_path, &snapshot).await?;
         let job = Arc::new(JobState {
@@ -952,6 +1008,7 @@ mod tests {
                 env: BTreeMap::new(),
                 timeout_ms: 5_000,
                 stdin: CommandStdin::Null,
+                metadata: BTreeMap::new(),
             })
             .await
             .unwrap();
@@ -1003,6 +1060,7 @@ mod tests {
                 env: BTreeMap::new(),
                 timeout_ms: 60_000,
                 stdin: CommandStdin::Null,
+                metadata: BTreeMap::new(),
             })
             .await
             .unwrap();
@@ -1033,6 +1091,7 @@ mod tests {
             env: BTreeMap::new(),
             timeout_ms: 5_000,
             stdin: CommandStdin::Null,
+            metadata: BTreeMap::new(),
         };
 
         let first = supervisor
@@ -1099,6 +1158,7 @@ mod tests {
                 env: BTreeMap::new(),
                 timeout_ms: 5_000,
                 stdin: CommandStdin::Pipe,
+                metadata: BTreeMap::new(),
             })
             .await
             .unwrap();

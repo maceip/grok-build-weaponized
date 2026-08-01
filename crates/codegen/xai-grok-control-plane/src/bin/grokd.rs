@@ -70,9 +70,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let arguments = Arguments::parse();
     let profile = arguments.profile.as_ref().map(load_profile).transpose()?;
-    let socket_path = arguments
-        .socket
-        .unwrap_or_else(|| arguments.state_directory.join("grokd.sock"));
+    let socket_path = absolute_path(
+        arguments
+            .socket
+            .unwrap_or_else(|| arguments.state_directory.join("grokd.sock")),
+    )?;
     let mut control_config = ControlPlaneConfig::new(&arguments.state_directory);
     control_config.command_capacity = arguments
         .command_capacity
@@ -113,6 +115,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .canonicalize()?;
         let mut provider_config = AgentProviderConfig::new(binary, workspace);
         provider_config.model_id = arguments.agent_model;
+        provider_config
+            .environment
+            .insert("GROK_EXECUTION_BACKEND".to_owned(), "daemon".to_owned());
+        provider_config.environment.insert(
+            "GROKD_SOCKET".to_owned(),
+            socket_path.to_string_lossy().into_owned(),
+        );
         let provider = AgentExecutionProvider::start(provider_config).await?;
         handle.register_provider(provider.clone()).await?;
         Some(provider)
@@ -211,6 +220,14 @@ fn resolve_agent_binary(explicit: Option<&PathBuf>) -> Result<PathBuf, Box<dyn s
         ),
     )
     .into())
+}
+
+fn absolute_path(path: PathBuf) -> Result<PathBuf, std::io::Error> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
 
 fn load_profile(path: &PathBuf) -> Result<RuntimeProfile, Box<dyn std::error::Error>> {
