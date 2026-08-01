@@ -689,6 +689,7 @@ async fn execute_turn(
         output,
         observations: Vec::new(),
         artifacts: Vec::new(),
+        terminal_status: None,
     })
 }
 

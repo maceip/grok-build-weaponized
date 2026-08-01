@@ -343,6 +343,7 @@ impl ExecutionProvider for ProcessExecutionProvider {
                     },
                 })
                 .collect(),
+            terminal_status: None,
         })
     }
 

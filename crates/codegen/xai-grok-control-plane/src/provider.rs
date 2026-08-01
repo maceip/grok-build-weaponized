@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use xai_grok_protocol::{
     CapabilityManifest, CapabilityRequirement, ExecutionMode, OperationId, PROTOCOL_VERSION,
     ProtocolError, ProtocolErrorCode, ProviderDispatch, ProviderId, RequestId, ServiceHealth,
+    TaskStatus,
 };
 
 type ProviderFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -55,6 +56,30 @@ pub struct ProviderOutput {
     pub observations: Vec<xai_grok_protocol::EvidenceObservation>,
     #[serde(default)]
     pub artifacts: Vec<ProviderArtifact>,
+    /// Terminal task outcome when provider transport success and the invoked
+    /// operation's semantic outcome differ. Omission means Completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_status: Option<ProviderTerminalStatus>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTerminalStatus {
+    Completed,
+    Failed,
+    Cancelled,
+    Lost,
+}
+
+impl ProviderTerminalStatus {
+    pub const fn task_status(self) -> TaskStatus {
+        match self {
+            Self::Completed => TaskStatus::Completed,
+            Self::Failed => TaskStatus::Failed,
+            Self::Cancelled => TaskStatus::Cancelled,
+            Self::Lost => TaskStatus::Lost,
+        }
+    }
 }
 
 #[async_trait]

@@ -2008,6 +2008,9 @@ impl ControlPlaneCore {
             if !cancelled {
                 match dispatch_result {
                     Ok(output) => {
+                        let provider_status = output
+                            .terminal_status
+                            .map_or(TaskStatus::Completed, |status| status.task_status());
                         let recorded = core
                             .record_provider_output(
                                 engagement_id.clone(),
@@ -2017,18 +2020,22 @@ impl ControlPlaneCore {
                                 output,
                             )
                             .await;
-                        let status = if recorded.is_ok() {
-                            TaskStatus::Completed
-                        } else {
-                            TaskStatus::Failed
-                        };
+                        let status = recorded
+                            .as_ref()
+                            .map_or(TaskStatus::Failed, |_| provider_status);
                         if let Err(error) = recorded {
                             tracing::error!(%error, "failed to persist provider output");
                         }
-                        let ledger_status = if status == TaskStatus::Completed {
-                            DispatchLedgerStatus::Completed
-                        } else {
-                            DispatchLedgerStatus::Failed
+                        let ledger_status = match status {
+                            TaskStatus::Completed => DispatchLedgerStatus::Completed,
+                            TaskStatus::Cancelled => DispatchLedgerStatus::Cancelled,
+                            TaskStatus::Lost => DispatchLedgerStatus::Lost,
+                            TaskStatus::Failed => DispatchLedgerStatus::Failed,
+                            TaskStatus::Prepared
+                            | TaskStatus::Admitted
+                            | TaskStatus::Dispatched
+                            | TaskStatus::Running
+                            | TaskStatus::Suspended => DispatchLedgerStatus::Failed,
                         };
                         if let Err(error) =
                             core.update_dispatch_status(request_id, ledger_status).await
@@ -2971,7 +2978,7 @@ mod tests {
 
     use super::*;
     use crate::native_provider::NativeExecutionProvider;
-    use crate::provider::FunctionProvider;
+    use crate::provider::{FunctionProvider, ProviderTerminalStatus};
 
     struct GenerationProvider {
         manifest: CapabilityManifest,
@@ -4229,6 +4236,94 @@ mod tests {
         assert!(next_cursor.is_none());
         let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(output["text"], "executed: inspect the supplied evidence");
+
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+    }
+
+    #[tokio::test]
+    async fn provider_semantic_failure_retains_output_but_never_projects_completed() {
+        let directory = tempfile::tempdir().unwrap();
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        handle
+            .register_provider(Arc::new(FunctionProvider::new(
+                agent_provider_manifest(),
+                |_| async move {
+                    Ok(ProviderOutput {
+                        output: serde_json::json!({
+                            "lifecycle": "failed",
+                            "exit_code": 7,
+                            "error": "process exited with status 7"
+                        }),
+                        artifacts: vec![ProviderArtifact::inline(
+                            "text/plain",
+                            b"failure-evidence".to_vec(),
+                        )],
+                        terminal_status: Some(ProviderTerminalStatus::Failed),
+                        ..ProviderOutput::default()
+                    })
+                },
+                |_| async { Ok(()) },
+            )))
+            .await
+            .unwrap();
+        let accepted = handle
+            .submit(envelope(Command::SubmitIngress(IngressEnvelope {
+                command_id: CommandId::new(),
+                source: IngressSource::Cli,
+                source_event_id: "semantic-failure-ingress".to_owned(),
+                workspace_id: WorkspaceId::from_string("workspace"),
+                exercise_id: None,
+                operation_run_id: None,
+                operator_session_id: None,
+                session_id: "semantic-failure-session".to_owned(),
+                prompt_id: "semantic-failure-prompt".to_owned(),
+                request: "run a command that fails".to_owned(),
+                team: None,
+                metadata: serde_json::Map::new(),
+            })))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Accepted { engagement_id, .. } = accepted else {
+            panic!("expected accepted ingress");
+        };
+        let graph = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let graph = task_graph(&handle, engagement_id.clone()).await;
+                if graph.tasks[0].status == TaskStatus::Failed {
+                    break graph;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider semantic failure did not reach the task graph");
+        assert_eq!(graph.tasks[0].status, TaskStatus::Failed);
+        assert_eq!(graph.tasks[0].artifacts.len(), 2);
+        assert!(
+            graph.tasks[0].artifacts.iter().any(|artifact| {
+                artifact.media_type == "text/plain" && !artifact.provider_output
+            })
+        );
+        assert!(graph.tasks[0].artifacts.iter().any(|artifact| {
+            artifact.media_type == "application/vnd.grok.provider-output+json"
+                && artifact.provider_output
+        }));
+        assert!(!all_events(&handle).await.iter().any(|event| {
+            event.engagement_id.as_ref() == Some(&engagement_id)
+                && matches!(
+                    event.event,
+                    Event::TaskStatus {
+                        status: TaskStatus::Completed,
+                        ..
+                    }
+                )
+        }));
 
         handle.shutdown_token().cancel();
         control_plane.wait().await;

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::sync::{Notify, RwLock};
 use xai_grok_native_execution::{
-    CommandRequest, JobSnapshot, NativeExecutionError, NativeExecutionLimits,
+    CommandRequest, JobLifecycle, JobSnapshot, NativeExecutionError, NativeExecutionLimits,
     NativeExecutionSupervisor, NmapRequest,
 };
 use xai_grok_protocol::{
@@ -18,7 +18,9 @@ use xai_grok_protocol::{
     VersionRange,
 };
 
-use crate::provider::{ExecutionProvider, ProviderArtifact, ProviderOutput};
+use crate::provider::{
+    ExecutionProvider, ProviderArtifact, ProviderOutput, ProviderTerminalStatus,
+};
 
 pub const NATIVE_PROVIDER_ID: &str = "native-execution";
 
@@ -221,7 +223,7 @@ impl NativeExecutionProvider {
         &self,
         job_id: &str,
         deadline_unix_ms: u64,
-    ) -> Result<JobSnapshot, ProtocolError> {
+    ) -> Result<(JobSnapshot, bool), ProtocolError> {
         loop {
             let snapshot = self
                 .supervisor
@@ -229,15 +231,12 @@ impl NativeExecutionProvider {
                 .await
                 .map_err(native_error)?;
             if snapshot.lifecycle.is_terminal() {
-                return Ok(snapshot);
+                return Ok((snapshot, false));
             }
             let now = now_unix_ms();
             if now >= deadline_unix_ms {
-                let _ = self.supervisor.cancel(job_id).await;
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::DeadlineExceeded,
-                    format!("native job {job_id} exceeded its task deadline"),
-                ));
+                let snapshot = self.supervisor.cancel(job_id).await.map_err(native_error)?;
+                return Ok((snapshot, true));
             }
             tokio::time::sleep(Duration::from_millis(
                 deadline_unix_ms.saturating_sub(now).min(50),
@@ -271,6 +270,8 @@ impl NativeExecutionProvider {
         let owner_id = dispatch.engagement_id.to_string();
         let input = dispatch.task.input;
         let mut artifacts = Vec::new();
+        let mut terminal_status = None;
+        let mut task_deadline_exceeded = false;
         let output = match operation {
             "native.command.start" => {
                 let input: StartCommandInput = parse(input)?;
@@ -284,12 +285,19 @@ impl NativeExecutionProvider {
                     .bind(snapshot.job_id.clone())
                     .await;
                 if mode == xai_grok_protocol::ExecutionMode::Detached {
-                    snapshot = self
+                    let waited = self
                         .wait_until_terminal(&snapshot.job_id, deadline_unix_ms)
                         .await?;
+                    snapshot = waited.0;
+                    task_deadline_exceeded = waited.1;
+                    terminal_status = if task_deadline_exceeded {
+                        Some(ProviderTerminalStatus::Failed)
+                    } else {
+                        native_terminal_status(snapshot.lifecycle)
+                    };
                     artifacts.extend(self.terminal_artifacts(&snapshot.job_id).await?);
                 }
-                serde_json::to_value(snapshot).map_err(internal_error)?
+                snapshot_output(snapshot, task_deadline_exceeded)?
             }
             "native.nmap.start" => {
                 let request: NmapRequest = parse(input)?;
@@ -303,12 +311,19 @@ impl NativeExecutionProvider {
                     .bind(snapshot.job_id.clone())
                     .await;
                 if mode == xai_grok_protocol::ExecutionMode::Detached {
-                    snapshot = self
+                    let waited = self
                         .wait_until_terminal(&snapshot.job_id, deadline_unix_ms)
                         .await?;
+                    snapshot = waited.0;
+                    task_deadline_exceeded = waited.1;
+                    terminal_status = if task_deadline_exceeded {
+                        Some(ProviderTerminalStatus::Failed)
+                    } else {
+                        native_terminal_status(snapshot.lifecycle)
+                    };
                     artifacts.extend(self.terminal_artifacts(&snapshot.job_id).await?);
                 }
-                serde_json::to_value(snapshot).map_err(internal_error)?
+                snapshot_output(snapshot, task_deadline_exceeded)?
             }
             "native.command.status" | "native.nmap.status" => {
                 let input: JobInput = parse(input)?;
@@ -448,6 +463,7 @@ impl NativeExecutionProvider {
                     output: serde_json::to_value(result).map_err(internal_error)?,
                     observations,
                     artifacts,
+                    terminal_status: None,
                 });
             }
             other => {
@@ -461,6 +477,7 @@ impl NativeExecutionProvider {
             output,
             observations: Vec::new(),
             artifacts,
+            terminal_status,
         })
     }
 }
@@ -617,6 +634,27 @@ fn now_unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn native_terminal_status(lifecycle: JobLifecycle) -> Option<ProviderTerminalStatus> {
+    match lifecycle {
+        JobLifecycle::Completed => Some(ProviderTerminalStatus::Completed),
+        JobLifecycle::Failed | JobLifecycle::TimedOut => Some(ProviderTerminalStatus::Failed),
+        JobLifecycle::Cancelled => Some(ProviderTerminalStatus::Cancelled),
+        JobLifecycle::Lost => Some(ProviderTerminalStatus::Lost),
+        JobLifecycle::Queued | JobLifecycle::Running => None,
+    }
+}
+
+fn snapshot_output(
+    snapshot: JobSnapshot,
+    task_deadline_exceeded: bool,
+) -> Result<serde_json::Value, ProtocolError> {
+    let mut value = serde_json::to_value(snapshot).map_err(internal_error)?;
+    if task_deadline_exceeded && let Some(object) = value.as_object_mut() {
+        object.insert("task_deadline_exceeded".to_owned(), true.into());
+    }
+    Ok(value)
 }
 
 fn parse<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T, ProtocolError> {
@@ -905,6 +943,63 @@ mod tests {
             xai_grok_native_execution::JobLifecycle::Cancelled
         );
         assert!(provider.request_jobs.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detached_nonzero_exit_preserves_output_and_reports_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = NativeExecutionProvider::open(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let output = provider
+            .execute(dispatch_with_mode(
+                "native.command.start",
+                serde_json::json!({
+                    "executable": "/bin/sh",
+                    "args": ["-c", "printf failure-evidence; exit 7"],
+                    "timeout_ms": 5_000
+                }),
+                ExecutionMode::Detached,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(output.output["lifecycle"], "failed");
+        assert_eq!(output.output["exit_code"], 7);
+        assert_eq!(output.terminal_status, Some(ProviderTerminalStatus::Failed));
+        assert_eq!(output.artifacts.len(), 1);
+        let crate::provider::ProviderArtifactSource::File { path } = &output.artifacts[0].content
+        else {
+            panic!("failed process output must remain available as an artifact");
+        };
+        assert!(path.is_file());
+    }
+
+    #[tokio::test]
+    async fn detached_task_deadline_cancels_process_but_preserves_partial_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = NativeExecutionProvider::open(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut request = dispatch_with_mode(
+            "native.command.start",
+            serde_json::json!({
+                "executable": "/bin/sh",
+                "args": ["-c", "printf before-deadline; sleep 30"],
+                "timeout_ms": 60_000
+            }),
+            ExecutionMode::Detached,
+        );
+        request.task.deadline_unix_ms = now_unix_ms() + 500;
+        let output = provider.execute(request).await.unwrap();
+        assert_eq!(output.output["lifecycle"], "cancelled");
+        assert_eq!(output.output["task_deadline_exceeded"], true);
+        assert_eq!(output.terminal_status, Some(ProviderTerminalStatus::Failed));
+        assert_eq!(output.artifacts.len(), 1);
+        let crate::provider::ProviderArtifactSource::File { path } = &output.artifacts[0].content
+        else {
+            panic!("partial deadline output must remain available as an artifact");
+        };
+        assert!(path.is_file());
     }
 
     #[tokio::test]
