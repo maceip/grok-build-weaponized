@@ -8,19 +8,27 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
+blake3 = { workspace = true }
 clap = { workspace = true }
 dunce = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { workspace = true }
+toml = { workspace = true }
+xai-grok-control-client = { workspace = true }
 xai-grok-config-types = { workspace = true }
 xai-grok-memory = { workspace = true }
 xai-grok-native-execution = { workspace = true }
+xai-grok-protocol = { workspace = true }
 xai-grok-runtime = { workspace = true }
 xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
 xai-grok-test-support = { workspace = true }
 xai-grok-tools = { workspace = true }
+
+[[bin]]
+name = "grok-integrated-qualifier"
+path = "src/bin/integrated_daemon.rs"
 
 [lints]
 workspace = true
