@@ -16,9 +16,9 @@ use xai_grok_protocol::{
     ExecutionReceipt, ExecutionTask, Exercise, ExerciseEvidence, ExerciseId, ExerciseStatus,
     Finding, FindingId, FindingStatus, MessageId, OperationRun, OperationRunId, OperationRunStatus,
     OperatorSession, OperatorSessionId, OperatorSessionStatus, PROTOCOL_VERSION, Playbook,
-    PlaybookId, ProtocolError, ProtocolErrorCode, ProviderDispatch, ProviderId, ResourceClaimId,
-    Response, ResponseEnvelope, ServiceHealth, TaskId, TaskStatus, TaskingPlan, TeamMessage,
-    TeamPresence, TeamResourceClaim, TeamWorkItem, TeamWorkItemId, TeamWorkItemStatus,
+    PlaybookId, ProjectionQuery, ProtocolError, ProtocolErrorCode, ProviderDispatch, ProviderId,
+    ResourceClaimId, Response, ResponseEnvelope, ServiceHealth, TaskId, TaskStatus, TaskingPlan,
+    TeamMessage, TeamPresence, TeamResourceClaim, TeamWorkItem, TeamWorkItemId, TeamWorkItemStatus,
 };
 
 use crate::SERVER_NAME;
@@ -1630,7 +1630,14 @@ impl ControlPlaneCore {
             }
             Command::ReadEvents(request) => Ok(Response::Events(self.read_events(&request).await?)),
             Command::QueryProjection(query) => {
-                Ok(Response::Projection(self.projections.query(query).await))
+                let mut snapshot = self.projections.query(query.clone()).await;
+                if matches!(query, ProjectionQuery::Capacity) {
+                    snapshot.value = serde_json::json!({
+                        "providers": self.providers.capacity().await,
+                        "overloads": snapshot.value,
+                    });
+                }
+                Ok(Response::Projection(snapshot))
             }
             Command::Shutdown => {
                 self.shutdown.cancel();
@@ -3463,6 +3470,45 @@ mod tests {
                 .response
                 .is_ok()
         );
+
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+    }
+
+    #[tokio::test]
+    async fn capacity_projection_reports_live_dispatchable_provider_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        handle
+            .register_provider(Arc::new(FunctionProvider::new(
+                provider_manifest(),
+                |_| async { Ok(ProviderOutput::default()) },
+                |_| async { Ok(()) },
+            )))
+            .await
+            .unwrap();
+        let response = handle
+            .submit(envelope(Command::QueryProjection(
+                ProjectionQuery::Capacity,
+            )))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Projection(snapshot) = response else {
+            panic!("expected capacity projection");
+        };
+        assert_eq!(
+            snapshot.value["providers"][0]["provider_id"],
+            "test-provider"
+        );
+        assert_eq!(snapshot.value["providers"][0]["maximum_parallel"], 1);
+        assert_eq!(snapshot.value["providers"][0]["available_permits"], 1);
+        assert_eq!(snapshot.value["providers"][0]["queue_capacity"], 4);
+        assert_eq!(snapshot.value["overloads"], serde_json::json!({}));
 
         handle.shutdown_token().cancel();
         control_plane.wait().await;

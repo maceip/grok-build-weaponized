@@ -10,6 +10,7 @@ pub mod artifact;
 pub mod control_plane;
 pub mod journal;
 pub mod native_provider;
+pub mod process_provider;
 pub mod projection;
 pub mod provider;
 pub mod server;
@@ -20,6 +21,7 @@ pub use artifact::{ArtifactDescriptor, ArtifactStore, ArtifactStoreConfig};
 pub use control_plane::{ControlPlane, ControlPlaneConfig, ControlPlaneError, ControlPlaneHandle};
 pub use journal::{EventJournal, JournalError};
 pub use native_provider::{NATIVE_PROVIDER_ID, NativeExecutionProvider};
+pub use process_provider::{ProcessExecutionProvider, ProcessProviderConfig};
 pub use projection::{
     ArtifactProjection, EngagementProjection, ProjectionStore, ProviderOutputProjection,
     ProviderProjection,

@@ -15586,6 +15586,8 @@ dependencies = [
  "xai-computer-hub-sdk",
  "xai-file-utils",
  "xai-grok-config",
+ "xai-grok-control-plane",
+ "xai-grok-protocol",
  "xai-grok-telemetry",
  "xai-grok-tools",
  "xai-grok-version",

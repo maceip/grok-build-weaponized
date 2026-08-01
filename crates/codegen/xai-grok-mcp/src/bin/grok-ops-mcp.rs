@@ -12,7 +12,7 @@
 //! Framework credentials are read from environment variables and are never
 //! accepted as model-visible tool parameters.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
@@ -26,12 +26,20 @@ use futures::StreamExt;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use walkdir::WalkDir;
 use xai_grok_mcp::rmcp;
 use xai_grok_mcp::rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     schemars, tool, tool_handler, tool_router,
+};
+use xai_grok_protocol::{
+    ArtifactContract, CancellationSemantics, CapabilityManifest, ConcurrencyProfile,
+    MAX_PROVIDER_WORKER_FRAME_BYTES, OperationDescriptor, PROVIDER_WORKER_PROTOCOL_VERSION,
+    Platform, ProtocolError, ProtocolErrorCode, ProviderDispatch, ProviderKind,
+    ProviderWorkerOutput, ProviderWorkerRequest, ProviderWorkerResponse, RecoverySemantics,
+    VersionRange,
 };
 
 const MAX_FRAMEWORK_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -42,7 +50,17 @@ const MAX_SEARCH_RESULTS: usize = 50;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let connector = env::args().nth(1).unwrap_or_default();
+    let mut arguments = env::args().skip(1);
+    let connector = arguments.next().unwrap_or_default();
+    let provider_worker = arguments.next().as_deref() == Some("--provider-worker");
+    if arguments.next().is_some() {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "too many arguments").into(),
+        );
+    }
+    if provider_worker {
+        return run_provider_worker(&connector).await;
+    }
     match connector.as_str() {
         "metasploit" => {
             let server = MetasploitServer::from_env().map_err(std::io::Error::other)?;
@@ -70,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "--help" | "-h" => {
             eprintln!(
-                "Usage: grok-ops-mcp <metasploit|bloodhound|vulnerability-index>\n\
+                "Usage: grok-ops-mcp <metasploit|bloodhound|vulnerability-index> [--provider-worker]\n\
                  Configuration is supplied through environment variables; see the Grok Build \
                  operational-observability documentation."
             );
@@ -83,6 +101,340 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum ConnectorWorker {
+    Metasploit(MetasploitServer),
+    BloodHound(BloodHoundServer),
+    Vulnerability(VulnerabilityServer),
+}
+
+impl ConnectorWorker {
+    fn from_env(connector: &str) -> Result<Self, String> {
+        match connector {
+            "metasploit" => MetasploitServer::from_env().map(Self::Metasploit),
+            "bloodhound" | "neo4j" => BloodHoundServer::from_env().map(Self::BloodHound),
+            "vulnerability-index" | "vuln-index" => {
+                VulnerabilityServer::from_env().map(Self::Vulnerability)
+            }
+            _ => Err("choose one connector: metasploit, bloodhound, or vulnerability-index".into()),
+        }
+    }
+
+    fn manifest(&self) -> CapabilityManifest {
+        let operation = |operation_id: &str,
+                         display_name: &str,
+                         input_schema: Value,
+                         deferred: bool| OperationDescriptor {
+            operation_id: operation_id.into(),
+            display_name: display_name.to_owned(),
+            input_schema,
+            output_schema: json!({"type":"object","additionalProperties":true}),
+            streaming: false,
+            interactive: true,
+            deferred,
+        };
+        let (provider_id, features, operations) = match self {
+            Self::Metasploit(_) => (
+                "mcp-metasploit",
+                vec!["external_framework", "metasploit", "messagepack_rpc"],
+                vec![
+                    operation(
+                        "metasploit.module_info",
+                        "Read Metasploit module metadata",
+                        json!({
+                            "type":"object",
+                            "required":["module_type","module_name"],
+                            "properties":{
+                                "module_type":{"type":"string"},
+                                "module_name":{"type":"string"}
+                            },
+                            "additionalProperties":false
+                        }),
+                        false,
+                    ),
+                    operation(
+                        "metasploit.execute_module",
+                        "Execute a Metasploit module",
+                        json!({
+                            "type":"object",
+                            "required":["module_type","module_name","target"],
+                            "properties":{
+                                "module_type":{"type":"string"},
+                                "module_name":{"type":"string"},
+                                "target":{"type":"string"},
+                                "options":{"type":"object"}
+                            },
+                            "additionalProperties":false
+                        }),
+                        true,
+                    ),
+                    operation(
+                        "metasploit.execution_status",
+                        "Read Metasploit execution status",
+                        json!({
+                            "type":"object",
+                            "required":["target"],
+                            "properties":{
+                                "target":{"type":"string"},
+                                "job_id":{"type":["integer","null"]},
+                                "execution_uuid":{"type":["string","null"]}
+                            },
+                            "additionalProperties":false
+                        }),
+                        true,
+                    ),
+                ],
+            ),
+            Self::BloodHound(_) => (
+                "mcp-bloodhound",
+                vec!["bloodhound", "external_framework", "neo4j", "read_only"],
+                vec![
+                    operation(
+                        "bloodhound.schema",
+                        "Read the BloodHound graph schema",
+                        json!({"type":"object","additionalProperties":false}),
+                        false,
+                    ),
+                    operation(
+                        "bloodhound.query",
+                        "Execute bounded read-only Cypher",
+                        json!({
+                            "type":"object",
+                            "required":["cypher"],
+                            "properties":{
+                                "cypher":{"type":"string"},
+                                "parameters":{"type":"object"},
+                                "max_rows":{"type":["integer","null"],"minimum":1,"maximum":1000}
+                            },
+                            "additionalProperties":false
+                        }),
+                        true,
+                    ),
+                ],
+            ),
+            Self::Vulnerability(_) => (
+                "mcp-vulnerability-index",
+                vec!["exploit_db", "fts5", "nvd", "offline_index"],
+                vec![
+                    operation(
+                        "vulnerability.refresh_index",
+                        "Refresh the offline vulnerability index",
+                        json!({"type":"object","additionalProperties":false}),
+                        true,
+                    ),
+                    operation(
+                        "vulnerability.search",
+                        "Search the offline vulnerability index",
+                        json!({
+                            "type":"object",
+                            "required":["query"],
+                            "properties":{
+                                "query":{"type":"string"},
+                                "limit":{"type":["integer","null"],"minimum":1,"maximum":50}
+                            },
+                            "additionalProperties":false
+                        }),
+                        false,
+                    ),
+                ],
+            ),
+        };
+        let mut platforms = BTreeSet::new();
+        platforms.insert(Platform {
+            os: env::consts::OS.to_owned(),
+            architecture: env::consts::ARCH.to_owned(),
+            accelerator: None,
+        });
+        CapabilityManifest {
+            provider_id: provider_id.into(),
+            provider_version: env!("CARGO_PKG_VERSION").to_owned(),
+            protocol: VersionRange::exact(xai_grok_protocol::PROTOCOL_VERSION),
+            kind: ProviderKind::McpConnector,
+            features: features.into_iter().map(str::to_owned).collect(),
+            operations,
+            concurrency: ConcurrencyProfile {
+                maximum_parallel: 1,
+                queue_capacity: 32,
+                exclusive_resource: Some(provider_id.to_owned()),
+            },
+            cancellation: CancellationSemantics::Unsupported,
+            recovery: RecoverySemantics::Restartable,
+            artifacts: ArtifactContract::Optional,
+            platforms,
+            metadata: [
+                ("transport".to_owned(), "local_binary_ipc".into()),
+                ("mcp_stdio_available".to_owned(), true.into()),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    async fn execute(
+        &self,
+        dispatch: ProviderDispatch,
+    ) -> Result<ProviderWorkerOutput, ProtocolError> {
+        let manifest = self.manifest();
+        if dispatch.provider_id != manifest.provider_id {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::UnknownProvider,
+                format!(
+                    "dispatch selected {} but worker is {}",
+                    dispatch.provider_id, manifest.provider_id
+                ),
+            ));
+        }
+        let operation = dispatch.task.capability.operation_id.as_str();
+        if manifest
+            .operation(&dispatch.task.capability.operation_id)
+            .is_none()
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::UnsupportedOperation,
+                format!(
+                    "provider {} does not support {operation}",
+                    manifest.provider_id
+                ),
+            ));
+        }
+        let input = dispatch.task.input;
+        let text = match (self, operation) {
+            (Self::Metasploit(server), "metasploit.module_info") => {
+                server
+                    .metasploit_module_info(Parameters(decode_input(input)?))
+                    .await
+            }
+            (Self::Metasploit(server), "metasploit.execute_module") => {
+                server
+                    .metasploit_execute_module(Parameters(decode_input(input)?))
+                    .await
+            }
+            (Self::Metasploit(server), "metasploit.execution_status") => {
+                server
+                    .metasploit_execution_status(Parameters(decode_input(input)?))
+                    .await
+            }
+            (Self::BloodHound(server), "bloodhound.schema") => server.bloodhound_schema().await,
+            (Self::BloodHound(server), "bloodhound.query") => {
+                server
+                    .bloodhound_query(Parameters(decode_input(input)?))
+                    .await
+            }
+            (Self::Vulnerability(server), "vulnerability.refresh_index") => {
+                server.vulnerability_refresh_index().await
+            }
+            (Self::Vulnerability(server), "vulnerability.search") => {
+                server
+                    .vulnerability_search(Parameters(decode_input(input)?))
+                    .await
+            }
+            _ => unreachable!("operation was checked against this worker manifest"),
+        }
+        .map_err(|message| ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message))?;
+        Ok(ProviderWorkerOutput {
+            output: serde_json::from_str(&text).unwrap_or_else(|_| json!({"text": text})),
+            ..ProviderWorkerOutput::default()
+        })
+    }
+}
+
+fn decode_input<T: serde::de::DeserializeOwned>(input: Value) -> Result<T, ProtocolError> {
+    serde_json::from_value(input).map_err(|error| {
+        ProtocolError::new(
+            ProtocolErrorCode::InvalidEnvelope,
+            format!("connector input does not match its schema: {error}"),
+        )
+    })
+}
+
+async fn run_provider_worker(connector: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let worker = ConnectorWorker::from_env(connector).map_err(std::io::Error::other)?;
+    let mut input = tokio::io::stdin();
+    let mut output = tokio::io::stdout();
+    let mut negotiated = false;
+    loop {
+        let request: ProviderWorkerRequest = read_provider_frame(&mut input).await?;
+        let response = match request {
+            ProviderWorkerRequest::Hello { protocol_version } => {
+                if negotiated || protocol_version != PROVIDER_WORKER_PROTOCOL_VERSION {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "incompatible or duplicate provider worker handshake",
+                    )
+                    .into());
+                }
+                negotiated = true;
+                ProviderWorkerResponse::Hello {
+                    protocol_version: PROVIDER_WORKER_PROTOCOL_VERSION,
+                    manifest: worker.manifest(),
+                }
+            }
+            ProviderWorkerRequest::Execute { dispatch } if negotiated => {
+                let request_id = dispatch.request_id.clone();
+                ProviderWorkerResponse::Execute {
+                    request_id,
+                    result: worker.execute(dispatch).await,
+                }
+            }
+            ProviderWorkerRequest::Cancel { request_id } if negotiated => {
+                ProviderWorkerResponse::Cancel {
+                    request_id,
+                    result: Err(ProtocolError::new(
+                        ProtocolErrorCode::UnsupportedOperation,
+                        "this connector does not expose cancellable in-flight requests",
+                    )),
+                }
+            }
+            ProviderWorkerRequest::Shutdown if negotiated => {
+                write_provider_frame(&mut output, &ProviderWorkerResponse::Ack).await?;
+                return Ok(());
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "provider worker requires a successful hello before commands",
+                )
+                .into());
+            }
+        };
+        write_provider_frame(&mut output, &response).await?;
+    }
+}
+
+async fn read_provider_frame<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
+    reader: &mut R,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let length = reader.read_u32().await? as usize;
+    if length > MAX_PROVIDER_WORKER_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("provider frame exceeds {MAX_PROVIDER_WORKER_FRAME_BYTES} bytes"),
+        )
+        .into());
+    }
+    let mut bytes = vec![0; length];
+    reader.read_exact(&mut bytes).await?;
+    Ok(rmp_serde::from_slice(&bytes)?)
+}
+
+async fn write_provider_frame<W: AsyncWrite + Unpin, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = rmp_serde::to_vec_named(value)?;
+    if bytes.len() > MAX_PROVIDER_WORKER_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("provider frame exceeds {MAX_PROVIDER_WORKER_FRAME_BYTES} bytes"),
+        )
+        .into());
+    }
+    writer.write_u32(u32::try_from(bytes.len())?).await?;
+    writer.write_all(&bytes).await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -1256,6 +1608,67 @@ impl ServerHandler for VulnerabilityServer {}
 mod tests {
     use super::*;
     use axum::{Router, body::Body, body::Bytes, response::Response, routing::post};
+
+    fn worker_dispatch(operation: &str, input: Value) -> ProviderDispatch {
+        ProviderDispatch {
+            request_id: "request-worker".into(),
+            engagement_id: "engagement-worker".into(),
+            plan_revision: 1,
+            task: xai_grok_protocol::ExecutionTask {
+                task_id: "task-worker".into(),
+                objective: "exercise connector worker".to_owned(),
+                mode: xai_grok_protocol::ExecutionMode::Interactive,
+                capability: xai_grok_protocol::CapabilityRequirement {
+                    operation_id: operation.into(),
+                    preferred_provider: Some("mcp-vulnerability-index".into()),
+                    required_features: Vec::new(),
+                },
+                input,
+                deadline_unix_ms: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+                    + 10_000,
+                completion_tests: Vec::new(),
+                depends_on: Vec::new(),
+            },
+            provider_id: "mcp-vulnerability-index".into(),
+            lease_epoch: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_worker_dispatches_the_real_offline_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exploitdb");
+        let worker = ConnectorWorker::Vulnerability(VulnerabilityServer {
+            config: VulnerabilityIndexConfig {
+                database: directory.path().join("index.sqlite"),
+                nvd_paths: Vec::new(),
+                exploitdb_csv: Some(fixture.join("files_exploits.csv")),
+                exploitdb_root: Some(fixture),
+            },
+            tool_router: VulnerabilityServer::tool_router(),
+        });
+        worker
+            .execute(worker_dispatch("vulnerability.refresh_index", json!({})))
+            .await
+            .unwrap();
+        let output = worker
+            .execute(worker_dispatch(
+                "vulnerability.search",
+                json!({"query":"CVE-2026-4242","limit":5}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(output.output[0]["id"], "EDB-424242");
+        assert!(
+            output.output[0]["execution_syntax"]
+                .as_str()
+                .unwrap()
+                .contains("example_check.py")
+        );
+    }
 
     #[test]
     fn cypher_gate_accepts_paths_and_rejects_mutations() {

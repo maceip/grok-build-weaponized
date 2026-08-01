@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use xai_grok_control_plane::{
     AgentExecutionProvider, AgentProviderConfig, ControlPlane, ControlPlaneConfig,
-    ControlPlaneServer, NativeExecutionProvider, ServerConfig,
+    ControlPlaneServer, NativeExecutionProvider, ProcessExecutionProvider, ProcessProviderConfig,
+    ServerConfig,
 };
 use xai_grok_native_execution::NativeExecutionLimits;
 use xai_grok_protocol::{
@@ -58,6 +59,16 @@ struct Arguments {
     /// compact execution nodes that are driven by another client.
     #[arg(long)]
     no_agent: bool,
+
+    /// `grok-ops-mcp` executable used for daemon-supervised connector workers.
+    /// Defaults to a sibling binary when at least one connector is enabled.
+    #[arg(long, env = "GROK_OPS_MCP_BINARY")]
+    ops_mcp_binary: Option<PathBuf>,
+
+    /// Start a real persistent connector worker. Repeat for metasploit,
+    /// bloodhound, and/or vulnerability-index.
+    #[arg(long = "ops-connector")]
+    ops_connectors: Vec<String>,
 }
 
 #[tokio::main]
@@ -140,6 +151,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handle.register_provider(provider.clone()).await?;
         Some(provider)
     };
+    let connector_names = requested_connectors(&arguments.ops_connectors, profile.as_ref())?;
+    let mut connector_providers = Vec::new();
+    if !arguments.control_only && !connector_names.is_empty() {
+        let binary = resolve_sibling_binary(
+            arguments.ops_mcp_binary.as_ref(),
+            "grok-ops-mcp",
+            "--ops-mcp-binary",
+        )?;
+        for connector in connector_names {
+            let mut config = ProcessProviderConfig::new(binary.clone());
+            config.arguments = vec![connector, "--provider-worker".to_owned()];
+            let provider = ProcessExecutionProvider::start(config).await?;
+            handle.register_provider(provider.clone()).await?;
+            connector_providers.push(provider);
+        }
+    }
     if let Some(profile) = &profile {
         validate_active_providers(profile, handle.providers().manifests().await)?;
     }
@@ -163,6 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         profile_hash = profile.as_ref().map(RuntimeProfile::content_hash).unwrap_or_default(),
         agent_provider = agent_provider.is_some(),
         native_provider = native_provider.is_some(),
+        connector_providers = connector_providers.len(),
         "grokd ready"
     );
 
@@ -220,6 +248,61 @@ fn profile_requirement(
         .providers
         .iter()
         .find(|provider| provider.kind == kind)
+}
+
+fn requested_connectors(
+    explicit: &[String],
+    profile: Option<&RuntimeProfile>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut connectors = std::collections::BTreeSet::new();
+    for connector in explicit {
+        connectors.insert(normalize_connector(connector)?);
+    }
+    if let Some(profile) = profile {
+        for requirement in profile
+            .providers
+            .iter()
+            .filter(|provider| provider.kind == ProviderKind::McpConnector)
+        {
+            let mut matched = false;
+            for operation in &requirement.operations {
+                let connector = if operation.as_str().starts_with("metasploit.") {
+                    Some("metasploit")
+                } else if operation.as_str().starts_with("bloodhound.") {
+                    Some("bloodhound")
+                } else if operation.as_str().starts_with("vulnerability.") {
+                    Some("vulnerability-index")
+                } else {
+                    None
+                };
+                if let Some(connector) = connector {
+                    connectors.insert(connector.to_owned());
+                    matched = true;
+                }
+            }
+            if !matched && explicit.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "an MCP provider requirement must name a metasploit.*, bloodhound.*, or vulnerability.* operation, or grokd must receive --ops-connector",
+                )
+                .into());
+            }
+        }
+    }
+    Ok(connectors.into_iter().collect())
+}
+
+fn normalize_connector(connector: &str) -> Result<String, Box<dyn std::error::Error>> {
+    match connector {
+        "metasploit" => Ok("metasploit".to_owned()),
+        "bloodhound" | "neo4j" => Ok("bloodhound".to_owned()),
+        "vulnerability-index" | "vuln-index" => Ok("vulnerability-index".to_owned()),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unknown operational connector {connector:?}"),
+        )
+        .into()),
+    }
 }
 
 fn validate_active_providers(
@@ -290,6 +373,34 @@ fn resolve_agent_binary(explicit: Option<&PathBuf>) -> Result<PathBuf, Box<dyn s
             "no persistent agent worker found beside {}; pass --agent-binary or use --control-only",
             current_executable.display()
         ),
+    )
+    .into())
+}
+
+fn resolve_sibling_binary(
+    explicit: Option<&PathBuf>,
+    name: &str,
+    option: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(explicit) = explicit {
+        return Ok(explicit.canonicalize()?);
+    }
+    let current_executable = std::env::current_exe()?;
+    let candidate = current_executable
+        .parent()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "grokd executable has no parent directory",
+            )
+        })?
+        .join(name);
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("no {name} found beside grokd; pass {option}"),
     )
     .into())
 }
@@ -420,5 +531,23 @@ mod tests {
         };
         let error = validate_active_providers(&profile(required), vec![manifest()]).unwrap_err();
         assert!(error.to_string().contains("maximum concurrency 1"));
+    }
+
+    #[test]
+    fn connector_workers_are_derived_from_required_operations() {
+        let required = ProfileProviderRequirement {
+            kind: ProviderKind::McpConnector,
+            operations: vec!["bloodhound.query".into(), "bloodhound.schema".into()],
+            required_features: vec!["read_only".to_owned()],
+            maximum_concurrency: 1,
+        };
+        assert_eq!(
+            requested_connectors(&[], Some(&profile(required))).unwrap(),
+            vec!["bloodhound"]
+        );
+        assert_eq!(
+            requested_connectors(&["neo4j".to_owned()], None).unwrap(),
+            vec!["bloodhound"]
+        );
     }
 }

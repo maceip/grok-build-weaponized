@@ -37,6 +37,7 @@ Commands:
   team message --team ID --channel ID --sender CLIENT --body TEXT [--reply-to ID]
   team claim --team ID --owner CLIENT --resource KEY --lease-ms N
   team release CLAIM_ID --owner CLIENT --revision N
+  provider invoke OPERATION --input FILE|- [--provider ID] [--timeout-ms N]
   job start --exec PATH [--arg VALUE ...] [--cwd PATH] [--env K=V ...] [--timeout-ms N]
   job nmap --target TARGET --scope SELECTOR[,SELECTOR] [--profile host_discovery|tcp_connect|service_discovery] [--ports LIST] [--timeout-ms N]
   job status ID
@@ -111,11 +112,60 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "evidence" => record_evidence(&control, arguments).await,
         "finding" => finding(&control, arguments).await,
         "team" => team(&control, arguments).await,
+        "provider" => provider(&control, arguments).await,
         "job" => job(&control, arguments).await,
         "submit" => submit(&control, arguments).await,
         "artifact" => artifact(&control, arguments).await,
         _ => Err(format!("unknown command {command:?}\n{USAGE}").into()),
     }
+}
+
+async fn provider(
+    control: &ControlPlaneClient,
+    mut arguments: VecDeque<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.pop_front().as_deref() != Some("invoke") {
+        return Err("provider requires `invoke OPERATION --input FILE|-`".into());
+    }
+    let operation = arguments
+        .pop_front()
+        .ok_or("provider invoke requires an operation")?;
+    let mut input_path = None;
+    let mut preferred_provider = None;
+    let mut timeout_ms = 35_000_u64;
+    while let Some(argument) = arguments.pop_front() {
+        match argument.as_str() {
+            "--input" => input_path = Some(value(&mut arguments, "--input")?),
+            "--provider" => {
+                preferred_provider = Some(ProviderId::from_string(value(
+                    &mut arguments,
+                    "--provider",
+                )?));
+            }
+            "--timeout-ms" => timeout_ms = value(&mut arguments, "--timeout-ms")?.parse()?,
+            other => return Err(format!("unknown provider invoke option {other:?}").into()),
+        }
+    }
+    let input_path = input_path.ok_or("provider invoke requires --input FILE|-")?;
+    let mut bytes = Vec::new();
+    if input_path == "-" {
+        std::io::stdin().read_to_end(&mut bytes)?;
+    } else {
+        bytes = std::fs::read(input_path)?;
+    }
+    let input = serde_json::from_slice(&bytes)?;
+    let response = control
+        .send(
+            Command::InvokeProvider {
+                request_id: RequestId::new(),
+                operation_id: OperationId::from_string(operation),
+                preferred_provider,
+                input,
+            },
+            Duration::from_millis(timeout_ms.max(1)),
+        )
+        .await?;
+    write_json(&response)
 }
 
 async fn job(

@@ -13,6 +13,7 @@ mod ids;
 mod ingress;
 mod output;
 mod profile;
+mod provider_worker;
 mod tasking;
 mod team;
 
@@ -47,6 +48,11 @@ pub use profile::{
     ArtifactBinding, DeploymentTarget, DiagnosticSeverity, GuiProfile, GuiRenderer, LibcTarget,
     ProfileDiagnostic, ProfileProviderRequirement, RUNTIME_PROFILE_SCHEMA_VERSION, RuntimeProfile,
     RuntimeResourceLimits,
+};
+pub use provider_worker::{
+    MAX_PROVIDER_WORKER_FRAME_BYTES, PROVIDER_WORKER_PROTOCOL_VERSION, ProviderWorkerArtifact,
+    ProviderWorkerArtifactSource, ProviderWorkerOutput, ProviderWorkerRequest,
+    ProviderWorkerResponse,
 };
 pub use tasking::{
     CapabilityRequirement, CompletionDecision, CompletionTest, EvidenceObservation, ExecutionMode,

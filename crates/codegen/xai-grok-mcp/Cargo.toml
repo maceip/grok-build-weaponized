@@ -43,6 +43,7 @@ tracing = { workspace = true }
 url = { workspace = true }
 webbrowser = { workspace = true }
 xai-grok-config = { workspace = true }
+xai-grok-protocol = { workspace = true }
 
 # For mcp_http_client.rs (rmcp trait signatures). Must match rmcp 2.1's own
 # versions or the trait types won't unify.
@@ -79,6 +80,7 @@ xai-computer-hub-sdk = { workspace = true }
 # `test-util` enables `tokio::time::pause` / `advance`, required by
 # the deterministic timing tests in `liveness.rs`.
 tokio = { workspace = true, features = ["test-util"] }
+xai-grok-control-plane = { workspace = true }
 
 [lints]
 workspace = true
