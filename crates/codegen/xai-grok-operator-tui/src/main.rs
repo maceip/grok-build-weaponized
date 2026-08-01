@@ -14,17 +14,47 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use xai_grok_operator_core::{
     OperatorClientConfig, OperatorCommand, OperatorState, OperatorUpdate, event_summary,
     parse_scope_targets, spawn_client_worker,
+    theme::{
+        self as shared_theme, GOLD, GOLD_MATTE, GREEN_TEXT, HOT_PINK, NEON_GREEN, OBSIDIAN,
+        ON_GOLD, ON_GREEN, ON_SURFACE, ON_SURFACE_VARIANT, OUTLINE, OUTLINE_VARIANT, PINK_TEXT,
+        Rgb, SURFACE, SURFACE_LOW, SemanticTone,
+    },
 };
 use xai_grok_protocol::{
     ClientId, ExerciseId, IngressSource, OperationRunId, OperatorSessionId, TeamId,
 };
 
-const ACCENT: Color = Color::Rgb(122, 162, 247);
-const MUTED: Color = Color::Rgb(86, 95, 137);
+fn color(rgb: Rgb) -> Color {
+    let (red, green, blue) = rgb.tuple();
+    Color::Rgb(red, green, blue)
+}
+
+fn tone_color(tone: SemanticTone) -> Color {
+    color(shared_theme::tone_rgb(tone))
+}
+
+fn panel<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(color(GOLD_MATTE)))
+        .style(Style::default().bg(color(OBSIDIAN)).fg(color(ON_SURFACE)))
+}
+
+fn key_span(label: &'static str) -> Span<'static> {
+    Span::styled(
+        label,
+        Style::default()
+            .fg(color(ON_GOLD))
+            .bg(color(GOLD))
+            .add_modifier(Modifier::BOLD),
+    )
+}
 
 #[derive(Clone, Debug)]
 struct Arguments {
@@ -224,6 +254,9 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
+        }
         if self.form.is_some() {
             self.handle_form_key(key);
             return false;
@@ -371,10 +404,14 @@ impl App {
     }
 
     fn draw(&self, frame: &mut ratatui::Frame<'_>) {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(color(OBSIDIAN)).fg(color(ON_SURFACE))),
+            frame.area(),
+        );
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
+                Constraint::Length(4),
                 Constraint::Min(10),
                 Constraint::Length(3),
             ])
@@ -404,20 +441,42 @@ impl App {
             .map_or("no exercise", |exercise| exercise.name.as_str());
         let line = Line::from(vec![
             Span::styled(
-                " GROK OPS ",
+                " GROK // OPERATIONS ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(ACCENT)
+                    .fg(color(ON_GOLD))
+                    .bg(color(GOLD))
+                    .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            ),
+            Span::styled("  MISSION  ", Style::default().fg(color(OUTLINE))),
+            Span::styled(
+                selected.to_ascii_uppercase(),
+                Style::default()
+                    .fg(color(GOLD))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
-            Span::styled(selected, Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("  "),
-            Span::styled(&self.state.connection, Style::default().fg(MUTED)),
-            Span::raw(format!("  cursor {}", self.state.cursor)),
+            Span::styled("  //  ", Style::default().fg(color(OUTLINE_VARIANT))),
+            Span::styled(
+                self.state.connection.to_ascii_uppercase(),
+                Style::default()
+                    .fg(tone_color(shared_theme::connection_tone(
+                        &self.state.connection,
+                    )))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  CURSOR {:08}", self.state.cursor),
+                Style::default().fg(color(ON_SURFACE_VARIANT)),
+            ),
         ]);
         frame.render_widget(
-            Paragraph::new(line).block(Block::default().borders(Borders::BOTTOM)),
+            Paragraph::new(line)
+                .style(Style::default().bg(color(SURFACE)).fg(color(ON_SURFACE)))
+                .block(
+                    Block::default()
+                        .borders(Borders::BOTTOM)
+                        .border_type(BorderType::Double)
+                        .border_style(Style::default().fg(color(GOLD))),
+                ),
             area,
         );
     }
@@ -425,56 +484,79 @@ impl App {
     fn draw_navigation(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let items = self.nav_items();
         let rows = if items.is_empty() {
-            vec![ListItem::new("No exercises. Press n to create one.")]
+            vec![ListItem::new(Line::from(vec![
+                Span::styled("NO EXERCISES", Style::default().fg(color(PINK_TEXT))),
+                Span::styled(
+                    "  PRESS N TO CREATE THE FIRST MISSION BOUNDARY",
+                    Style::default().fg(color(OUTLINE)),
+                ),
+            ]))]
         } else {
             items
                 .iter()
                 .enumerate()
                 .map(|(index, item)| {
-                    let (prefix, label) = match item {
+                    let (prefix, label, base_style) = match item {
                         NavItem::Exercise(id) => (
-                            "◆ ",
+                            "◆  ",
                             self.state
                                 .catalog
                                 .exercises
                                 .iter()
                                 .find(|exercise| &exercise.exercise_id == id)
                                 .map_or("unknown", |exercise| exercise.name.as_str()),
+                            Style::default()
+                                .fg(color(GOLD))
+                                .add_modifier(Modifier::BOLD),
                         ),
                         NavItem::Run(id) => (
-                            "  ├─ ",
+                            "   ├─  ",
                             self.state
                                 .catalog
                                 .operation_runs
                                 .iter()
                                 .find(|run| &run.operation_run_id == id)
                                 .map_or("unknown", |run| run.name.as_str()),
+                            Style::default().fg(color(ON_SURFACE_VARIANT)),
                         ),
                         NavItem::Session(id) => (
-                            "     └─ ",
+                            "      └─  ",
                             self.state
                                 .catalog
                                 .sessions
                                 .iter()
                                 .find(|session| &session.session_id == id)
                                 .map_or("unknown", |session| session.name.as_str()),
+                            Style::default().fg(color(GREEN_TEXT)),
                         ),
                     };
                     let style = if index == self.nav_index {
-                        Style::default().fg(Color::Black).bg(ACCENT)
-                    } else {
                         Style::default()
+                            .fg(color(ON_GREEN))
+                            .bg(color(NEON_GREEN))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        base_style.bg(color(OBSIDIAN))
                     };
-                    ListItem::new(format!("{prefix}{label}")).style(style)
+                    ListItem::new(format!("{prefix}{}", label.to_ascii_uppercase())).style(style)
                 })
                 .collect()
         };
         frame.render_widget(
-            List::new(rows).block(
-                Block::default()
-                    .title(" Exercises / runs / sessions ")
-                    .borders(Borders::ALL),
-            ),
+            List::new(rows)
+                .style(Style::default().bg(color(OBSIDIAN)).fg(color(ON_SURFACE)))
+                .block(panel(Line::from(vec![
+                    Span::styled(
+                        " MISSION INDEX ",
+                        Style::default()
+                            .fg(color(GOLD))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        " EXERCISES / RUNS / SESSIONS ",
+                        Style::default().fg(color(OUTLINE)),
+                    ),
+                ]))),
             area,
         );
     }
@@ -487,22 +569,50 @@ impl App {
             .into_iter()
             .flat_map(|graph| {
                 let mut graph_rows = vec![ListItem::new(Line::from(vec![
-                    Span::styled("turn   ", Style::default().fg(ACCENT)),
-                    Span::raw(format!(
-                        "{} r{} — {}",
-                        graph.engagement_id.as_str(),
-                        graph.revision,
-                        graph.objective
-                    )),
+                    Span::styled(
+                        " TURN ",
+                        Style::default()
+                            .fg(color(ON_GOLD))
+                            .bg(color(GOLD))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  {}  R{}  ", graph.engagement_id.as_str(), graph.revision,),
+                        Style::default().fg(color(OUTLINE)),
+                    ),
+                    Span::styled(
+                        graph.objective.clone(),
+                        Style::default()
+                            .fg(color(ON_SURFACE))
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]))];
                 graph_rows.extend(graph.tasks.iter().map(|node| {
+                    let tone = shared_theme::task_tone(node.status);
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!("{:?} ", node.status), Style::default().fg(ACCENT)),
-                        Span::raw(format!(
-                            "{} — {}",
-                            node.task.task_id.as_str(),
-                            node.task.objective
-                        )),
+                        Span::styled(
+                            format!(" {:<10} ", format!("{:?}", node.status).to_uppercase()),
+                            Style::default()
+                                .fg(if matches!(tone, SemanticTone::Live) {
+                                    color(ON_GREEN)
+                                } else {
+                                    tone_color(tone)
+                                })
+                                .bg(if matches!(tone, SemanticTone::Live) {
+                                    color(NEON_GREEN)
+                                } else {
+                                    color(SURFACE_LOW)
+                                })
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("  {}  ", node.task.task_id.as_str()),
+                            Style::default().fg(color(OUTLINE)),
+                        ),
+                        Span::styled(
+                            node.task.objective.clone(),
+                            Style::default().fg(color(ON_SURFACE_VARIANT)),
+                        ),
                     ]))
                 }));
                 graph_rows
@@ -516,8 +626,15 @@ impl App {
                 .flat_map(|output| {
                     output.text.lines().map(|line| {
                         ListItem::new(Line::from(vec![
-                            Span::styled("agent  ", Style::default().fg(ACCENT)),
-                            Span::raw(line.to_owned()),
+                            Span::styled(
+                                " AGENT ",
+                                Style::default()
+                                    .fg(color(ON_GREEN))
+                                    .bg(color(NEON_GREEN))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled("  ", Style::default()),
+                            Span::styled(line.to_owned(), Style::default().fg(color(GREEN_TEXT))),
                         ]))
                     })
                 })
@@ -533,10 +650,13 @@ impl App {
                 .map(|event| {
                     ListItem::new(Line::from(vec![
                         Span::styled(
-                            format!("{:>7} ", event.sequence),
-                            Style::default().fg(MUTED),
+                            format!(" #{:07} ", event.sequence),
+                            Style::default().fg(color(GOLD)),
                         ),
-                        Span::raw(event_summary(event)),
+                        Span::styled(
+                            event_summary(event),
+                            Style::default().fg(tone_color(shared_theme::event_tone(event))),
+                        ),
                     ]))
                 })
                 .collect::<Vec<_>>(),
@@ -545,11 +665,20 @@ impl App {
             rows.drain(0..rows.len() - height.max(1));
         }
         frame.render_widget(
-            List::new(rows).block(
-                Block::default()
-                    .title(" Live activity ")
-                    .borders(Borders::ALL),
-            ),
+            List::new(rows)
+                .style(Style::default().bg(color(OBSIDIAN)).fg(color(ON_SURFACE)))
+                .block(panel(Line::from(vec![
+                    Span::styled(
+                        " LIVE ACTIVITY ",
+                        Style::default()
+                            .fg(color(GREEN_TEXT))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        " TASK GRAPH / MODEL OUTPUT / JOURNAL ",
+                        Style::default().fg(color(OUTLINE)),
+                    ),
+                ]))),
             area,
         );
     }
@@ -558,48 +687,95 @@ impl App {
         let mut lines = Vec::new();
         if let Some(exercise) = self.state.selected_exercise() {
             lines.push(Line::styled(
-                "EXERCISE",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                " EXERCISE ",
+                Style::default()
+                    .fg(color(ON_GOLD))
+                    .bg(color(GOLD))
+                    .add_modifier(Modifier::BOLD),
             ));
-            lines.push(Line::raw(exercise.name.clone()));
-            lines.push(Line::raw(exercise.objective.clone()));
+            lines.push(Line::styled(
+                exercise.name.to_ascii_uppercase(),
+                Style::default()
+                    .fg(color(GOLD))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::styled(
+                exercise.objective.clone(),
+                Style::default().fg(color(ON_SURFACE_VARIANT)),
+            ));
             lines.push(Line::raw(""));
         }
         if let Some(run) = self.state.selected_operation_run() {
             lines.push(Line::styled(
-                "RUN",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                format!(" RUN / {:?} ", run.status).to_uppercase(),
+                Style::default()
+                    .fg(color(ON_GREEN))
+                    .bg(color(NEON_GREEN))
+                    .add_modifier(Modifier::BOLD),
             ));
-            lines.push(Line::raw(run.name.clone()));
-            lines.push(Line::raw(run.objective.clone()));
+            lines.push(Line::styled(
+                run.name.to_ascii_uppercase(),
+                Style::default()
+                    .fg(color(GREEN_TEXT))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::styled(
+                run.objective.clone(),
+                Style::default().fg(color(ON_SURFACE_VARIANT)),
+            ));
             lines.push(Line::raw(""));
         }
         if let Some(session) = self.state.selected_session() {
             lines.push(Line::styled(
-                "SESSION",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                format!(" SESSION / {:?} ", session.status).to_uppercase(),
+                Style::default()
+                    .fg(color(PINK_TEXT))
+                    .bg(color(SURFACE_LOW))
+                    .add_modifier(Modifier::BOLD),
             ));
-            lines.push(Line::raw(session.name.clone()));
-            lines.push(Line::raw(session.purpose.clone()));
+            lines.push(Line::styled(
+                session.name.to_ascii_uppercase(),
+                Style::default()
+                    .fg(color(PINK_TEXT))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::styled(
+                session.purpose.clone(),
+                Style::default().fg(color(ON_SURFACE_VARIANT)),
+            ));
             lines.push(Line::raw(""));
         }
         lines.push(Line::styled(
-            "TEAM",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            " TEAM ",
+            Style::default()
+                .fg(color(ON_GOLD))
+                .bg(color(GOLD))
+                .add_modifier(Modifier::BOLD),
         ));
         if self.state.team.presence.is_empty() {
-            lines.push(Line::raw("No connected team clients"));
+            lines.push(Line::styled(
+                "NO CONNECTED TEAM CLIENTS",
+                Style::default().fg(color(OUTLINE)),
+            ));
         }
         for presence in &self.state.team.presence {
-            lines.push(Line::raw(format!(
-                "{} {:?}",
-                presence
-                    .client
-                    .display_name
-                    .as_deref()
-                    .unwrap_or(presence.client.client_id.as_str()),
-                presence.state
-            )));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {:?} ", presence.state).to_uppercase(),
+                    Style::default()
+                        .fg(tone_color(shared_theme::presence_tone(presence.state)))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    presence
+                        .client
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(presence.client.client_id.as_str())
+                        .to_owned(),
+                    Style::default().fg(color(ON_SURFACE)),
+                ),
+            ]));
         }
         for work_item in self.state.team.work_items.iter().filter(|item| {
             self.state
@@ -608,16 +784,26 @@ impl App {
                 .as_ref()
                 .is_none_or(|selected| item.exercise_id.as_ref() == Some(selected))
         }) {
-            lines.push(Line::raw(format!(
-                "{:?}: {}{}",
-                work_item.status,
-                work_item.title,
-                work_item
-                    .assignee
-                    .as_ref()
-                    .map(|assignee| format!(" -> {}", assignee.as_str()))
-                    .unwrap_or_default()
-            )));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {:?} ", work_item.status).to_uppercase(),
+                    Style::default()
+                        .fg(tone_color(shared_theme::work_item_tone(work_item.status)))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "{}{}",
+                        work_item.title,
+                        work_item
+                            .assignee
+                            .as_ref()
+                            .map(|assignee| format!(" -> {}", assignee.as_str()))
+                            .unwrap_or_default()
+                    ),
+                    Style::default().fg(color(ON_SURFACE_VARIANT)),
+                ),
+            ]));
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -630,56 +816,90 @@ impl App {
             .iter()
             .filter(|claim| claim.released_unix_ms.is_none() && claim.expires_unix_ms > now)
         {
-            lines.push(Line::raw(format!(
-                "claim {} by {}",
-                claim.resource_key,
-                claim.owner.as_str()
-            )));
+            lines.push(Line::styled(
+                format!("CLAIM {} BY {}", claim.resource_key, claim.owner.as_str()),
+                Style::default().fg(color(GREEN_TEXT)),
+            ));
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "CAPACITY",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            " CAPACITY ",
+            Style::default()
+                .fg(color(ON_GOLD))
+                .bg(color(GOLD))
+                .add_modifier(Modifier::BOLD),
         ));
-        lines.extend(
-            pretty_json(&self.state.capacity)
-                .lines()
-                .map(|line| Line::raw(line.to_owned())),
-        );
+        lines.extend(pretty_json(&self.state.capacity).lines().map(|line| {
+            Line::styled(
+                line.to_owned(),
+                Style::default().fg(color(ON_SURFACE_VARIANT)),
+            )
+        }));
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "PROVIDERS",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            " PROVIDERS ",
+            Style::default()
+                .fg(color(ON_GREEN))
+                .bg(color(NEON_GREEN))
+                .add_modifier(Modifier::BOLD),
         ));
-        lines.extend(
-            pretty_json(&self.state.providers)
-                .lines()
-                .map(|line| Line::raw(line.to_owned())),
-        );
+        lines.extend(pretty_json(&self.state.providers).lines().map(|line| {
+            Line::styled(
+                line.to_owned(),
+                Style::default().fg(color(ON_SURFACE_VARIANT)),
+            )
+        }));
         frame.render_widget(
             Paragraph::new(lines)
+                .style(Style::default().bg(color(OBSIDIAN)).fg(color(ON_SURFACE)))
                 .wrap(Wrap { trim: false })
-                .block(Block::default().title(" Context ").borders(Borders::ALL)),
+                .block(panel(Line::from(vec![
+                    Span::styled(
+                        " MISSION TELEMETRY ",
+                        Style::default()
+                            .fg(color(GOLD))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" CONTEXT ", Style::default().fg(color(OUTLINE))),
+                ]))),
             area,
         );
     }
 
     fn draw_footer(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let help = Line::from(vec![
-            Span::styled(" n ", Style::default().fg(Color::Black).bg(MUTED)),
-            Span::raw(" exercise  "),
-            Span::styled(" r ", Style::default().fg(Color::Black).bg(MUTED)),
-            Span::raw(" run  "),
-            Span::styled(" s ", Style::default().fg(Color::Black).bg(MUTED)),
-            Span::raw(" session  "),
-            Span::styled(" i ", Style::default().fg(Color::Black).bg(MUTED)),
-            Span::raw(" send  "),
-            Span::styled(" q ", Style::default().fg(Color::Black).bg(MUTED)),
-            Span::raw(" quit  •  "),
-            Span::styled(&self.state.notice, Style::default().fg(ACCENT)),
+            key_span(" N "),
+            Span::styled(
+                " EXERCISE  ",
+                Style::default().fg(color(ON_SURFACE_VARIANT)),
+            ),
+            key_span(" R "),
+            Span::styled(" RUN  ", Style::default().fg(color(ON_SURFACE_VARIANT))),
+            key_span(" S "),
+            Span::styled(" SESSION  ", Style::default().fg(color(ON_SURFACE_VARIANT))),
+            key_span(" I "),
+            Span::styled(" SEND  ", Style::default().fg(color(ON_SURFACE_VARIANT))),
+            key_span(" Q "),
+            Span::styled(
+                " QUIT  //  ",
+                Style::default().fg(color(ON_SURFACE_VARIANT)),
+            ),
+            Span::styled(
+                self.state.notice.to_ascii_uppercase(),
+                Style::default()
+                    .fg(tone_color(shared_theme::notice_tone(&self.state.notice)))
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]);
         frame.render_widget(
-            Paragraph::new(help).block(Block::default().borders(Borders::TOP)),
+            Paragraph::new(help)
+                .style(Style::default().bg(color(SURFACE)).fg(color(ON_SURFACE)))
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .border_type(BorderType::Double)
+                        .border_style(Style::default().fg(color(GOLD))),
+                ),
             area,
         );
     }
@@ -688,17 +908,28 @@ impl App {
         let area = centered(68, form.values.len() as u16 * 3 + 7, frame.area());
         frame.render_widget(Clear, area);
         let inner = Block::default()
-            .title(format!(" {} ", form.title))
+            .title(format!(" {} ", form.title.to_ascii_uppercase()))
             .title_alignment(Alignment::Center)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT))
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(color(GOLD)))
             .inner(area);
         frame.render_widget(
             Block::default()
-                .title(format!(" {} ", form.title))
+                .title(format!(" {} ", form.title.to_ascii_uppercase()))
                 .title_alignment(Alignment::Center)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT)),
+                .border_type(BorderType::Double)
+                .border_style(
+                    Style::default()
+                        .fg(color(GOLD))
+                        .add_modifier(Modifier::BOLD),
+                )
+                .style(
+                    Style::default()
+                        .bg(color(SURFACE_LOW))
+                        .fg(color(ON_SURFACE)),
+                ),
             area,
         );
         let constraints = std::iter::repeat_n(Constraint::Length(3), form.values.len())
@@ -715,14 +946,29 @@ impl App {
             .zip(rows.iter())
             .enumerate()
         {
-            let border = if index == form.active { ACCENT } else { MUTED };
+            let border = if index == form.active {
+                HOT_PINK
+            } else {
+                OUTLINE_VARIANT
+            };
             frame.render_widget(
-                Paragraph::new(value.as_str()).block(
-                    Block::default()
-                        .title(format!(" {label} "))
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(border)),
-                ),
+                Paragraph::new(value.as_str())
+                    .style(Style::default().bg(color(SURFACE)).fg(color(ON_SURFACE)))
+                    .block(
+                        Block::default()
+                            .title(Span::styled(
+                                format!(" {} ", label.to_ascii_uppercase()),
+                                Style::default()
+                                    .fg(if index == form.active {
+                                        color(PINK_TEXT)
+                                    } else {
+                                        color(OUTLINE)
+                                    })
+                                    .add_modifier(Modifier::BOLD),
+                            ))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(color(border))),
+                    ),
                 *row,
             );
         }
@@ -731,9 +977,9 @@ impl App {
         );
         frame.render_widget(
             Paragraph::new(instruction).style(Style::default().fg(if form.error.is_some() {
-                Color::Red
+                color(PINK_TEXT)
             } else {
-                MUTED
+                color(GREEN_TEXT)
             })),
             rows[form.values.len()],
         );
@@ -884,9 +1130,68 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Create the first exercise"));
-        assert!(rendered.contains("Workspace"));
-        assert!(rendered.contains("Objective"));
-        assert!(rendered.contains("Scope"));
+        assert!(rendered.contains("CREATE THE FIRST EXERCISE"));
+        assert!(rendered.contains("WORKSPACE"));
+        assert!(rendered.contains("OBJECTIVE"));
+        assert!(rendered.contains("SCOPE"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.fg == color(GOLD)),
+            "gold structural accent must reach terminal cells"
+        );
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.fg == color(PINK_TEXT)),
+            "the focused first-run field must use the pink focus accent"
+        );
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.bg == color(OBSIDIAN)),
+            "the terminal surface must render the obsidian base"
+        );
+    }
+
+    #[test]
+    fn first_run_remains_legible_on_an_eighty_column_terminal() {
+        let (_updates_tx, updates) = mpsc::sync_channel(1);
+        let (commands, _command_rx) = mpsc::sync_channel(1);
+        let mut app = App::new(updates, commands, Arc::new(AtomicBool::new(false)));
+        app.state.catalog_loaded = true;
+        app.receive_updates();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("CREATE THE FIRST EXERCISE"));
+        assert!(rendered.contains("WORKSPACE"));
+        assert!(rendered.contains("SCOPE"));
+    }
+
+    #[test]
+    fn control_c_exits_even_when_the_first_run_form_is_open() {
+        let (_updates_tx, updates) = mpsc::sync_channel(1);
+        let (commands, _command_rx) = mpsc::sync_channel(1);
+        let mut app = App::new(updates, commands, Arc::new(AtomicBool::new(false)));
+        app.state.catalog_loaded = true;
+        app.receive_updates();
+        assert!(app.form.is_some());
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL,)));
     }
 }

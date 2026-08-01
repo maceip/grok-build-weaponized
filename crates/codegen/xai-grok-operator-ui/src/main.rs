@@ -7,8 +7,14 @@ use eframe::egui;
 use xai_grok_operator_core::{
     OperatorClientConfig, OperatorCommand, OperatorState, OperatorUpdate, event_summary,
     parse_scope_targets, spawn_client_worker,
+    theme::{
+        self as shared_theme, GOLD, GREEN_TEXT, HOT_PINK, OBSIDIAN, ON_GREEN, ON_SURFACE,
+        ON_SURFACE_VARIANT, OUTLINE, PINK_TEXT, SURFACE, SURFACE_LOW, SemanticTone,
+    },
 };
 use xai_grok_protocol::{ClientId, IngressSource, TeamId};
+
+mod theme;
 
 #[derive(Clone, Debug)]
 struct Arguments {
@@ -39,7 +45,8 @@ struct OperatorApp {
 }
 
 impl OperatorApp {
-    fn new(arguments: Arguments) -> Self {
+    fn new(arguments: Arguments, context: &egui::Context) -> Self {
+        theme::configure(context);
         let (updates_tx, updates) = mpsc::sync_channel(128);
         let (commands, command_rx) = mpsc::sync_channel(16);
         let stop = Arc::new(AtomicBool::new(false));
@@ -108,18 +115,48 @@ impl OperatorApp {
     }
 
     fn show_catalog(&mut self, ui: &mut egui::Ui) {
+        theme::section_heading(ui, "mission index", "Exercises");
         ui.horizontal(|ui| {
-            ui.heading("Exercises");
-            if ui.small_button("+").on_hover_text("New exercise").clicked() {
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("+ NEW EXERCISE").monospace().strong())
+                        .fill(theme::color(SURFACE_LOW))
+                        .stroke(egui::Stroke::new(1.0, theme::color(GOLD)))
+                        .corner_radius(egui::CornerRadius::ZERO),
+                )
+                .clicked()
+            {
                 self.dialog = Some(DialogKind::Exercise);
             }
         });
-        ui.separator();
+        ui.add_space(8.0);
         let exercises = self.state.catalog.exercises.clone();
         for exercise in exercises {
             let selected = self.state.selection.exercise_id.as_ref() == Some(&exercise.exercise_id);
             if ui
-                .selectable_label(selected, format!("◆ {}", exercise.name))
+                .add_sized(
+                    [ui.available_width(), 34.0],
+                    egui::Button::new(
+                        egui::RichText::new(format!("◆  {}", exercise.name.to_ascii_uppercase()))
+                            .monospace()
+                            .strong(),
+                    )
+                    .selected(selected)
+                    .fill(if selected {
+                        theme::color(GOLD)
+                    } else {
+                        theme::color(SURFACE)
+                    })
+                    .stroke(egui::Stroke::new(
+                        if selected { 2.0 } else { 1.0 },
+                        if selected {
+                            theme::color(GREEN_TEXT)
+                        } else {
+                            theme::color(shared_theme::OUTLINE_VARIANT)
+                        },
+                    ))
+                    .corner_radius(egui::CornerRadius::ZERO),
+                )
                 .clicked()
             {
                 self.state.select_exercise(exercise.exercise_id.clone());
@@ -138,7 +175,29 @@ impl OperatorApp {
                 ui.horizontal(|ui| {
                     ui.add_space(12.0);
                     if ui
-                        .selectable_label(selected, format!("├─ {}", run.name))
+                        .add_sized(
+                            [ui.available_width(), 29.0],
+                            egui::Button::new(
+                                egui::RichText::new(format!("├─  {}", run.name))
+                                    .monospace()
+                                    .color(if selected {
+                                        theme::color(GREEN_TEXT)
+                                    } else {
+                                        theme::color(ON_SURFACE_VARIANT)
+                                    }),
+                            )
+                            .selected(selected)
+                            .fill(theme::color(if selected { SURFACE_LOW } else { OBSIDIAN }))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                theme::color(if selected {
+                                    shared_theme::NEON_GREEN
+                                } else {
+                                    shared_theme::OUTLINE_VARIANT
+                                }),
+                            ))
+                            .corner_radius(egui::CornerRadius::ZERO),
+                        )
                         .clicked()
                     {
                         self.state
@@ -175,14 +234,23 @@ impl OperatorApp {
             }
         }
         if self.state.catalog.exercises.is_empty() {
-            ui.label("No exercises yet.");
+            theme::deco_frame(SURFACE, SemanticTone::Muted).show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("NO EXERCISES — CREATE THE FIRST MISSION BOUNDARY")
+                        .monospace()
+                        .color(theme::color(OUTLINE)),
+                );
+            });
         }
-        ui.separator();
+        ui.add_space(12.0);
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     self.state.selected_exercise().is_some(),
-                    egui::Button::new("New run"),
+                    egui::Button::new("NEW RUN")
+                        .fill(theme::color(SURFACE_LOW))
+                        .stroke(egui::Stroke::new(1.0, theme::color(GOLD)))
+                        .corner_radius(egui::CornerRadius::ZERO),
                 )
                 .clicked()
             {
@@ -191,7 +259,10 @@ impl OperatorApp {
             if ui
                 .add_enabled(
                     self.state.selected_exercise().is_some(),
-                    egui::Button::new("New session"),
+                    egui::Button::new("NEW SESSION")
+                        .fill(theme::color(SURFACE_LOW))
+                        .stroke(egui::Stroke::new(1.0, theme::color(GOLD)))
+                        .corner_radius(egui::CornerRadius::ZERO),
                 )
                 .clicked()
             {
@@ -205,7 +276,33 @@ impl OperatorApp {
         ui.horizontal(|ui| {
             ui.add_space(28.0);
             if ui
-                .selectable_label(selected, format!("└─ {}", session.name))
+                .add_sized(
+                    [ui.available_width(), 27.0],
+                    egui::Button::new(
+                        egui::RichText::new(format!("└─  {}", session.name))
+                            .monospace()
+                            .color(if selected {
+                                theme::color(ON_GREEN)
+                            } else {
+                                theme::color(ON_SURFACE_VARIANT)
+                            }),
+                    )
+                    .selected(selected)
+                    .fill(if selected {
+                        theme::color(shared_theme::NEON_GREEN)
+                    } else {
+                        theme::color(OBSIDIAN)
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        if selected {
+                            theme::color(HOT_PINK)
+                        } else {
+                            theme::color(shared_theme::OUTLINE_VARIANT)
+                        },
+                    ))
+                    .corner_radius(egui::CornerRadius::ZERO),
+                )
                 .clicked()
             {
                 self.state.select_session(session.session_id.clone());
@@ -215,18 +312,30 @@ impl OperatorApp {
 
     fn show_activity(&mut self, ui: &mut egui::Ui) {
         if let Some(session) = self.state.selected_session() {
-            ui.heading(format!("Session: {}", session.name));
-            ui.label(&session.purpose);
-            ui.add(
-                egui::TextEdit::multiline(&mut self.request)
-                    .desired_rows(4)
-                    .hint_text("Give the agent work within this session"),
+            theme::section_heading(ui, "active execution lane", &session.name);
+            ui.label(
+                egui::RichText::new(&session.purpose)
+                    .size(17.0)
+                    .italics()
+                    .color(theme::color(ON_SURFACE_VARIANT)),
             );
+            ui.add_space(8.0);
+            theme::deco_frame(SURFACE, SemanticTone::Primary).show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("OPERATOR DIRECTIVE")
+                        .monospace()
+                        .strong()
+                        .color(theme::color(GREEN_TEXT)),
+                );
+                ui.add_sized(
+                    [ui.available_width(), 92.0],
+                    egui::TextEdit::multiline(&mut self.request)
+                        .desired_rows(4)
+                        .hint_text("Give the agent work within this session"),
+                );
+            });
             let can_submit = !self.request.trim().is_empty();
-            if ui
-                .add_enabled(can_submit, egui::Button::new("Send to session"))
-                .clicked()
-            {
+            if theme::action_button(ui, "Send to session", can_submit).clicked() {
                 let session = session.clone();
                 let exercise = self
                     .state
@@ -245,131 +354,231 @@ impl OperatorApp {
                 }
             }
         } else {
-            ui.heading("Choose an execution lane");
-            ui.label(
-                "Create or select a session. Sessions are separate model/context lanes inside an exercise; they are not new engagements.",
-            );
+            theme::section_heading(ui, "execution lane", "Select a session");
+            theme::deco_frame(SURFACE, SemanticTone::Interrupt).show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Create or select a session. Sessions are separate model/context lanes inside an exercise; they are not new engagements.",
+                    )
+                    .italics()
+                    .color(theme::color(ON_SURFACE_VARIANT)),
+                );
+            });
         }
-        ui.separator();
+        ui.add_space(18.0);
         let task_graphs = self.state.selected_task_graphs();
         if !task_graphs.is_empty() {
-            ui.heading("Execution graphs");
+            theme::section_heading(ui, "live control plane", "Execution graphs");
         }
         for graph in task_graphs {
-            ui.collapsing(
-                format!(
-                    "Turn {} · revision {}",
-                    graph.engagement_id.as_str(),
-                    graph.revision
-                ),
-                |ui| {
-                    ui.label(&graph.objective);
-                    for node in &graph.tasks {
-                        ui.group(|ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.strong(format!("{:?}", node.status));
-                                ui.monospace(node.task.task_id.as_str());
-                                if let Some(provider) = &node.provider_id {
-                                    ui.label(format!("via {}", provider.as_str()));
-                                }
-                            });
-                            ui.label(&node.task.objective);
-                            if !node.task.depends_on.is_empty() {
-                                ui.small(format!(
-                                    "depends on {}",
+            theme::deco_frame(SURFACE_LOW, SemanticTone::Primary).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    theme::status_chip(
+                        ui,
+                        format!("revision {}", graph.revision),
+                        SemanticTone::Primary,
+                    );
+                    ui.monospace(graph.engagement_id.as_str());
+                });
+                ui.label(
+                    egui::RichText::new(&graph.objective)
+                        .size(18.0)
+                        .strong()
+                        .color(theme::color(ON_SURFACE)),
+                );
+                ui.add_space(6.0);
+                for node in &graph.tasks {
+                    let tone = shared_theme::task_tone(node.status);
+                    theme::deco_frame(SURFACE, tone).show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            theme::status_chip(ui, format!("{:?}", node.status), tone);
+                            ui.monospace(node.task.task_id.as_str());
+                            if let Some(provider) = &node.provider_id {
+                                ui.label(
+                                    egui::RichText::new(format!("VIA {}", provider.as_str()))
+                                        .monospace()
+                                        .color(theme::color(OUTLINE)),
+                                );
+                            }
+                        });
+                        ui.label(&node.task.objective);
+                        if !node.task.depends_on.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "DEPENDS ON  {}",
                                     node.task
                                         .depends_on
                                         .iter()
                                         .map(|dependency| dependency.as_str())
                                         .collect::<Vec<_>>()
                                         .join(", ")
-                                ));
-                            }
-                            for observation in &node.observations {
-                                ui.label(format!("• {}", observation.observation.finding));
-                            }
-                            if !node.artifacts.is_empty() {
-                                ui.monospace(format!(
-                                    "{} artifact{}",
+                                ))
+                                .monospace()
+                                .size(11.0)
+                                .color(theme::color(OUTLINE)),
+                            );
+                        }
+                        for observation in &node.observations {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "▸ {}",
+                                    observation.observation.finding
+                                ))
+                                .color(theme::color(GREEN_TEXT)),
+                            );
+                        }
+                        if !node.artifacts.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} ARTIFACT{}",
                                     node.artifacts.len(),
-                                    if node.artifacts.len() == 1 { "" } else { "s" }
-                                ));
-                            }
-                        });
-                    }
-                },
-            );
+                                    if node.artifacts.len() == 1 { "" } else { "S" }
+                                ))
+                                .monospace()
+                                .color(theme::color(GOLD)),
+                            );
+                        }
+                    });
+                }
+            });
+            ui.add_space(10.0);
         }
-        ui.separator();
+        let mut showed_output_heading = false;
         for output in self
             .state
             .outputs
             .iter()
             .filter(|output| self.state.output_is_in_selected_session(output))
         {
-            ui.group(|ui| {
-                ui.strong("Agent");
-                ui.label(&output.text);
+            if !showed_output_heading {
+                theme::section_heading(ui, "model channel", "Agent output");
+                showed_output_heading = true;
+            }
+            theme::deco_frame(SURFACE, SemanticTone::Live).show(ui, |ui| {
+                theme::status_chip(ui, "agent", SemanticTone::Live);
+                ui.label(egui::RichText::new(&output.text).color(theme::color(ON_SURFACE)));
                 if output.truncated {
-                    ui.monospace(format!(
-                        "Preview truncated; artifact {}",
-                        output.artifact_id.as_str()
-                    ));
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "PREVIEW TRUNCATED · ARTIFACT {}",
+                            output.artifact_id.as_str()
+                        ))
+                        .monospace()
+                        .color(theme::color(HOT_PINK)),
+                    );
                 }
             });
             ui.add_space(8.0);
         }
-        ui.separator();
-        ui.heading("Live activity");
+        ui.add_space(12.0);
+        theme::section_heading(ui, "streaming journal", "Live activity");
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
+            .max_height(280.0)
             .show(ui, |ui| {
                 for event in &self.state.events {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.monospace(format!("{:>8}", event.sequence));
-                        ui.label(event_summary(event));
-                        if let Some(engagement_id) = &event.engagement_id {
-                            ui.monospace(engagement_id.as_str());
-                        }
+                    theme::deco_frame(SURFACE, shared_theme::event_tone(event)).show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("#{:08}", event.sequence))
+                                    .monospace()
+                                    .color(theme::color(GOLD)),
+                            );
+                            ui.label(event_summary(event));
+                            if let Some(engagement_id) = &event.engagement_id {
+                                ui.label(
+                                    egui::RichText::new(engagement_id.as_str())
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(theme::color(OUTLINE)),
+                                );
+                            }
+                        });
                     });
                 }
             });
     }
 
     fn show_context(&self, ui: &mut egui::Ui) {
-        ui.heading("Operational context");
+        theme::section_heading(ui, "mission telemetry", "Operational context");
         if let Some(exercise) = self.state.selected_exercise() {
-            ui.strong(&exercise.name);
-            ui.label(&exercise.objective);
-            ui.monospace(exercise.exercise_id.as_str());
+            theme::deco_frame(SURFACE, SemanticTone::Primary).show(ui, |ui| {
+                theme::status_chip(ui, "exercise", SemanticTone::Primary);
+                ui.label(
+                    egui::RichText::new(&exercise.name)
+                        .size(19.0)
+                        .strong()
+                        .color(theme::color(GOLD)),
+                );
+                ui.label(&exercise.objective);
+                ui.label(
+                    egui::RichText::new(exercise.exercise_id.as_str())
+                        .monospace()
+                        .size(11.0)
+                        .color(theme::color(OUTLINE)),
+                );
+            });
         }
         if let Some(run) = self.state.selected_operation_run() {
-            ui.separator();
-            ui.strong(format!("Run: {}", run.name));
-            ui.label(&run.objective);
-            ui.monospace(run.operation_run_id.as_str());
+            theme::deco_frame(SURFACE, SemanticTone::Live).show(ui, |ui| {
+                theme::status_chip(ui, format!("{:?}", run.status), SemanticTone::Live);
+                ui.label(
+                    egui::RichText::new(&run.name)
+                        .strong()
+                        .color(theme::color(GREEN_TEXT)),
+                );
+                ui.label(&run.objective);
+                ui.label(
+                    egui::RichText::new(run.operation_run_id.as_str())
+                        .monospace()
+                        .size(11.0)
+                        .color(theme::color(OUTLINE)),
+                );
+            });
         }
         if let Some(session) = self.state.selected_session() {
-            ui.separator();
-            ui.strong(format!("Session: {}", session.name));
-            ui.label(&session.purpose);
-            ui.monospace(session.session_id.as_str());
+            theme::deco_frame(SURFACE, SemanticTone::Interrupt).show(ui, |ui| {
+                theme::status_chip(ui, format!("{:?}", session.status), SemanticTone::Interrupt);
+                ui.label(
+                    egui::RichText::new(&session.name)
+                        .strong()
+                        .color(theme::color(PINK_TEXT)),
+                );
+                ui.label(&session.purpose);
+                ui.label(
+                    egui::RichText::new(session.session_id.as_str())
+                        .monospace()
+                        .size(11.0)
+                        .color(theme::color(OUTLINE)),
+                );
+            });
         }
-        ui.separator();
-        ui.heading("Team");
+        ui.add_space(14.0);
+        theme::section_heading(ui, "connected operators", "Team");
         if self.state.team.presence.is_empty() {
-            ui.label("No connected team clients");
+            ui.label(
+                egui::RichText::new("NO CONNECTED TEAM CLIENTS")
+                    .monospace()
+                    .color(theme::color(OUTLINE)),
+            );
         }
         for presence in &self.state.team.presence {
             ui.horizontal_wrapped(|ui| {
-                ui.strong(
-                    presence
-                        .client
-                        .display_name
-                        .as_deref()
-                        .unwrap_or(presence.client.client_id.as_str()),
+                theme::status_chip(
+                    ui,
+                    format!("{:?}", presence.state),
+                    shared_theme::presence_tone(presence.state),
                 );
-                ui.label(format!("{:?}", presence.state));
+                ui.label(
+                    egui::RichText::new(
+                        presence
+                            .client
+                            .display_name
+                            .as_deref()
+                            .unwrap_or(presence.client.client_id.as_str()),
+                    )
+                    .strong(),
+                );
             });
         }
         for work_item in self.state.team.work_items.iter().filter(|item| {
@@ -379,16 +588,25 @@ impl OperatorApp {
                 .as_ref()
                 .is_none_or(|selected| item.exercise_id.as_ref() == Some(selected))
         }) {
-            ui.label(format!(
-                "{:?}: {}{}",
-                work_item.status,
-                work_item.title,
-                work_item
-                    .assignee
-                    .as_ref()
-                    .map(|assignee| format!(" → {}", assignee.as_str()))
-                    .unwrap_or_default()
-            ));
+            theme::deco_frame(SURFACE, shared_theme::work_item_tone(work_item.status)).show(
+                ui,
+                |ui| {
+                    theme::status_chip(
+                        ui,
+                        format!("{:?}", work_item.status),
+                        shared_theme::work_item_tone(work_item.status),
+                    );
+                    ui.label(format!(
+                        "{}{}",
+                        work_item.title,
+                        work_item
+                            .assignee
+                            .as_ref()
+                            .map(|assignee| format!(" → {}", assignee.as_str()))
+                            .unwrap_or_default()
+                    ));
+                },
+            );
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -401,18 +619,36 @@ impl OperatorApp {
             .iter()
             .filter(|claim| claim.released_unix_ms.is_none() && claim.expires_unix_ms > now)
         {
-            ui.monospace(format!(
-                "claim {} by {}",
-                claim.resource_key,
-                claim.owner.as_str()
-            ));
+            ui.label(
+                egui::RichText::new(format!(
+                    "CLAIM {} BY {}",
+                    claim.resource_key,
+                    claim.owner.as_str()
+                ))
+                .monospace()
+                .color(theme::color(GREEN_TEXT)),
+            );
         }
-        ui.separator();
-        ui.heading("Capacity");
-        ui.monospace(pretty_json(&self.state.capacity));
-        ui.separator();
-        ui.heading("Providers");
-        ui.monospace(pretty_json(&self.state.providers));
+        ui.add_space(14.0);
+        theme::section_heading(ui, "resource governor", "Capacity");
+        theme::deco_frame(SURFACE, SemanticTone::Primary).show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(pretty_json(&self.state.capacity))
+                    .monospace()
+                    .size(11.0)
+                    .color(theme::color(ON_SURFACE_VARIANT)),
+            );
+        });
+        ui.add_space(14.0);
+        theme::section_heading(ui, "execution fabric", "Providers");
+        theme::deco_frame(SURFACE, SemanticTone::Live).show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(pretty_json(&self.state.providers))
+                    .monospace()
+                    .size(11.0)
+                    .color(theme::color(ON_SURFACE_VARIANT)),
+            );
+        });
     }
 
     fn show_dialog(&mut self, context: &egui::Context) {
@@ -430,25 +666,40 @@ impl OperatorApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(theme::deco_frame(SURFACE_LOW, SemanticTone::Primary))
             .show(context, |ui| {
+                theme::section_heading(ui, "operator control", title);
                 if kind == DialogKind::Exercise {
-                    ui.label("Workspace");
-                    ui.text_edit_singleline(&mut self.workspace);
+                    field_label(ui, "Workspace");
+                    ui.add_sized(
+                        [ui.available_width(), 32.0],
+                        egui::TextEdit::singleline(&mut self.workspace),
+                    );
                 }
-                ui.label(match kind {
+                field_label(ui, match kind {
                     DialogKind::Exercise => "Exercise name",
                     DialogKind::Run => "Run name",
                     DialogKind::Session => "Session name",
                 });
-                ui.text_edit_singleline(&mut self.name);
-                ui.label(match kind {
+                ui.add_sized(
+                    [ui.available_width(), 32.0],
+                    egui::TextEdit::singleline(&mut self.name),
+                );
+                field_label(ui, match kind {
                     DialogKind::Session => "Purpose",
                     _ => "Objective",
                 });
-                ui.add(egui::TextEdit::multiline(&mut self.objective).desired_rows(3));
+                ui.add_sized(
+                    [ui.available_width(), 72.0],
+                    egui::TextEdit::multiline(&mut self.objective).desired_rows(3),
+                );
                 if kind == DialogKind::Exercise {
-                    ui.label("Initial scope (comma/newline separated; prefix ! to exclude)");
-                    ui.add(
+                    field_label(
+                        ui,
+                        "Initial scope (comma/newline separated; prefix ! to exclude)",
+                    );
+                    ui.add_sized(
+                        [ui.available_width(), 58.0],
                         egui::TextEdit::multiline(&mut self.scope)
                             .desired_rows(2)
                             .hint_text("10.10.4.0/24, !10.10.4.9, portal.internal"),
@@ -459,10 +710,7 @@ impl OperatorApp {
                     && (kind != DialogKind::Exercise
                         || (!self.workspace.trim().is_empty() && !self.scope.trim().is_empty()));
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(fields_valid, egui::Button::new("Create"))
-                        .clicked()
-                    {
+                    if theme::action_button(ui, "Create", fields_valid).clicked() {
                         let command = match kind {
                             DialogKind::Exercise => OperatorCommand::CreateExercise {
                                 workspace_id: self.workspace.trim().to_owned(),
@@ -499,14 +747,28 @@ impl OperatorApp {
                             self.clear_dialog();
                         }
                     }
-                    if !first_run && ui.button("Cancel").clicked() {
+                    if !first_run
+                        && ui
+                            .add(
+                                egui::Button::new("CANCEL")
+                                    .fill(theme::color(SURFACE))
+                                    .stroke(egui::Stroke::new(1.0, theme::color(HOT_PINK)))
+                                    .corner_radius(egui::CornerRadius::ZERO),
+                            )
+                            .clicked()
+                    {
                         self.dialog = None;
                         self.clear_dialog();
                     }
                 });
                 if first_run {
-                    ui.small(
-                        "An exercise is the long-lived assessment boundary. Runs and sessions are created inside it.",
+                    ui.label(
+                        egui::RichText::new(
+                            "AN EXERCISE IS THE LONG-LIVED ASSESSMENT BOUNDARY. RUNS AND SESSIONS ARE CREATED INSIDE IT.",
+                        )
+                        .monospace()
+                        .size(11.0)
+                        .color(theme::color(GREEN_TEXT)),
                     );
                 }
             });
@@ -522,31 +784,77 @@ impl Drop for OperatorApp {
 impl eframe::App for OperatorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.receive_updates();
-        egui::Panel::top("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Grok operator");
-                ui.separator();
-                ui.label(&self.state.connection);
-                ui.separator();
-                ui.monospace(format!("event cursor {}", self.state.cursor));
-                ui.separator();
-                ui.label(&self.state.notice);
+        egui::Panel::top("status")
+            .frame(
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(18, 10))
+                    .fill(theme::color(OBSIDIAN))
+                    .stroke(egui::Stroke::new(3.0, theme::color(GOLD)))
+                    .corner_radius(egui::CornerRadius::ZERO)
+                    .shadow(egui::Shadow {
+                        offset: [0, 4],
+                        blur: 8,
+                        spread: 0,
+                        color: theme::color(GOLD).gamma_multiply(0.24),
+                    }),
+            )
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("GROK // OPERATIONS")
+                            .size(27.0)
+                            .strong()
+                            .italics()
+                            .color(theme::color(GOLD)),
+                    );
+                    theme::status_chip(
+                        ui,
+                        &self.state.connection,
+                        shared_theme::connection_tone(&self.state.connection),
+                    );
+                    theme::status_chip(
+                        ui,
+                        format!("cursor {}", self.state.cursor),
+                        SemanticTone::Primary,
+                    );
+                    theme::status_chip(
+                        ui,
+                        &self.state.notice,
+                        shared_theme::notice_tone(&self.state.notice),
+                    );
+                });
             });
-        });
         egui::Panel::left("catalog")
             .resizable(true)
-            .default_size(280.0)
+            .default_size(300.0)
+            .frame(theme::panel_frame(SURFACE_LOW))
             .show(ui, |ui| self.show_catalog(ui));
         egui::Panel::right("context")
             .resizable(true)
-            .default_size(300.0)
+            .default_size(330.0)
+            .frame(theme::panel_frame(SURFACE_LOW))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| self.show_context(ui));
             });
-        egui::CentralPanel::default().show(ui, |ui| self.show_activity(ui));
+        egui::CentralPanel::default()
+            .frame(theme::panel_frame(OBSIDIAN))
+            .show(ui, |ui| {
+                theme::draw_backdrop(ui);
+                egui::ScrollArea::vertical().show(ui, |ui| self.show_activity(ui));
+            });
         self.show_dialog(ui.ctx());
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
+}
+
+fn field_label(ui: &mut egui::Ui, label: &str) {
+    ui.label(
+        egui::RichText::new(label.to_ascii_uppercase())
+            .monospace()
+            .size(11.0)
+            .strong()
+            .color(theme::color(GREEN_TEXT)),
+    );
 }
 
 fn pretty_json(value: &serde_json::Value) -> String {
@@ -600,8 +908,8 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "Grok operator",
+        "Grok // Operations",
         native_options,
-        Box::new(move |_context| Ok(Box::new(OperatorApp::new(arguments)))),
+        Box::new(move |context| Ok(Box::new(OperatorApp::new(arguments, &context.egui_ctx)))),
     )
 }

@@ -3,7 +3,7 @@ license = "Apache-2.0"
 name = "xai-grok-operator-ui"
 version = "0.1.0"
 edition.workspace = true
-description = "Optional compact egui operator client for grokd"
+description = "Native egui operator client for long-running grokd operations"
 
 [dependencies]
 serde_json = { workspace = true }

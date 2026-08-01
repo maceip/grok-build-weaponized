@@ -19,6 +19,158 @@ use xai_grok_protocol::{
     TeamClient, TeamId, TeamPresenceState, TeamProjection, WorkspaceId,
 };
 
+/// Renderer-independent visual language shared by the windowed and terminal
+/// operator surfaces. Colors are stored as raw RGB so the core does not depend
+/// on either renderer.
+pub mod theme {
+    use xai_grok_protocol::{
+        Event, EventEnvelope, ServiceHealth, TaskStatus, TeamPresenceState, TeamWorkItemStatus,
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Rgb(pub u8, pub u8, pub u8);
+
+    impl Rgb {
+        pub const fn tuple(self) -> (u8, u8, u8) {
+            (self.0, self.1, self.2)
+        }
+    }
+
+    // Gilded Glitch / Cyber-Art-Deco tokens from the attached source design.
+    pub const OBSIDIAN: Rgb = Rgb(0x08, 0x08, 0x08);
+    pub const SURFACE: Rgb = Rgb(0x13, 0x13, 0x13);
+    pub const SURFACE_LOW: Rgb = Rgb(0x1c, 0x1b, 0x1b);
+    pub const SURFACE_HIGH: Rgb = Rgb(0x2a, 0x2a, 0x2a);
+    pub const SURFACE_HIGHEST: Rgb = Rgb(0x35, 0x35, 0x34);
+    pub const ON_SURFACE: Rgb = Rgb(0xe5, 0xe2, 0xe1);
+    pub const ON_SURFACE_VARIANT: Rgb = Rgb(0xd0, 0xc5, 0xaf);
+    pub const OUTLINE: Rgb = Rgb(0x99, 0x90, 0x7c);
+    pub const OUTLINE_VARIANT: Rgb = Rgb(0x4d, 0x46, 0x35);
+    pub const GOLD: Rgb = Rgb(0xf2, 0xca, 0x50);
+    pub const GOLD_MATTE: Rgb = Rgb(0xd4, 0xaf, 0x37);
+    pub const ON_GOLD: Rgb = Rgb(0x3c, 0x2f, 0x00);
+    pub const NEON_GREEN: Rgb = Rgb(0x2f, 0xf8, 0x01);
+    pub const GREEN_TEXT: Rgb = Rgb(0x79, 0xff, 0x5b);
+    pub const ON_GREEN: Rgb = Rgb(0x05, 0x39, 0x00);
+    pub const HOT_PINK: Rgb = Rgb(0xff, 0x8f, 0xc2);
+    pub const PINK_TEXT: Rgb = Rgb(0xff, 0xbb, 0xd6);
+    pub const ERROR: Rgb = Rgb(0xff, 0xb4, 0xab);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SemanticTone {
+        Neutral,
+        Primary,
+        Live,
+        Interrupt,
+        Error,
+        Muted,
+    }
+
+    pub const fn tone_rgb(tone: SemanticTone) -> Rgb {
+        match tone {
+            SemanticTone::Neutral => ON_SURFACE,
+            SemanticTone::Primary => GOLD,
+            SemanticTone::Live => GREEN_TEXT,
+            SemanticTone::Interrupt => PINK_TEXT,
+            SemanticTone::Error => ERROR,
+            SemanticTone::Muted => OUTLINE,
+        }
+    }
+
+    pub const fn task_tone(status: TaskStatus) -> SemanticTone {
+        match status {
+            TaskStatus::Running | TaskStatus::Dispatched => SemanticTone::Live,
+            TaskStatus::Completed => SemanticTone::Primary,
+            TaskStatus::Failed | TaskStatus::Lost => SemanticTone::Error,
+            TaskStatus::Suspended | TaskStatus::Cancelled => SemanticTone::Interrupt,
+            TaskStatus::Prepared | TaskStatus::Admitted => SemanticTone::Muted,
+        }
+    }
+
+    pub const fn presence_tone(state: TeamPresenceState) -> SemanticTone {
+        match state {
+            TeamPresenceState::Online => SemanticTone::Live,
+            TeamPresenceState::Away => SemanticTone::Primary,
+            TeamPresenceState::Offline => SemanticTone::Muted,
+        }
+    }
+
+    pub const fn work_item_tone(status: TeamWorkItemStatus) -> SemanticTone {
+        match status {
+            TeamWorkItemStatus::InProgress => SemanticTone::Live,
+            TeamWorkItemStatus::Completed => SemanticTone::Primary,
+            TeamWorkItemStatus::Blocked => SemanticTone::Interrupt,
+            TeamWorkItemStatus::Cancelled => SemanticTone::Error,
+            TeamWorkItemStatus::Open => SemanticTone::Muted,
+        }
+    }
+
+    pub fn connection_tone(connection: &str) -> SemanticTone {
+        let normalized = connection.to_ascii_lowercase();
+        if normalized.contains("connected") && !normalized.contains("disconnected") {
+            SemanticTone::Live
+        } else if normalized.contains("error")
+            || normalized.contains("failed")
+            || normalized.contains("stopped")
+        {
+            SemanticTone::Error
+        } else if normalized.contains("reconnect") || normalized.contains("disconnect") {
+            SemanticTone::Interrupt
+        } else {
+            SemanticTone::Muted
+        }
+    }
+
+    pub fn notice_tone(notice: &str) -> SemanticTone {
+        let normalized = notice.to_ascii_lowercase();
+        if normalized.contains("error")
+            || normalized.contains("failed")
+            || normalized.contains("full")
+            || normalized.contains("stopped")
+            || normalized.contains("reject")
+        {
+            SemanticTone::Error
+        } else if normalized.contains("queued")
+            || normalized.contains("created")
+            || normalized.contains("accepted")
+        {
+            SemanticTone::Live
+        } else if normalized == "idle" {
+            SemanticTone::Muted
+        } else {
+            SemanticTone::Primary
+        }
+    }
+
+    pub fn event_tone(event: &EventEnvelope) -> SemanticTone {
+        match &event.event {
+            Event::TaskStatus { status, .. } => task_tone(*status),
+            Event::ProviderState { health, .. } => match health {
+                ServiceHealth::Ready => SemanticTone::Live,
+                ServiceHealth::Starting | ServiceHealth::Draining => SemanticTone::Primary,
+                ServiceHealth::Degraded => SemanticTone::Interrupt,
+                ServiceHealth::Stopped | ServiceHealth::Failed => SemanticTone::Error,
+            },
+            Event::Overload { .. } => SemanticTone::Error,
+            Event::Observation { .. }
+            | Event::EvidenceRecorded { .. }
+            | Event::ProviderOutput { .. }
+            | Event::ArtifactAvailable { .. } => SemanticTone::Live,
+            Event::TeamWorkItemCreated { work_item } | Event::TeamWorkItemUpdated { work_item } => {
+                work_item_tone(work_item.status)
+            }
+            Event::TeamPresenceSet { presence } => presence_tone(presence.state),
+            Event::EngagementAccepted { .. }
+            | Event::PlanAccepted { .. }
+            | Event::ExerciseCreated { .. }
+            | Event::OperationRunCreated { .. }
+            | Event::OperatorSessionCreated { .. }
+            | Event::PlaybookCreated { .. } => SemanticTone::Primary,
+            _ => SemanticTone::Neutral,
+        }
+    }
+}
+
 pub const MAX_VISIBLE_EVENTS: usize = 2_000;
 pub const MAX_VISIBLE_OUTPUTS: usize = 512;
 const OUTPUT_PREVIEW_BYTES: u32 = 1024 * 1024;
@@ -1078,7 +1230,7 @@ pub fn event_summary(event: &EventEnvelope) -> String {
 mod tests {
     use xai_grok_protocol::{
         Event, EventId, Exercise, ExerciseStatus, OperationRun, OperationRunStatus,
-        OperatorSession, OperatorSessionStatus, PROTOCOL_VERSION,
+        OperatorSession, OperatorSessionStatus, PROTOCOL_VERSION, TaskStatus,
     };
 
     use super::*;
@@ -1220,6 +1372,38 @@ mod tests {
         assert_eq!(
             state.selection.session_id.as_ref().unwrap().as_str(),
             "session-a"
+        );
+    }
+
+    #[test]
+    fn operator_theme_preserves_the_locked_reference_tokens() {
+        assert_eq!(theme::OBSIDIAN.tuple(), (0x08, 0x08, 0x08));
+        assert_eq!(theme::GOLD.tuple(), (0xf2, 0xca, 0x50));
+        assert_eq!(theme::NEON_GREEN.tuple(), (0x2f, 0xf8, 0x01));
+        assert_eq!(theme::HOT_PINK.tuple(), (0xff, 0x8f, 0xc2));
+    }
+
+    #[test]
+    fn operator_theme_assigns_operational_state_semantically() {
+        assert_eq!(
+            theme::task_tone(TaskStatus::Running),
+            theme::SemanticTone::Live
+        );
+        assert_eq!(
+            theme::task_tone(TaskStatus::Suspended),
+            theme::SemanticTone::Interrupt
+        );
+        assert_eq!(
+            theme::task_tone(TaskStatus::Failed),
+            theme::SemanticTone::Error
+        );
+        assert_eq!(
+            theme::connection_tone("connected to grokd"),
+            theme::SemanticTone::Live
+        );
+        assert_eq!(
+            theme::notice_tone("local command queue is full"),
+            theme::SemanticTone::Error
         );
     }
 }
