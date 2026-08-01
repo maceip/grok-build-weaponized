@@ -151,6 +151,7 @@ struct App {
     commands: mpsc::SyncSender<OperatorCommand>,
     stop: Arc<AtomicBool>,
     nav_index: usize,
+    task_index: usize,
     form: Option<Form>,
 }
 
@@ -166,6 +167,7 @@ impl App {
             commands,
             stop,
             nav_index: 0,
+            task_index: 0,
             form: None,
         }
     }
@@ -186,6 +188,12 @@ impl App {
             self.form = None;
             self.sync_nav_to_selection();
         }
+        let task_count = self.state.cancellable_tasks().len();
+        self.task_index = if task_count == 0 {
+            0
+        } else {
+            self.task_index.min(task_count - 1)
+        };
     }
 
     fn nav_items(&self) -> Vec<NavItem> {
@@ -224,6 +232,7 @@ impl App {
             NavItem::Run(id) => self.state.select_operation_run(id),
             NavItem::Session(id) => self.state.select_session(id),
         }
+        self.task_index = 0;
     }
 
     fn sync_nav_to_selection(&mut self) {
@@ -283,9 +292,41 @@ impl App {
             KeyCode::Char('i') if self.state.selected_session().is_some() => {
                 self.form = Some(Form::turn());
             }
+            KeyCode::Char('[') => {
+                self.task_index = self.task_index.saturating_sub(1);
+            }
+            KeyCode::Char(']') => {
+                let maximum = self.state.cancellable_tasks().len().saturating_sub(1);
+                self.task_index = self.task_index.saturating_add(1).min(maximum);
+            }
+            KeyCode::Char('x' | 'X') => self.cancel_selected_task(),
             _ => {}
         }
         false
+    }
+
+    fn cancel_selected_task(&mut self) {
+        let selected = self.state.cancellable_tasks().get(self.task_index).cloned();
+        let Some(selected) = selected else {
+            self.state.notice = "no cancellable task in the selected session".to_owned();
+            return;
+        };
+        let task_id = selected.task_id.clone();
+        match self.commands.try_send(OperatorCommand::CancelTask {
+            engagement_id: selected.engagement_id,
+            task_id: selected.task_id,
+            request_id: selected.request_id,
+        }) {
+            Ok(()) => {
+                self.state.notice = format!("cancellation queued for {}", task_id.as_str());
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.state.notice = "local command queue is full".to_owned();
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.state.notice = "operator client stopped".to_owned();
+            }
+        }
     }
 
     fn handle_form_key(&mut self, key: KeyEvent) {
@@ -563,6 +604,7 @@ impl App {
 
     fn draw_activity(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let height = area.height.saturating_sub(2) as usize;
+        let selected_task = self.state.cancellable_tasks().get(self.task_index).cloned();
         let mut rows = self
             .state
             .selected_task_graphs()
@@ -589,7 +631,22 @@ impl App {
                 ]))];
                 graph_rows.extend(graph.tasks.iter().map(|node| {
                     let tone = shared_theme::task_tone(node.status);
+                    let selected = selected_task.as_ref().is_some_and(|task| {
+                        task.engagement_id == graph.engagement_id
+                            && task.task_id == node.task.task_id
+                    });
                     ListItem::new(Line::from(vec![
+                        Span::styled(
+                            if selected { " ▶ " } else { "   " },
+                            Style::default()
+                                .fg(color(ON_GOLD))
+                                .bg(if selected {
+                                    color(HOT_PINK)
+                                } else {
+                                    color(OBSIDIAN)
+                                })
+                                .add_modifier(Modifier::BOLD),
+                        ),
                         Span::styled(
                             format!(" {:<10} ", format!("{:?}", node.status).to_uppercase()),
                             Style::default()
@@ -614,6 +671,11 @@ impl App {
                             Style::default().fg(color(ON_SURFACE_VARIANT)),
                         ),
                     ]))
+                    .style(if selected {
+                        Style::default().bg(color(SURFACE)).fg(color(ON_SURFACE))
+                    } else {
+                        Style::default().bg(color(OBSIDIAN)).fg(color(ON_SURFACE))
+                    })
                 }));
                 graph_rows
             })
@@ -867,6 +929,12 @@ impl App {
     }
 
     fn draw_footer(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let cancellable = self.state.cancellable_tasks();
+        let selection = if cancellable.is_empty() {
+            " 0/0 ".to_owned()
+        } else {
+            format!(" {}/{} ", self.task_index + 1, cancellable.len())
+        };
         let help = Line::from(vec![
             key_span(" N "),
             Span::styled(
@@ -879,6 +947,16 @@ impl App {
             Span::styled(" SESSION  ", Style::default().fg(color(ON_SURFACE_VARIANT))),
             key_span(" I "),
             Span::styled(" SEND  ", Style::default().fg(color(ON_SURFACE_VARIANT))),
+            key_span(" [ ] "),
+            Span::styled(" TASK ", Style::default().fg(color(ON_SURFACE_VARIANT))),
+            Span::styled(
+                selection,
+                Style::default()
+                    .fg(color(PINK_TEXT))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            key_span(" X "),
+            Span::styled(" CANCEL  ", Style::default().fg(color(ON_SURFACE_VARIANT))),
             key_span(" Q "),
             Span::styled(
                 " QUIT  //  ",

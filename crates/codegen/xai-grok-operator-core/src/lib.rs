@@ -13,10 +13,10 @@ use std::time::Duration;
 use xai_grok_control_client::{ClientIdentity, ControlPlaneClient};
 use xai_grok_protocol::{
     ArtifactId, ClientId, Command, CommandId, CreateExercise, CreateOperationRun,
-    CreateOperatorSession, EngagementId, EventEnvelope, EventReadRequest, ExerciseId,
-    IngressEnvelope, IngressSource, OperationRunId, OperatorCatalog, OperatorSessionId,
-    ProjectionQuery, Response, ScopeTarget, SetTeamPresence, TaskGraphProjection, TaskId,
-    TeamClient, TeamId, TeamPresenceState, TeamProjection, WorkspaceId,
+    CreateOperatorSession, EngagementId, EventEnvelope, EventReadRequest, ExecutionMode,
+    ExerciseId, IngressEnvelope, IngressSource, OperationRunId, OperatorCatalog, OperatorSessionId,
+    ProjectionQuery, RequestId, Response, ScopeTarget, SetTeamPresence, TaskGraphProjection,
+    TaskId, TaskStatus, TeamClient, TeamId, TeamPresenceState, TeamProjection, WorkspaceId,
 };
 
 /// Renderer-independent visual language shared by the windowed and terminal
@@ -237,6 +237,16 @@ pub struct OperatorOutput {
     pub truncated: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancellableTask {
+    pub engagement_id: EngagementId,
+    pub task_id: TaskId,
+    pub request_id: RequestId,
+    pub objective: String,
+    pub mode: ExecutionMode,
+    pub status: TaskStatus,
+}
+
 impl Default for OperatorState {
     fn default() -> Self {
         Self {
@@ -316,6 +326,37 @@ impl OperatorState {
             .collect::<Vec<_>>();
         graphs.sort_by_key(|graph| graph.last_sequence);
         graphs
+    }
+
+    /// Returns only active tasks whose durable receipt agrees with the graph.
+    /// The identity check is fail-closed so a corrupted projection can never
+    /// cause an operator surface to cancel a different request.
+    pub fn cancellable_tasks(&self) -> Vec<CancellableTask> {
+        let mut cancellable = Vec::new();
+        for graph in self.selected_task_graphs().into_iter().rev() {
+            for node in graph.tasks.iter().rev() {
+                if !matches!(node.status, TaskStatus::Dispatched | TaskStatus::Running) {
+                    continue;
+                }
+                let Some(receipt) = node.execution.as_ref() else {
+                    continue;
+                };
+                if receipt.engagement_id() != &graph.engagement_id
+                    || receipt.task_id() != &node.task.task_id
+                {
+                    continue;
+                }
+                cancellable.push(CancellableTask {
+                    engagement_id: graph.engagement_id.clone(),
+                    task_id: node.task.task_id.clone(),
+                    request_id: receipt.request_id().clone(),
+                    objective: node.task.objective.clone(),
+                    mode: node.task.mode,
+                    status: node.status,
+                });
+            }
+        }
+        cancellable
     }
 
     pub fn select_exercise(&mut self, exercise_id: ExerciseId) {
@@ -597,6 +638,11 @@ pub enum OperatorCommand {
         session_id: OperatorSessionId,
         request: String,
     },
+    CancelTask {
+        engagement_id: EngagementId,
+        task_id: TaskId,
+        request_id: RequestId,
+    },
 }
 
 impl OperatorCommand {
@@ -657,6 +703,15 @@ impl OperatorCommand {
                     metadata: serde_json::Map::new(),
                 })
             }
+            Self::CancelTask {
+                engagement_id,
+                task_id,
+                request_id,
+            } => Command::CancelTask {
+                engagement_id,
+                task_id,
+                request_id,
+            },
         }
     }
 }
@@ -1026,6 +1081,10 @@ async fn submit(
         )
         .await?;
     }
+    let cancelled_task = match &command {
+        OperatorCommand::CancelTask { task_id, .. } => Some(task_id.clone()),
+        _ => None,
+    };
     let response = control
         .send(command.into_protocol(source), Duration::from_secs(10))
         .await?;
@@ -1042,6 +1101,10 @@ async fn submit(
         Response::Accepted { engagement_id, .. } => {
             format!("turn accepted as {}", engagement_id.as_str())
         }
+        Response::Ack if cancelled_task.is_some() => format!(
+            "cancelled task {}",
+            cancelled_task.expect("checked cancellation task").as_str()
+        ),
         _ => return Err("daemon returned an unexpected operator response".into()),
     };
     Ok(notice)
@@ -1159,6 +1222,7 @@ pub fn event_summary(event: &EventEnvelope) -> String {
             task_id,
             status,
             provider_id,
+            ..
         } => format!(
             "task {} {:?}{}",
             task_id.as_str(),
@@ -1229,8 +1293,9 @@ pub fn event_summary(event: &EventEnvelope) -> String {
 #[cfg(test)]
 mod tests {
     use xai_grok_protocol::{
-        Event, EventId, Exercise, ExerciseStatus, OperationRun, OperationRunStatus,
-        OperatorSession, OperatorSessionStatus, PROTOCOL_VERSION, TaskStatus,
+        CapabilityRequirement, DeferredTask, Event, EventId, ExecutionReceipt, ExecutionTask,
+        Exercise, ExerciseStatus, OperationRun, OperationRunStatus, OperatorSession,
+        OperatorSessionStatus, PROTOCOL_VERSION, TaskProjection, TaskStatus,
     };
 
     use super::*;
@@ -1328,6 +1393,95 @@ mod tests {
 
         state.selection.session_id = Some(OperatorSessionId::from_string("session-other"));
         assert!(state.selected_task_graphs().is_empty());
+    }
+
+    #[test]
+    fn cancellable_tasks_require_a_matching_durable_active_receipt() {
+        let mut state = OperatorState::default();
+        state.apply(OperatorUpdate::Catalog(catalog()));
+        let engagement_id = EngagementId::from_string("engagement-a");
+        let task = |task_id: &str| ExecutionTask {
+            task_id: TaskId::from_string(task_id),
+            objective: format!("execute {task_id}"),
+            mode: ExecutionMode::Deferred,
+            capability: CapabilityRequirement {
+                operation_id: "test.execute".into(),
+                preferred_provider: Some("provider-a".into()),
+                required_features: Vec::new(),
+            },
+            input: serde_json::json!({}),
+            deadline_unix_ms: 10_000,
+            completion_tests: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let receipt = |task_id: &str, receipt_task_id: &str| {
+            ExecutionReceipt::Deferred(DeferredTask {
+                request_id: RequestId::from_string(format!("request-{task_id}")),
+                engagement_id: engagement_id.clone(),
+                task_id: TaskId::from_string(receipt_task_id),
+                provider_id: "provider-a".into(),
+                lease_epoch: 7,
+                result_cursor: 0,
+            })
+        };
+        state.apply(OperatorUpdate::TaskGraph(TaskGraphProjection {
+            engagement_id: engagement_id.clone(),
+            workspace_id: Some("workspace-a".to_owned()),
+            session_id: Some("session-a".to_owned()),
+            exercise_id: Some(ExerciseId::from_string("exercise-a")),
+            operation_run_id: Some(OperationRunId::from_string("run-a")),
+            operator_session_id: Some(OperatorSessionId::from_string("session-a")),
+            team_id: None,
+            client_id: None,
+            revision: 1,
+            objective: "exercise durable cancellation".to_owned(),
+            tasks: vec![
+                TaskProjection {
+                    task: task("active"),
+                    status: TaskStatus::Running,
+                    provider_id: Some("provider-a".into()),
+                    execution: Some(receipt("active", "active")),
+                    observations: Vec::new(),
+                    artifacts: Vec::new(),
+                    last_sequence: 4,
+                },
+                TaskProjection {
+                    task: task("terminal"),
+                    status: TaskStatus::Completed,
+                    provider_id: Some("provider-a".into()),
+                    execution: Some(receipt("terminal", "terminal")),
+                    observations: Vec::new(),
+                    artifacts: Vec::new(),
+                    last_sequence: 5,
+                },
+                TaskProjection {
+                    task: task("mismatch"),
+                    status: TaskStatus::Running,
+                    provider_id: Some("provider-a".into()),
+                    execution: Some(receipt("mismatch", "different-task")),
+                    observations: Vec::new(),
+                    artifacts: Vec::new(),
+                    last_sequence: 6,
+                },
+            ],
+            last_sequence: 6,
+        }));
+
+        let cancellable = state.cancellable_tasks();
+        assert_eq!(cancellable.len(), 1);
+        assert_eq!(cancellable[0].task_id.as_str(), "active");
+        assert_eq!(cancellable[0].request_id.as_str(), "request-active");
+        assert_eq!(cancellable[0].mode, ExecutionMode::Deferred);
+        assert!(matches!(
+            OperatorCommand::CancelTask {
+                engagement_id: cancellable[0].engagement_id.clone(),
+                task_id: cancellable[0].task_id.clone(),
+                request_id: cancellable[0].request_id.clone(),
+            }
+            .into_protocol(IngressSource::Tui),
+            Command::CancelTask { request_id, .. }
+                if request_id.as_str() == "request-active"
+        ));
     }
 
     #[test]

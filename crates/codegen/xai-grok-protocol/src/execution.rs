@@ -73,4 +73,44 @@ impl ExecutionReceipt {
             }),
         }
     }
+
+    pub fn request_id(&self) -> &RequestId {
+        match self {
+            Self::Interactive(session) => &session.request_id,
+            Self::Deferred(task) => &task.request_id,
+            Self::Detached(job) => &job.request_id,
+        }
+    }
+
+    pub fn engagement_id(&self) -> &EngagementId {
+        match self {
+            Self::Interactive(session) => &session.engagement_id,
+            Self::Deferred(task) => &task.engagement_id,
+            Self::Detached(job) => &job.engagement_id,
+        }
+    }
+
+    pub fn task_id(&self) -> &TaskId {
+        match self {
+            Self::Interactive(session) => &session.task_id,
+            Self::Deferred(task) => &task.task_id,
+            Self::Detached(job) => &job.task_id,
+        }
+    }
+
+    pub fn provider_id(&self) -> &ProviderId {
+        match self {
+            Self::Interactive(session) => &session.provider_id,
+            Self::Deferred(task) => &task.provider_id,
+            Self::Detached(job) => &job.provider_id,
+        }
+    }
+
+    pub fn lease_epoch(&self) -> u64 {
+        match self {
+            Self::Interactive(session) => session.lease_epoch,
+            Self::Deferred(task) => task.lease_epoch,
+            Self::Detached(job) => job.lease_epoch,
+        }
+    }
 }

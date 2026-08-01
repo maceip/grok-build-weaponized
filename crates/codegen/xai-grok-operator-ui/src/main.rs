@@ -366,7 +366,13 @@ impl OperatorApp {
             });
         }
         ui.add_space(18.0);
-        let task_graphs = self.state.selected_task_graphs();
+        let cancellable = self.state.cancellable_tasks();
+        let task_graphs = self
+            .state
+            .selected_task_graphs()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         if !task_graphs.is_empty() {
             theme::section_heading(ui, "live control plane", "Execution graphs");
         }
@@ -389,6 +395,17 @@ impl OperatorApp {
                 ui.add_space(6.0);
                 for node in &graph.tasks {
                     let tone = shared_theme::task_tone(node.status);
+                    let cancel = cancellable
+                        .iter()
+                        .find(|task| {
+                            task.engagement_id == graph.engagement_id
+                                && task.task_id == node.task.task_id
+                        })
+                        .map(|task| OperatorCommand::CancelTask {
+                            engagement_id: task.engagement_id.clone(),
+                            task_id: task.task_id.clone(),
+                            request_id: task.request_id.clone(),
+                        });
                     theme::deco_frame(SURFACE, tone).show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             theme::status_chip(ui, format!("{:?}", node.status), tone);
@@ -399,6 +416,20 @@ impl OperatorApp {
                                         .monospace()
                                         .color(theme::color(OUTLINE)),
                                 );
+                            }
+                            if let Some(command) = cancel.clone()
+                                && ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("CANCEL TASK").monospace().strong(),
+                                        )
+                                        .fill(theme::color(SURFACE_LOW))
+                                        .stroke(egui::Stroke::new(1.0, theme::color(HOT_PINK)))
+                                        .corner_radius(egui::CornerRadius::ZERO),
+                                    )
+                                    .clicked()
+                            {
+                                self.queue(command);
                             }
                         });
                         ui.label(&node.task.objective);
