@@ -74,9 +74,31 @@ pub(crate) struct PlanPacket {
 }
 
 impl PlanPacket {
+    pub(crate) fn canonicalize_task_ids(&mut self) {
+        let mut used = std::collections::HashSet::new();
+        for (index, task) in self.tasks.iter_mut().enumerate() {
+            let supplied = task.task_id.trim().to_string();
+            let mut candidate = supplied.clone();
+            if supplied.is_empty()
+                || placeholder_text(&supplied)
+                || used.contains(&supplied.to_ascii_lowercase())
+            {
+                candidate = format!("task-{}", index + 1);
+            }
+            let base = candidate.clone();
+            let mut suffix = 2usize;
+            while used.contains(&candidate.to_ascii_lowercase()) {
+                candidate = format!("{base}-{suffix}");
+                suffix += 1;
+            }
+            used.insert(candidate.to_ascii_lowercase());
+            task.task_id = candidate;
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.objective.trim().is_empty() {
-            return Err("planner returned an empty objective".to_string());
+        if !substantive_text(&self.objective) {
+            return Err("planner returned an empty or placeholder objective".to_string());
         }
         if self.tasks.is_empty() {
             return Err("planner returned no execution tasks".to_string());
@@ -84,14 +106,50 @@ impl PlanPacket {
         if self.tasks.len() > 12 {
             return Err("planner returned more than 12 execution tasks".to_string());
         }
-        if self
-            .tasks
-            .iter()
-            .any(|task| task.task_id.trim().is_empty() || task.objective.trim().is_empty())
+        let mut task_ids = std::collections::HashSet::new();
+        for task in &self.tasks {
+            validate_execution_task(task)?;
+            if !task_ids.insert(task.task_id.trim().to_ascii_lowercase()) {
+                return Err(format!(
+                    "planner returned duplicate task id {:?}",
+                    task.task_id
+                ));
+            }
+        }
+        if self.required_tool_families.is_empty()
+            || self
+                .required_tool_families
+                .iter()
+                .any(|value| !substantive_text(value))
         {
-            return Err(
-                "planner returned an execution task without an id or objective".to_string(),
-            );
+            return Err("planner returned no concrete required tool families".to_string());
+        }
+        if self.completion_tests.is_empty()
+            || self
+                .completion_tests
+                .iter()
+                .any(|value| !substantive_text(value))
+        {
+            return Err("planner returned no concrete completion tests".to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_tool_families(&self, allowed: &[String]) -> Result<(), String> {
+        let allowed = allowed
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        for family in self
+            .required_tool_families
+            .iter()
+            .chain(self.tasks.iter().flat_map(|task| &task.tool_families))
+        {
+            if !allowed.contains(&family.to_ascii_lowercase()) {
+                return Err(format!(
+                    "planner returned unavailable tool family {family:?}"
+                ));
+            }
         }
         Ok(())
     }
@@ -113,11 +171,160 @@ pub(crate) enum ReviewDecision {
     Accept {
         final_response: String,
         #[serde(default)]
+        evidence_ids: Vec<String>,
+        #[serde(default)]
         unresolved: Vec<String>,
     },
     Correct {
         tasks: Vec<ExecutionTask>,
     },
+}
+
+impl ReviewDecision {
+    pub(crate) fn canonicalize(&mut self) {
+        match self {
+            Self::Accept {
+                evidence_ids,
+                unresolved,
+                ..
+            } => {
+                evidence_ids.retain(|value| substantive_text(value));
+                evidence_ids.sort();
+                evidence_ids.dedup();
+                unresolved.retain(|value| substantive_text(value));
+            }
+            Self::Correct { tasks } => {
+                let mut used = std::collections::HashSet::new();
+                for (index, task) in tasks.iter_mut().enumerate() {
+                    let supplied = task.task_id.trim().to_string();
+                    let mut candidate = supplied.clone();
+                    if supplied.is_empty()
+                        || placeholder_text(&supplied)
+                        || used.contains(&supplied.to_ascii_lowercase())
+                    {
+                        candidate = format!("correction-{}", index + 1);
+                    }
+                    used.insert(candidate.to_ascii_lowercase());
+                    task.task_id = candidate;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Accept {
+                final_response,
+                evidence_ids,
+                ..
+            } => {
+                if !substantive_text(final_response) {
+                    return Err(
+                        "reviewer returned an empty or placeholder final response".to_string()
+                    );
+                }
+                if evidence_ids.is_empty() {
+                    return Err("reviewer accepted without citing evidence".to_string());
+                }
+                Ok(())
+            }
+            Self::Correct { tasks } => {
+                if tasks.is_empty() {
+                    return Err("reviewer returned no correction tasks".to_string());
+                }
+                for task in tasks {
+                    validate_execution_task(task)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn validate_evidence_ids(
+        &self,
+        available: &std::collections::HashSet<String>,
+    ) -> Result<(), String> {
+        let Self::Accept { evidence_ids, .. } = self else {
+            return Ok(());
+        };
+        for evidence_id in evidence_ids {
+            if !available.contains(evidence_id) {
+                return Err(format!(
+                    "reviewer cited unknown evidence id {evidence_id:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_tool_families(&self, allowed: &[String]) -> Result<(), String> {
+        let Self::Correct { tasks } = self else {
+            return Ok(());
+        };
+        let allowed = allowed
+            .iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        for family in tasks.iter().flat_map(|task| &task.tool_families) {
+            if !allowed.contains(&family.to_ascii_lowercase()) {
+                return Err(format!(
+                    "reviewer returned unavailable tool family {family:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_execution_task(task: &ExecutionTask) -> Result<(), String> {
+    if task.task_id.trim().is_empty() || placeholder_text(&task.task_id) {
+        return Err("planner returned an execution task without a concrete id".to_string());
+    }
+    if !substantive_text(&task.objective) {
+        return Err(format!(
+            "planner returned task {:?} without a concrete objective",
+            task.task_id
+        ));
+    }
+    if task.tool_families.is_empty()
+        || task
+            .tool_families
+            .iter()
+            .any(|value| !substantive_text(value))
+    {
+        return Err(format!(
+            "planner returned task {:?} without concrete tool families",
+            task.task_id
+        ));
+    }
+    if task.completion_tests.is_empty()
+        || task
+            .completion_tests
+            .iter()
+            .any(|value| !substantive_text(value))
+    {
+        return Err(format!(
+            "planner returned task {:?} without concrete completion tests",
+            task.task_id
+        ));
+    }
+    Ok(())
+}
+
+fn substantive_text(value: &str) -> bool {
+    !placeholder_text(value) && value.chars().filter(|ch| ch.is_alphanumeric()).count() >= 3
+}
+
+fn placeholder_text(value: &str) -> bool {
+    let normalized = value
+        .trim()
+        .trim_matches(|ch: char| !ch.is_alphanumeric())
+        .to_ascii_lowercase();
+    normalized.is_empty()
+        || matches!(
+            normalized.as_str(),
+            "todo" | "tbd" | "n/a" | "na" | "none" | "unknown" | "placeholder"
+        )
 }
 
 #[derive(Clone, Debug)]
@@ -591,8 +798,14 @@ mod tests {
     #[test]
     fn review_decisions_parse_without_reasoning_transfer() {
         let accepted: ReviewDecision =
-            parse_json_payload(r#"{"decision":"accept","final_response":"done","unresolved":[]}"#)
-                .unwrap();
+            parse_json_payload(
+                r#"{"decision":"accept","final_response":"done","evidence_ids":["tool:1:0"],"unresolved":[]}"#,
+            )
+            .unwrap();
+        accepted.validate().unwrap();
+        accepted
+            .validate_evidence_ids(&std::collections::HashSet::from(["tool:1:0".to_string()]))
+            .unwrap();
         assert!(matches!(
             accepted,
             ReviewDecision::Accept { final_response, .. } if final_response == "done"
@@ -605,5 +818,81 @@ mod tests {
             corrected,
             ReviewDecision::Correct { tasks } if tasks.len() == 1
         ));
+    }
+
+    #[test]
+    fn planner_discards_scratchpad_and_rejects_placeholder_packets() {
+        let concrete: PlanPacket = parse_json_payload(
+            r#"{
+                "scratchpad":"Need inspect the root manifest with a read-only file tool.",
+                "objective":"Identify the workspace package name from Cargo.toml",
+                "tasks":[{
+                    "task_id":"inspect-manifest",
+                    "objective":"Read Cargo.toml and extract the workspace package name",
+                    "tool_families":["read_file"],
+                    "required_evidence":["Cargo.toml package declaration"],
+                    "completion_tests":["The reported name is cited from Cargo.toml"]
+                }],
+                "required_tool_families":["read_file"],
+                "required_evidence":["Cargo.toml package declaration"],
+                "completion_tests":["The final response reports the observed package name"]
+            }"#,
+        )
+        .unwrap();
+        concrete.validate().unwrap();
+        concrete
+            .validate_tool_families(&["read_file".to_string()])
+            .unwrap();
+        assert!(
+            concrete
+                .validate_tool_families(&["grep".to_string()])
+                .is_err()
+        );
+        assert!(
+            !serde_json::to_string(&concrete)
+                .unwrap()
+                .contains("scratchpad")
+        );
+
+        let placeholder = PlanPacket {
+            objective: "...".to_string(),
+            tasks: vec![ExecutionTask {
+                task_id: "...".to_string(),
+                objective: "...".to_string(),
+                tool_families: vec!["...".to_string()],
+                required_evidence: vec!["...".to_string()],
+                completion_tests: vec!["...".to_string()],
+            }],
+            required_tool_families: vec!["...".to_string()],
+            required_evidence: vec!["...".to_string()],
+            completion_tests: vec!["...".to_string()],
+        };
+        assert!(placeholder.validate().is_err());
+    }
+
+    #[test]
+    fn coordinator_canonicalizes_duplicate_model_task_ids() {
+        let task = |objective: &str| ExecutionTask {
+            task_id: "task_1".to_string(),
+            objective: objective.to_string(),
+            tool_families: vec!["read_file".to_string()],
+            required_evidence: vec!["manifest".to_string()],
+            completion_tests: vec!["Observed value is reported".to_string()],
+        };
+        let mut packet = PlanPacket {
+            objective: "Inspect two distinct manifests".to_string(),
+            tasks: vec![
+                task("Read the root manifest"),
+                task("Read the nested manifest"),
+            ],
+            required_tool_families: vec!["read_file".to_string()],
+            required_evidence: vec!["manifest contents".to_string()],
+            completion_tests: vec!["Both manifest names are reported".to_string()],
+        };
+
+        packet.canonicalize_task_ids();
+        assert_eq!(packet.tasks[0].task_id, "task_1");
+        assert_eq!(packet.tasks[1].task_id, "task-2");
+        packet.validate().unwrap();
     }
 }

@@ -6,13 +6,13 @@
 
 typedef void (*stream_callback)(void *, const char *, bool, const char *);
 
-uint32_t grok_litert_bridge_abi_version(void) { return 5; }
+uint32_t grok_litert_bridge_abi_version(void) { return 6; }
 uint64_t grok_litert_bridge_capabilities(void) {
   return (1ULL << 0) | (1ULL << 1) | (1ULL << 2) | (1ULL << 3) |
-         (1ULL << 4) | (1ULL << 5) | (1ULL << 6);
+         (1ULL << 4) | (1ULL << 5) | (1ULL << 6) | (1ULL << 7);
 }
 const char *grok_litert_bridge_build_id(void) {
-  return "grok-litert-test-bridge-v5";
+  return "grok-litert-test-bridge-v6";
 }
 const char *grok_litert_last_error_message(void) { return NULL; }
 
@@ -191,6 +191,11 @@ void litert_lm_conversation_config_set_enable_constrained_decoding(
     void *config, bool enabled) {
   (void)config;
   (void)enabled;
+}
+void grok_litert_conversation_config_set_json_schema(void *config,
+                                                      const char *schema) {
+  (void)config;
+  (void)schema;
 }
 
 void *litert_lm_conversation_create(void *engine, void *config) {

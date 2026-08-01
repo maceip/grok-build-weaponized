@@ -957,7 +957,9 @@ impl SessionActor {
                     self.push_system_reminder(&format!(
                         "<cooperation_task>{task_packet}</cooperation_task>\n\
                          Execute only this task against real tools. Return a concise typed \
-                         evidence report when this task's completion tests have been evaluated."
+                         evidence report when this task's completion tests have been evaluated. \
+                         Treat configuration section names as containers, not fields; only exact \
+                         keys before '=' are fields, and never substitute another field's value."
                     ));
                 }
                 Err(error) => {
@@ -2153,6 +2155,9 @@ impl SessionActor {
         let mut model_fingerprint: Option<String> = None;
         let mut structured_output_retries: u32 = 0;
         let mut cooperation_corrections: u8 = 0;
+        let mut cooperation_task_tool_start: usize = 0;
+        let mut cooperation_tool_nudges = std::collections::HashSet::new();
+        let mut cooperation_bound_tools = std::collections::HashSet::new();
         let structured_output_validator = json_schema.as_ref().map(|schema| {
             jsonschema::validator_for(schema).map_err(|e| format!("invalid output schema: {e}"))
         });
@@ -2613,9 +2618,85 @@ impl SessionActor {
                 )
                 .await;
             }
+            if tool_calls.is_empty()
+                && !turn_refused
+                && let Some(turn) = cooperation.as_ref().filter(|turn| turn.mode.plans())
+                && let Some(task) = turn.current_task()
+            {
+                let used = turn_tools_called[cooperation_task_tool_start..]
+                    .iter()
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect::<std::collections::HashSet<_>>();
+                let missing_tool = task
+                    .tool_families
+                    .iter()
+                    .find(|name| !used.contains(&name.to_ascii_lowercase()))
+                    .cloned();
+                if let Some(tool_name) = missing_tool
+                    && cooperation_bound_tools.insert(format!(
+                        "{}:{}:{}",
+                        turn.plan_revision, task.task_id, tool_name
+                    ))
+                    && let Some(tool) = request
+                        .tools
+                        .iter()
+                        .find(|tool| tool.name.eq_ignore_ascii_case(&tool_name))
+                {
+                    match self
+                        .bind_required_local_tool_call(req_id, turn, task, tool)
+                        .await
+                    {
+                        Ok(tool_call) => {
+                            self.record_assistant_response(ConversationItem::assistant_tool_calls(
+                                vec![tool_call.clone()],
+                            ))
+                            .await;
+                            tool_calls.push(tool_call);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                prompt_id = req_id,
+                                task_id = %task.task_id,
+                                tool_name,
+                                %error,
+                                "native required-tool argument binding failed"
+                            );
+                        }
+                    }
+                }
+            }
             if tool_calls.is_empty() {
                 if let Some(cooperation) = cooperation.as_ref().filter(|turn| turn.mode.plans()) {
                     self.append_cooperation_turn_evidence(cooperation).await;
+                }
+                if !turn_refused
+                    && let Some(turn) = cooperation.as_ref().filter(|turn| turn.mode.plans())
+                    && let Some(task) = turn.current_task()
+                {
+                    let used = turn_tools_called[cooperation_task_tool_start..]
+                        .iter()
+                        .map(|name| name.to_ascii_lowercase())
+                        .collect::<std::collections::HashSet<_>>();
+                    let missing = task
+                        .tool_families
+                        .iter()
+                        .filter(|name| !used.contains(&name.to_ascii_lowercase()))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let nudge_key = format!("{}:{}", turn.plan_revision, task.task_id);
+                    if !missing.is_empty() && cooperation_tool_nudges.insert(nudge_key) {
+                        self.push_system_reminder(&format!(
+                            "<cooperation_evidence_gap>{{\"task_id\":{},\"missing_tools\":{}}}\
+                             </cooperation_evidence_gap>\nThe task is not complete because required \
+                             evidence tools have not run. Invoke only the missing tools now; do \
+                             not repeat completed actions and do not answer until their results \
+                             are available.",
+                            serde_json::to_string(&task.task_id)
+                                .unwrap_or_else(|_| "\"unknown\"".to_string()),
+                            serde_json::to_string(&missing).unwrap_or_else(|_| "[]".to_string()),
+                        ));
+                        continue;
+                    }
                 }
                 if !turn_refused
                     && cooperation.as_ref().is_some_and(|turn| turn.mode.plans())
@@ -2697,8 +2778,11 @@ impl SessionActor {
                         "<cooperation_task>{task_packet}</cooperation_task>\n\
                          Execute only this next task. Use prior tool results as immutable evidence; \
                          do not repeat completed tool actions. Return a concise typed evidence \
-                         report when this task's completion tests have been evaluated."
+                         report when this task's completion tests have been evaluated. Treat \
+                         configuration section names as containers, not fields; only exact keys \
+                         before '=' are fields, and never substitute another field's value."
                     ));
+                    cooperation_task_tool_start = turn_tools_called.len();
                     continue;
                 }
                 if suppress_executor_stream
@@ -2750,6 +2834,7 @@ impl SessionActor {
                         Ok(crate::agent::turn_coordinator::ReviewDecision::Accept {
                             final_response,
                             unresolved,
+                            ..
                         }) if !final_response.trim().is_empty() => {
                             let final_response = if unresolved.is_empty() {
                                 final_response
@@ -2840,6 +2925,7 @@ impl SessionActor {
                                      Perform only this correction task using existing evidence. \
                                      Never repeat a completed tool action."
                                 ));
+                                cooperation_task_tool_start = turn_tools_called.len();
                                 continue;
                             }
                         }
@@ -2858,8 +2944,19 @@ impl SessionActor {
                             )
                             .await;
                         }
-                        Ok(crate::agent::turn_coordinator::ReviewDecision::Accept { .. })
-                        | Err(_) => {
+                        Err(error) => {
+                            tracing::warn!(
+                                prompt_id = req_id,
+                                %error,
+                                "cooperation reviewer failed; returning executor evidence report"
+                            );
+                            self.publish_cooperation_final(
+                                &cooperation.executor_model,
+                                executor_response,
+                            )
+                            .await;
+                        }
+                        Ok(crate::agent::turn_coordinator::ReviewDecision::Accept { .. }) => {
                             self.publish_cooperation_final(
                                 &cooperation.executor_model,
                                 executor_response,

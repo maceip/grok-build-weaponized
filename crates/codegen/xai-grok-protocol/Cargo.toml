@@ -9,6 +9,7 @@ description = "Zero-I/O control-plane protocol, tasking, capability, and event t
 blake3 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+schemars = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
 

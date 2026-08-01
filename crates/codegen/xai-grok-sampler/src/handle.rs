@@ -115,6 +115,32 @@ impl SamplerHandle {
         request_id: RequestId,
         request: ConversationRequest,
     ) -> Result<(ConversationResponse, InferenceLatencyStats), SamplingError> {
+        self.submit_and_collect_inner(request_id, request, None)
+            .await
+    }
+
+    /// Submit and collect using an explicit model/transport configuration.
+    ///
+    /// This is the collection counterpart to [`Self::submit_with_config`]. It
+    /// keeps auxiliary local-model work on the session's existing actor, so
+    /// native admission acknowledgements, cancellation, and event delivery use
+    /// the same live channel as the primary turn.
+    pub async fn submit_and_collect_with_config(
+        &self,
+        request_id: RequestId,
+        request: ConversationRequest,
+        config: SamplerConfig,
+    ) -> Result<(ConversationResponse, InferenceLatencyStats), SamplingError> {
+        self.submit_and_collect_inner(request_id, request, Some(config))
+            .await
+    }
+
+    async fn submit_and_collect_inner(
+        &self,
+        request_id: RequestId,
+        request: ConversationRequest,
+        config: Option<SamplerConfig>,
+    ) -> Result<(ConversationResponse, InferenceLatencyStats), SamplingError> {
         // RAII guard: when this future is dropped (cancel, panic, or normal return),
         // tell the sampler actor to cancel the in-flight request_id. No-op if the
         // actor already finished and removed it from its active set.
@@ -140,7 +166,7 @@ impl SamplerHandle {
             .send(SamplerCommand::Submit {
                 request_id,
                 request: Box::new(request),
-                config: None,
+                config: config.map(Box::new),
                 completion_tx: Some(completion_tx),
             })
             .ok()

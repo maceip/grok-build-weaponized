@@ -7,6 +7,7 @@
 //! the parent module's private helpers.
 use super::*;
 use futures::StreamExt;
+use tokio::io::AsyncWriteExt;
 /// Whether a tool name is an MCP `create_pull_request` (qualified
 /// `server__create_pull_request` or bare).
 fn is_mcp_create_pull_request(tool_name: &str) -> bool {
@@ -410,8 +411,117 @@ fn bound_atomic_tool_envelope_estimated(
     None
 }
 
+fn plain_tool_result_envelope(
+    status: &str,
+    prompt_text: &str,
+    artifact_path: &std::path::Path,
+) -> String {
+    let mut analysis = xai_grok_tools::util::output_filter::OutputAnalysis::default();
+    analysis.push(prompt_text.as_bytes());
+    let filtered = analysis.render(prompt_text, false, usize::MAX);
+    xai_grok_tools::util::output_filter::ToolResultEnvelope {
+        status: status.to_string(),
+        exit_code: None,
+        signal: None,
+        findings: filtered.structure.findings.clone(),
+        structure: filtered.structure,
+        preview: filtered.text,
+        artifact: xai_grok_tools::util::output_filter::OutputArtifactRef {
+            path: artifact_path.to_string_lossy().into_owned(),
+            total_bytes: prompt_text.len(),
+        },
+        cursor: xai_grok_tools::util::output_filter::OutputCursor {
+            next_byte: prompt_text.len(),
+            complete: true,
+        },
+        truncated: filtered.truncated,
+    }
+    .to_prompt_json()
+}
+
 impl SessionActor {
-    async fn budget_tool_result_for_history(&self, tool_name: &str, prompt_text: String) -> String {
+    async fn persist_plain_tool_result_envelope(
+        &self,
+        call_id: &str,
+        status: &str,
+        prompt_text: String,
+    ) -> std::io::Result<String> {
+        if xai_grok_tools::util::output_filter::WrappedToolResultEnvelope::parse(&prompt_text)
+            .is_some()
+        {
+            return Ok(prompt_text);
+        }
+
+        let session_dir = crate::session::persistence::session_dir(&self.session_info);
+        let artifact_dir = session_dir.join("artifacts").join("tool-results");
+        tokio::fs::create_dir_all(&artifact_dir).await?;
+        let call_hash = blake3::hash(call_id.as_bytes()).to_hex();
+        let content_hash = blake3::hash(prompt_text.as_bytes()).to_hex();
+        let artifact_path = artifact_dir.join(format!(
+            "{}-{}.txt",
+            &call_hash.as_str()[..16],
+            &content_hash.as_str()[..16]
+        ));
+        let existing_is_complete = tokio::fs::metadata(&artifact_path)
+            .await
+            .is_ok_and(|metadata| metadata.len() == prompt_text.len() as u64);
+        if !existing_is_complete {
+            let temporary_path = artifact_dir.join(format!(
+                ".{}.{}.tmp",
+                &call_hash.as_str()[..16],
+                uuid::Uuid::new_v4()
+            ));
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)
+                .await?;
+            if let Err(error) = async {
+                file.write_all(prompt_text.as_bytes()).await?;
+                file.sync_all().await?;
+                drop(file);
+                tokio::fs::rename(&temporary_path, &artifact_path).await
+            }
+            .await
+            {
+                let _ = tokio::fs::remove_file(&temporary_path).await;
+                return Err(error);
+            }
+        }
+
+        Ok(plain_tool_result_envelope(
+            status,
+            &prompt_text,
+            &artifact_path,
+        ))
+    }
+
+    async fn budget_tool_result_for_history(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        status: &str,
+        prompt_text: String,
+    ) -> String {
+        let prompt_text = match self
+            .persist_plain_tool_result_envelope(call_id, status, prompt_text)
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                tracing::error!(
+                    tool = tool_name,
+                    %error,
+                    "failed to persist complete tool-result artifact"
+                );
+                return serde_json::json!({
+                    "status": "artifact_persistence_failed",
+                    "tool": tool_name,
+                    "error": error.to_string(),
+                })
+                .to_string();
+            }
+        };
         let sampler = self.reconstruct_full_config().await;
         let live_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
         let context_window = sampler.context_window.min(u64::from(u32::MAX)) as u32;
@@ -432,12 +542,12 @@ impl SessionActor {
         };
         let limit = claim.limit();
         if limit == 0 {
-            tracing::info!(
-                tool = tool_name,
-                "omitting tool result after cumulative turn-output budget exhaustion"
-            );
-            claim.finish(0);
-            return String::new();
+            let minimum =
+                xai_grok_tools::util::output_filter::WrappedToolResultEnvelope::parse(&prompt_text)
+                    .map(|wrapped| wrapped.render(0, false))
+                    .unwrap_or(prompt_text);
+            claim.finish(limit);
+            return minimum;
         }
 
         if let Some(wrapped) =
@@ -463,8 +573,9 @@ impl SessionActor {
                         limit,
                         "mandatory tool status envelope cannot fit the live result allowance"
                     );
-                    claim.finish(0);
-                    return String::new();
+                    let minimum = wrapped.render(0, false);
+                    claim.finish(limit);
+                    return minimum;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -474,8 +585,9 @@ impl SessionActor {
                     );
                     let Some(bounded) = bound_atomic_tool_envelope_estimated(&wrapped, limit)
                     else {
-                        claim.finish(0);
-                        return String::new();
+                        let minimum = wrapped.render(0, false);
+                        claim.finish(limit);
+                        return minimum;
                     };
                     claim.finish(bounded.retained_tokens);
                     return bounded.text;
@@ -1288,7 +1400,7 @@ impl SessionActor {
         );
         let parse_result = serde_json::from_str::<serde_json::Value>(args_str);
         let mut concatenated_json_count: usize = 0;
-        let raw_input = match &parse_result {
+        let mut raw_input = match &parse_result {
             Ok(value) => value.clone(),
             Err(e) => {
                 if let Some(objects) = crate::session::helpers::tool_input_parsing::try_extract_concatenated_json_objects(
@@ -1336,6 +1448,15 @@ impl SessionActor {
                 }
             }
         };
+        let normalized_integral_numbers =
+            crate::session::helpers::tool_input_parsing::normalize_integral_numbers(&mut raw_input);
+        if normalized_integral_numbers > 0 {
+            tracing::info!(
+                tool_name = %call.function.name,
+                count = normalized_integral_numbers,
+                "canonicalized exactly integral floating-point tool arguments"
+            );
+        }
         let tool_input = match self
             .agent
             .borrow()
@@ -2411,6 +2532,9 @@ impl SessionActor {
             None,
         )
         .await;
+        let message = self
+            .budget_tool_result_for_history(call_id, function_name, "failed", message)
+            .await;
         let tool_chat = ConversationItem::tool_result(call_id.to_string(), message);
         self.chat_state_handle.push_tool_result(tool_chat);
         Ok(())
@@ -2746,7 +2870,7 @@ impl SessionActor {
             );
         }
         prompt_text = self
-            .budget_tool_result_for_history(effective_tool_name, prompt_text)
+            .budget_tool_result_for_history(&call_id, effective_tool_name, "completed", prompt_text)
             .await;
         let tool_chat = if inline_images.is_empty() {
             ConversationItem::tool_result(call_id.to_string(), prompt_text)
@@ -2855,6 +2979,14 @@ impl SessionActor {
             None,
         )
         .await;
+        let message = self
+            .budget_tool_result_for_history(
+                call_id,
+                effective_tool_name.unwrap_or(requested_tool_name),
+                "failed",
+                message,
+            )
+            .await;
         let tool_chat = ConversationItem::tool_result(call_id.to_string(), message);
         self.chat_state_handle.push_tool_result(tool_chat);
         vec![]
@@ -3708,7 +3840,7 @@ mod wait_interrupt_tests {
 
 #[cfg(test)]
 mod atomic_tool_envelope_budget_tests {
-    use super::bound_atomic_tool_envelope_estimated;
+    use super::{bound_atomic_tool_envelope_estimated, plain_tool_result_envelope};
     use xai_grok_tools::util::output_filter::{
         OutputArtifactRef, OutputCursor, OutputStructure, ToolResultEnvelope,
         WrappedToolResultEnvelope,
@@ -3755,5 +3887,24 @@ mod atomic_tool_envelope_budget_tests {
         assert_eq!(reparsed.envelope.structure.line_count, 50_000);
         assert_eq!(reparsed.envelope.artifact.total_bytes, 1_000_000);
         assert_eq!(reparsed.envelope.cursor.next_byte, 1_000_000);
+    }
+
+    #[test]
+    fn plain_tool_results_become_recoverable_typed_envelopes() {
+        let output = "HTTP/1.1 302 Found\n22/tcp open ssh\n";
+        let rendered = plain_tool_result_envelope(
+            "completed",
+            output,
+            std::path::Path::new("/tmp/session/artifacts/result.txt"),
+        );
+        let wrapped = WrappedToolResultEnvelope::parse(&rendered).unwrap();
+        assert_eq!(wrapped.envelope.status, "completed");
+        assert_eq!(wrapped.envelope.structure.line_count, 2);
+        assert_eq!(wrapped.envelope.structure.http_status_count, 1);
+        assert_eq!(wrapped.envelope.structure.open_port_count, 1);
+        assert_eq!(wrapped.envelope.artifact.total_bytes, output.len());
+        assert_eq!(wrapped.envelope.cursor.next_byte, output.len());
+        assert!(wrapped.envelope.cursor.complete);
+        assert!(wrapped.envelope.preview.contains(output));
     }
 }

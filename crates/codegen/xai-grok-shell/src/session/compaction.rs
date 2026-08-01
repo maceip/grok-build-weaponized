@@ -1070,6 +1070,7 @@ impl SessionActor {
             compaction_tools.clone(),
             compaction_hosted_tools.clone(),
             sampling_client,
+            self.sampler_handle.clone(),
             self.session_info.id.clone(),
             sampling_config.clone(),
             self.inference_idle_timeout,

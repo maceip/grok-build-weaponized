@@ -260,6 +260,56 @@ async fn submit_and_collect_returns_response() {
     assert_eq!(a.content.as_ref(), "collected response");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_and_collect_with_config_uses_override_without_mutating_default() {
+    use std::sync::Mutex;
+
+    let captured_models: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_handler = Arc::clone(&captured_models);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let captured = Arc::clone(&captured_handler);
+            async move {
+                captured.lock().unwrap().push(
+                    body.get("model")
+                        .and_then(|model| model.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                let events = sse::chat_completion_events("ok", "test-model");
+                Sse::new(stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ))
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let default_config = test_config(server.base_url(), "default-model");
+    let handle = SamplerActor::spawn(default_config, RetryPolicy::default(), event_tx);
+
+    let override_config = test_config(server.base_url(), "planner-model");
+    handle
+        .submit_and_collect_with_config(
+            RequestId::from("req-override"),
+            user_request("plan"),
+            override_config,
+        )
+        .await
+        .expect("override request should complete");
+    handle
+        .submit_and_collect(RequestId::from("req-default"), user_request("execute"))
+        .await
+        .expect("default request should complete");
+    server.shutdown();
+
+    assert_eq!(
+        captured_models.lock().unwrap().as_slice(),
+        ["planner-model", "default-model"]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Cancellation
 // ---------------------------------------------------------------------------

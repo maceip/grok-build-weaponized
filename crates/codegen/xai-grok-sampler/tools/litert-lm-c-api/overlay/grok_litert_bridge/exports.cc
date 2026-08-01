@@ -7,7 +7,7 @@
 extern "C" const char* grok_litert_last_error_message();
 
 namespace {
-constexpr std::uint32_t kGrokLiteRtBridgeAbiVersion = 5;
+constexpr std::uint32_t kGrokLiteRtBridgeAbiVersion = 6;
 constexpr std::uint64_t kGrokLiteRtBridgeStreaming = 1ULL << 0;
 constexpr std::uint64_t kGrokLiteRtBridgeTokenize = 1ULL << 1;
 constexpr std::uint64_t kGrokLiteRtBridgeLora = 1ULL << 2;
@@ -15,6 +15,7 @@ constexpr std::uint64_t kGrokLiteRtBridgeErrorDetail = 1ULL << 3;
 constexpr std::uint64_t kGrokLiteRtBridgeExactPromptMeasurement = 1ULL << 4;
 constexpr std::uint64_t kGrokLiteRtBridgeAdapterUnload = 1ULL << 5;
 constexpr std::uint64_t kGrokLiteRtBridgeSupportedLoraRanks = 1ULL << 6;
+constexpr std::uint64_t kGrokLiteRtBridgeJsonSchema = 1ULL << 7;
 }  // namespace
 
 extern "C" __attribute__((visibility("default"))) std::uint32_t
@@ -28,14 +29,15 @@ grok_litert_bridge_capabilities() {
          kGrokLiteRtBridgeLora | kGrokLiteRtBridgeErrorDetail |
          kGrokLiteRtBridgeExactPromptMeasurement |
          kGrokLiteRtBridgeAdapterUnload |
-         kGrokLiteRtBridgeSupportedLoraRanks;
+         kGrokLiteRtBridgeSupportedLoraRanks |
+         kGrokLiteRtBridgeJsonSchema;
 }
 
 extern "C" __attribute__((visibility("default"))) const char*
 grok_litert_bridge_build_id() {
   // This identifier describes the stable Grok-facing contract. The build
   // script records the exact LiteRT-LM source revision alongside the dylib.
-  return "grok-litert-bridge-v5";
+  return "grok-litert-bridge-v6";
 }
 
 // `//c:engine` is a cc_library. This exported table creates concrete references
@@ -77,6 +79,8 @@ const std::uintptr_t grok_litert_lm_required_symbols[] = {
         &litert_lm_conversation_config_set_messages),
     reinterpret_cast<std::uintptr_t>(
         &litert_lm_conversation_config_set_enable_constrained_decoding),
+    reinterpret_cast<std::uintptr_t>(
+        &grok_litert_conversation_config_set_json_schema),
     reinterpret_cast<std::uintptr_t>(&litert_lm_conversation_create),
     reinterpret_cast<std::uintptr_t>(&litert_lm_conversation_delete),
     reinterpret_cast<std::uintptr_t>(

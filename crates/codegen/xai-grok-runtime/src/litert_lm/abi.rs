@@ -72,6 +72,7 @@ struct Api {
     conversation_config_set_tools: ConfigSetString,
     conversation_config_set_messages: ConfigSetString,
     conversation_config_set_enable_constrained_decoding: ConfigSetBool,
+    conversation_config_set_json_schema: ConfigSetString,
     conversation_create: ConversationCreate,
     conversation_delete: PtrDelete,
     conversation_measure_prompt: ConversationMeasurePrompt,
@@ -172,6 +173,10 @@ impl Api {
             conversation_config_set_enable_constrained_decoding: symbol!(
                 "litert_lm_conversation_config_set_enable_constrained_decoding",
                 ConfigSetBool
+            ),
+            conversation_config_set_json_schema: symbol!(
+                "grok_litert_conversation_config_set_json_schema",
+                ConfigSetString
             ),
             conversation_create: symbol!("litert_lm_conversation_create", ConversationCreate),
             conversation_delete: symbol!("litert_lm_conversation_delete", PtrDelete),

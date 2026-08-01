@@ -7,11 +7,15 @@
 
 use std::collections::HashSet;
 
-use serde::{Deserialize, Serialize};
+pub use xai_grok_protocol::{
+    OutputArtifactRef, OutputCursor, OutputStructure, ToolResultEnvelope, WrappedToolResultEnvelope,
+};
 
 const MAX_PENDING_LINE_BYTES: usize = 64 * 1024;
 const MAX_FINDINGS: usize = 16;
 const MAX_FINDING_CHARS: usize = 240;
+const MAX_STRUCTURAL_BLOCK_CHARS: usize = 800;
+const MAX_STRUCTURAL_BLOCK_FIELDS: usize = 8;
 const TRUNCATION_MARKER: &str = "\n\n... (output truncated) ...\n\n";
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -23,10 +27,21 @@ pub struct OutputAnalysis {
     http_status_count: usize,
     open_port_count: usize,
     vulnerable_banner_count: usize,
+    generic_match_count: usize,
     dropped_finding_count: usize,
     findings: Vec<String>,
     finding_keys: HashSet<String>,
+    pending_structural_block: Option<StructuralBlock>,
+    capture_search_results: bool,
+    search_result_path: Option<String>,
     oversized_line_count: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct StructuralBlock {
+    header: String,
+    fields: Vec<String>,
+    complete: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -34,116 +49,6 @@ pub struct FilteredOutput {
     pub text: String,
     pub truncated: bool,
     pub structure: OutputStructure,
-}
-
-/// Machine-readable structural facts extracted from the complete stream.
-#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct OutputStructure {
-    pub line_count: usize,
-    pub error_line_count: usize,
-    pub warning_line_count: usize,
-    pub http_status_count: usize,
-    pub open_port_count: usize,
-    pub vulnerable_banner_count: usize,
-    pub match_count: usize,
-    pub oversized_line_count: usize,
-    pub omitted_finding_count: usize,
-    pub findings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct OutputArtifactRef {
-    pub path: String,
-    pub total_bytes: usize,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct OutputCursor {
-    pub next_byte: usize,
-    pub complete: bool,
-}
-
-/// Atomic model-facing result. The preview may be shortened, while the
-/// complete stream remains available through `artifact` and `cursor`.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct ToolResultEnvelope {
-    pub status: String,
-    pub exit_code: Option<i32>,
-    pub signal: Option<String>,
-    pub structure: OutputStructure,
-    pub findings: Vec<String>,
-    pub preview: String,
-    pub artifact: OutputArtifactRef,
-    pub cursor: OutputCursor,
-    pub truncated: bool,
-}
-
-impl ToolResultEnvelope {
-    pub fn to_prompt_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| {
-            "{\"status\":\"serialization_error\",\"truncated\":true}".to_string()
-        })
-    }
-}
-
-/// A typed terminal result embedded in a tool adapter's surrounding prompt
-/// text (for example, the `exit: 0\n` prefix emitted by the bash adapter).
-///
-/// Keeping the wrapper separate lets downstream context admission compact the
-/// preview while reserializing the complete envelope atomically. Generic
-/// middle truncation must never cut the JSON object itself.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct WrappedToolResultEnvelope {
-    pub prefix: String,
-    pub envelope: ToolResultEnvelope,
-    pub suffix: String,
-}
-
-impl WrappedToolResultEnvelope {
-    pub fn parse(input: &str) -> Option<Self> {
-        for (start, _) in input.match_indices('{') {
-            let mut stream = serde_json::Deserializer::from_str(&input[start..])
-                .into_iter::<ToolResultEnvelope>();
-            let Some(Ok(envelope)) = stream.next() else {
-                continue;
-            };
-            let end = start.checked_add(stream.byte_offset())?;
-            return Some(Self {
-                prefix: input[..start].to_owned(),
-                envelope,
-                suffix: input[end..].to_owned(),
-            });
-        }
-        None
-    }
-
-    /// Serialize a valid envelope after bounding only its unstructured
-    /// preview. Finding detail can be omitted after the preview reaches zero;
-    /// all structural counts, status, artifact reference, and cursor remain.
-    pub fn render(&self, preview_char_budget: usize, retain_finding_detail: bool) -> String {
-        let mut envelope = self.envelope.clone();
-        let (preview, preview_truncated) = truncate_middle(&envelope.preview, preview_char_budget);
-        envelope.preview = preview;
-        envelope.truncated |= preview_truncated;
-        if !retain_finding_detail {
-            let omitted = envelope
-                .findings
-                .len()
-                .max(envelope.structure.findings.len());
-            envelope.findings.clear();
-            envelope.structure.findings.clear();
-            envelope.structure.omitted_finding_count = envelope
-                .structure
-                .omitted_finding_count
-                .saturating_add(omitted);
-        }
-        format!(
-            "{}{}{}",
-            self.prefix,
-            envelope.to_prompt_json(),
-            self.suffix
-        )
-    }
 }
 
 impl OutputAnalysis {
@@ -228,7 +133,8 @@ impl OutputAnalysis {
             match_count: self
                 .http_status_count
                 .saturating_add(self.open_port_count)
-                .saturating_add(self.vulnerable_banner_count),
+                .saturating_add(self.vulnerable_banner_count)
+                .saturating_add(self.generic_match_count),
             oversized_line_count: self.oversized_line_count,
             omitted_finding_count: self.dropped_finding_count,
             findings: self.findings.clone(),
@@ -240,6 +146,7 @@ impl OutputAnalysis {
             let line = std::mem::take(&mut self.pending_line);
             self.analyze_complete_line(&line);
         }
+        self.flush_structural_block();
     }
 
     fn analyze_complete_line(&mut self, bytes: &[u8]) {
@@ -247,8 +154,12 @@ impl OutputAnalysis {
         let line = String::from_utf8_lossy(bytes);
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            self.flush_structural_block();
             return;
         }
+
+        self.analyze_structural_line(trimmed);
+        self.analyze_search_result_line(trimmed);
 
         let lowercase = trimmed.to_ascii_lowercase();
         let is_error = contains_any(
@@ -274,6 +185,89 @@ impl OutputAnalysis {
         }
     }
 
+    fn analyze_structural_line(&mut self, line: &str) {
+        let line = strip_display_line_number(line);
+        if is_config_section_header(line) {
+            self.flush_structural_block();
+            self.pending_structural_block = Some(StructuralBlock {
+                header: line.to_string(),
+                fields: Vec::new(),
+                complete: true,
+            });
+            return;
+        }
+
+        let Some(block) = self.pending_structural_block.as_mut() else {
+            return;
+        };
+        if line.starts_with('#') || line.starts_with(';') {
+            return;
+        }
+        if block.fields.len() < MAX_STRUCTURAL_BLOCK_FIELDS && is_config_assignment(line) {
+            block.fields.push(line.to_string());
+            return;
+        }
+
+        // A non-comment, non-assignment line ends a simple TOML/INI-style
+        // structural block. This avoids treating arbitrary source text after a
+        // bracketed expression as configuration evidence.
+        block.complete = false;
+        self.flush_structural_block();
+    }
+
+    fn analyze_search_result_line(&mut self, line: &str) {
+        if let Some(count) = parse_matching_line_count(line) {
+            self.generic_match_count = self.generic_match_count.saturating_add(count);
+            self.capture_search_results = true;
+            self.search_result_path = None;
+            return;
+        }
+        if !self.capture_search_results {
+            return;
+        }
+        if line.starts_with("</workspace_result") {
+            self.capture_search_results = false;
+            self.search_result_path = None;
+            return;
+        }
+        if line.starts_with('/') {
+            self.search_result_path = Some(line.to_string());
+            return;
+        }
+        if line
+            .split_once(':')
+            .is_some_and(|(line_number, _)| line_number.parse::<usize>().is_ok())
+        {
+            let finding = self
+                .search_result_path
+                .as_ref()
+                .map_or_else(|| line.to_string(), |path| format!("{path}:{line}"));
+            self.add_finding(&finding);
+        }
+    }
+
+    fn flush_structural_block(&mut self) {
+        let Some(block) = self.pending_structural_block.take() else {
+            return;
+        };
+        if block.fields.is_empty() {
+            return;
+        }
+        let section_name = block.header.trim_matches(['[', ']']);
+        let completeness = if block.complete {
+            "complete"
+        } else {
+            "partial"
+        };
+        let mut finding =
+            format!("config section {section_name:?} ({completeness}); observed fields:");
+        for field in block.fields {
+            finding.push_str("\n- ");
+            finding.push_str(&field);
+        }
+        self.add_finding(&truncate_chars(&finding, MAX_STRUCTURAL_BLOCK_CHARS));
+    }
+
     fn add_finding(&mut self, line: &str) {
         let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
         if !self.finding_keys.insert(normalized.clone()) {
@@ -288,8 +282,10 @@ impl OutputAnalysis {
     }
 
     fn summary(&self, raw_was_truncated: bool) -> Option<String> {
-        let match_count =
-            self.http_status_count + self.open_port_count + self.vulnerable_banner_count;
+        let match_count = self.http_status_count
+            + self.open_port_count
+            + self.vulnerable_banner_count
+            + self.generic_match_count;
         if !raw_was_truncated
             && match_count == 0
             && self.error_line_count == 0
@@ -333,6 +329,45 @@ impl OutputAnalysis {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn strip_display_line_number(line: &str) -> &str {
+    let Some((prefix, remainder)) = line.split_once('→') else {
+        return line;
+    };
+    if prefix.chars().all(|ch| ch.is_ascii_digit()) {
+        remainder.trim_start()
+    } else {
+        line
+    }
+}
+
+fn is_config_section_header(line: &str) -> bool {
+    let line = line.trim();
+    line.len() >= 3
+        && line.starts_with('[')
+        && line.ends_with(']')
+        && !line[1..line.len() - 1].trim().is_empty()
+}
+
+fn is_config_assignment(line: &str) -> bool {
+    let Some((key, value)) = line.split_once('=') else {
+        return false;
+    };
+    let key = key.trim();
+    !key.is_empty()
+        && !value.trim().is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn parse_matching_line_count(line: &str) -> Option<usize> {
+    let normalized = line.trim().to_ascii_lowercase();
+    let count = normalized
+        .strip_prefix("found ")?
+        .strip_suffix(" matching lines")?;
+    count.parse().ok()
 }
 
 fn has_http_status(line: &str) -> bool {
@@ -478,6 +513,55 @@ mod tests {
         assert!(rendered.text.contains("warnings=1"));
         assert!(rendered.text.contains("matches=0"));
         assert!(!rendered.text.contains("Key findings"));
+    }
+
+    #[test]
+    fn retains_complete_config_sections_from_truncated_middle() {
+        let mut analysis = OutputAnalysis::default();
+        analysis.push(
+            b"[workspace]\nresolver = \"2\"\nmembers = [\n\n\
+              [workspace.package]\nedition = \"2024\"\nlicense = \"Apache-2.0\"\n\n\
+              [workspace.dependencies]\nserde = \"1\"\n",
+        );
+
+        let rendered = analysis.render("[workspace]\n...\n[workspace.dependencies]", true, 2_000);
+
+        assert!(
+            rendered
+                .text
+                .contains("config section \"workspace.package\" (complete)")
+        );
+        assert!(rendered.text.contains("edition = \"2024\""));
+        assert!(rendered.text.contains("license = \"Apache-2.0\""));
+        assert!(
+            rendered
+                .structure
+                .findings
+                .iter()
+                .any(|finding| finding.contains("\"workspace.package\""))
+        );
+    }
+
+    #[test]
+    fn retains_grep_match_count_and_path_qualified_lines() {
+        let mut analysis = OutputAnalysis::default();
+        analysis.push(
+            b"<workspace_result workspace_path=\"/repo\">\nFound 2 matching lines\n\
+              /repo/Cargo.toml\n101:[workspace.package]\n102:name = \"demo\"\n\
+              </workspace_result>\n",
+        );
+
+        let rendered = analysis.render("tail", true, 2_000);
+
+        assert_eq!(rendered.structure.match_count, 2);
+        assert!(
+            rendered
+                .structure
+                .findings
+                .iter()
+                .any(|finding| finding == "/repo/Cargo.toml:101:[workspace.package]")
+        );
+        assert!(rendered.text.contains("matches=2"));
     }
 
     #[test]

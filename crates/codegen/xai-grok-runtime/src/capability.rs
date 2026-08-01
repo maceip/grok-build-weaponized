@@ -99,12 +99,14 @@ pub fn local_runtime_capability_manifest(config: &RuntimeManagerConfig) -> Capab
     metadata.insert("engine".to_owned(), "litert-lm".into());
     metadata.insert("isolated_worker_default".to_owned(), true.into());
     metadata.insert("exact_prompt_measurement".to_owned(), true.into());
+    metadata.insert("json_schema_constrained_decoding".to_owned(), true.into());
     metadata.insert("single_adapter_per_request".to_owned(), true.into());
     let features = [
         "adapter_residency",
         "bounded_binary_ipc",
         "cancellation",
         "exact_prompt_measurement",
+        "json_schema_constrained_decoding",
         "memory_counters",
         "session_release",
     ]

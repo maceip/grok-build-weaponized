@@ -259,6 +259,64 @@ mod tests {
     }
 
     #[test]
+    fn prepares_native_json_schema_constraint() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        });
+        let request = ConversationRequest {
+            items: vec![ConversationItem::User(UserItem {
+                content: vec![ContentPart::Text {
+                    text: Arc::<str>::from("Return the answer"),
+                }],
+                ..Default::default()
+            })],
+            json_schema: Some(schema.clone()),
+            ..Default::default()
+        };
+
+        let prepared = prepare_conversation(request).unwrap();
+
+        let serialized = prepared.json_schema.as_deref().expect("serialized schema");
+        assert_eq!(serde_json::from_str::<Value>(serialized).unwrap(), schema);
+        assert_eq!(prepared.compatibility().json_schema, prepared.json_schema);
+    }
+
+    #[test]
+    fn executor_stage_compacts_generic_base_system_and_retains_typed_task() {
+        let request = ConversationRequest {
+            items: vec![
+                ConversationItem::System(SystemItem {
+                    content: Arc::<str>::from(
+                        "You are Grok released by xAI.\n\n<large-generic-policy>unused</large-generic-policy>",
+                    ),
+                }),
+                ConversationItem::System(SystemItem {
+                    content: Arc::<str>::from(
+                        "<cooperation_task>{\"objective\":\"inspect\"}</cooperation_task>",
+                    ),
+                }),
+                ConversationItem::User(UserItem {
+                    content: vec![ContentPart::Text {
+                        text: Arc::<str>::from("Inspect the workspace"),
+                    }],
+                    ..Default::default()
+                }),
+            ],
+            x_grok_req_id: Some("grok-stage-executor:test:1".to_string()),
+            ..Default::default()
+        };
+
+        let prepared = prepare_conversation(request).unwrap();
+        let system = prepared.system_message.unwrap();
+        assert!(system.contains("local execution stage"));
+        assert!(system.contains("<cooperation_task>"));
+        assert!(!system.contains("large-generic-policy"));
+    }
+
+    #[test]
     fn local_tool_admission_keeps_at_most_six_complete_relevant_schemas() {
         let request = ConversationRequest {
             items: vec![ConversationItem::User(UserItem {

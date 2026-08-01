@@ -9,6 +9,8 @@ pub struct PreparedConversation {
     pub retrieved_memory: Option<String>,
     pub messages: String,
     pub tools: String,
+    #[serde(default)]
+    pub json_schema: Option<String>,
     pub current_message: String,
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f32>,
@@ -33,6 +35,7 @@ impl PreparedConversation {
         ConversationCompatibility {
             system_message: self.effective_system_message(),
             tools: self.tools.clone(),
+            json_schema: self.json_schema.clone(),
             max_output_tokens: self.max_output_tokens,
             temperature_bits: self.temperature.map(f32::to_bits),
             top_p_bits: self.top_p.map(f32::to_bits),
@@ -235,6 +238,13 @@ fn build_native_conversation_config(
             request.tools != "[]",
         );
     }
+    if let Some(schema) = request.json_schema.as_deref() {
+        let schema = cstring(schema, "JSON Schema output constraint")?;
+        // SAFETY: the setter copies the validated schema string.
+        unsafe {
+            (api.conversation_config_set_json_schema)(conversation.as_ptr(), schema.as_ptr())
+        };
+    }
     Ok(native)
 }
 
@@ -285,18 +295,22 @@ fn partition_retrieved_memory(system_parts: Vec<String>) -> (Option<String>, Opt
 pub fn prepare_conversation(
     request: ConversationRequest,
 ) -> Result<PreparedConversation, SamplingError> {
+    let executor_stage = request
+        .x_grok_req_id
+        .as_deref()
+        .is_some_and(|request_id| request_id.starts_with("grok-stage-executor:"));
     if !request.hosted_tools.is_empty() {
         return Err(local_error(
             "litert_lm_unsupported",
             "backend-hosted tools are unavailable for local inference",
         ));
     }
-    if request.json_schema.is_some() {
-        return Err(local_error(
-            "litert_lm_unsupported",
-            "JSON Schema output constraints are not exposed by LiteRT-LM's public C API",
-        ));
-    }
+    let json_schema = request
+        .json_schema
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(SamplingError::Serialization)?;
     let disable_tools = matches!(
         request.tool_choice,
         Some(xai_grok_sampling_types::ConversationToolChoice::None)
@@ -322,9 +336,27 @@ pub fn prepare_conversation(
     let mut messages = Vec::new();
     let mut tool_names = HashMap::new();
     let mut omitted_discovery_reminders = 0usize;
+    let mut compacted_executor_base_system = false;
     for item in request.items {
         match item {
-            ConversationItem::System(system) => system_parts.push(system.content.to_string()),
+            ConversationItem::System(system) => {
+                let content = system.content.to_string();
+                if executor_stage
+                    && !compacted_executor_base_system
+                    && content.starts_with("You are Grok released by xAI.")
+                {
+                    system_parts.push(
+                        "You are the local execution stage. Execute exactly the current typed \
+                         cooperation task with the provided tools. Never invent tool results or \
+                         claim unobserved evidence. Do not expose hidden reasoning. Return a \
+                         concise evidence report that evaluates the task completion tests."
+                            .to_string(),
+                    );
+                    compacted_executor_base_system = true;
+                } else {
+                    system_parts.push(content);
+                }
+            }
             ConversationItem::User(user) => {
                 // Grok persists plugin-skill and connected-MCP inventories as
                 // synthetic user reminders. They are useful to large hosted
@@ -454,6 +486,7 @@ pub fn prepare_conversation(
         retrieved_memory,
         messages,
         tools,
+        json_schema,
         current_message,
         max_output_tokens: request.max_output_tokens,
         temperature: request.temperature,

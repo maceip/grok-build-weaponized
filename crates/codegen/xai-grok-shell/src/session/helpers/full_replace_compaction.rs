@@ -39,7 +39,8 @@ use xai_chat_state::compaction_utils::{
 
 use crate::sampling::Client as OaiCompatClient;
 use crate::session::helpers::session_compact::{
-    CompactFailure, CompactOutput, build_compaction_chat_history, generate_session_compact,
+    CompactFailure, CompactOutput, build_compaction_chat_history, generate_local_session_compact,
+    generate_session_compact,
 };
 
 /// Wraps `generate_session_compact` as the shared engine's
@@ -62,6 +63,7 @@ pub(crate) struct ShellCompactionSampler {
     tools: Vec<ToolSpec>,
     hosted_tools: Vec<HostedTool>,
     client: OaiCompatClient,
+    sampler_handle: xai_grok_sampler::SamplerHandle,
     session_id: acp::SessionId,
     sampling_config: SamplingConfig,
     /// Per-chunk idle timeout forwarded to `generate_session_compact`: a stalled
@@ -84,6 +86,7 @@ impl ShellCompactionSampler {
         tools: Vec<ToolSpec>,
         hosted_tools: Vec<HostedTool>,
         client: OaiCompatClient,
+        sampler_handle: xai_grok_sampler::SamplerHandle,
         session_id: acp::SessionId,
         sampling_config: SamplingConfig,
         idle_timeout: Duration,
@@ -96,6 +99,7 @@ impl ShellCompactionSampler {
             tools,
             hosted_tools,
             client,
+            sampler_handle,
             session_id,
             sampling_config,
             idle_timeout,
@@ -130,19 +134,32 @@ impl CompactionSampler for ShellCompactionSampler {
             self.use_short_prompt,
         );
 
-        match generate_session_compact(
-            chat_history,
-            self.tools.clone(),
-            self.hosted_tools.clone(),
-            self.client.clone(),
-            self.session_id.clone(),
-            &self.sampling_config,
-            self.idle_timeout,
-            self.wall_clock_budget_secs,
-            self.tool_choice,
-        )
-        .await
-        {
+        let result = if self.sampling_config.base_url.starts_with("litert-lm:") {
+            generate_local_session_compact(
+                chat_history,
+                self.sampler_handle.clone(),
+                self.session_id.clone(),
+                &self.sampling_config,
+                self.idle_timeout,
+                self.wall_clock_budget_secs,
+            )
+            .await
+        } else {
+            generate_session_compact(
+                chat_history,
+                self.tools.clone(),
+                self.hosted_tools.clone(),
+                self.client.clone(),
+                self.session_id.clone(),
+                &self.sampling_config,
+                self.idle_timeout,
+                self.wall_clock_budget_secs,
+                self.tool_choice,
+            )
+            .await
+        };
+
+        match result {
             Ok(output) => {
                 let response = output.content.clone();
                 *self.last_success.lock().unwrap() = Some(output);

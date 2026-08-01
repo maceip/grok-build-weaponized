@@ -664,14 +664,19 @@ impl JsonlStorageAdapter {
             }
             Err(error) => return Err(error),
         };
+        // The public restore limit applies to valid runs, not raw directory
+        // entries. Scan a separately bounded candidate set so an invalid or
+        // symlinked entry cannot consume a valid-run slot while a hostile
+        // directory still cannot force an unbounded restore walk.
+        let max_scanned_entries = MAX_RESTORED_WORKFLOW_RUNS.saturating_mul(4);
         let mut entries: Vec<_> = std::fs::read_dir(&workflows_dir)?
             .filter_map(Result::ok)
-            .take(MAX_RESTORED_WORKFLOW_RUNS.saturating_add(1))
+            .take(max_scanned_entries.saturating_add(1))
             .collect();
-        let entries_truncated = entries.len() > MAX_RESTORED_WORKFLOW_RUNS;
-        entries.truncate(MAX_RESTORED_WORKFLOW_RUNS);
+        let scan_truncated = entries.len() > max_scanned_entries;
+        entries.truncate(max_scanned_entries);
         entries.sort_by_key(|entry| entry.file_name());
-        if entries_truncated {
+        if scan_truncated || entries.len() > MAX_RESTORED_WORKFLOW_RUNS {
             tracing::warn!(
                 path = %workflows_dir.display(),
                 limit = MAX_RESTORED_WORKFLOW_RUNS,
@@ -680,6 +685,9 @@ impl JsonlStorageAdapter {
         }
         let mut restored = Vec::new();
         for entry in entries {
+            if restored.len() >= MAX_RESTORED_WORKFLOW_RUNS {
+                break;
+            }
             let run_dir = entry.path();
             let Ok(run_meta) = std::fs::symlink_metadata(&run_dir) else {
                 continue;

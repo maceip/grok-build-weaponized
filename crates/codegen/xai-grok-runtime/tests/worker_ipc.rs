@@ -40,6 +40,7 @@ fn prepared() -> PreparedConversation {
         retrieved_memory: None,
         messages: "[]".to_owned(),
         tools: "[]".to_owned(),
+        json_schema: None,
         current_message: r#"{"role":"user","content":[{"type":"text","text":"hello"}]}"#.to_owned(),
         max_output_tokens: Some(64),
         temperature: Some(0.0),

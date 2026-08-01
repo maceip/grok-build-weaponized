@@ -11,6 +11,7 @@ mod execution;
 mod exercise;
 mod ids;
 mod ingress;
+mod output;
 mod profile;
 mod tasking;
 mod team;
@@ -39,6 +40,9 @@ pub use ids::{
     TurnId, WorkspaceId,
 };
 pub use ingress::{BuzzIngress, IngressEnvelope, IngressSource, QmIngress};
+pub use output::{
+    OutputArtifactRef, OutputCursor, OutputStructure, ToolResultEnvelope, WrappedToolResultEnvelope,
+};
 pub use profile::{
     ArtifactBinding, DeploymentTarget, DiagnosticSeverity, GuiProfile, GuiRenderer, LibcTarget,
     ProfileDiagnostic, ProfileProviderRequirement, RUNTIME_PROFILE_SCHEMA_VERSION, RuntimeProfile,

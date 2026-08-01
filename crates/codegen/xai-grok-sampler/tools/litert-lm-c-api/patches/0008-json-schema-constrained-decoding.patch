@@ -1,0 +1,95 @@
+diff --git a/c/engine.h b/c/engine.h
+--- a/c/engine.h
++++ b/c/engine.h
+@@ -185,6 +185,14 @@ LITERT_LM_C_API_EXPORT
+ void litert_lm_conversation_config_set_enable_constrained_decoding(
+     LiteRtLmConversationConfig* config, bool enable_constrained_decoding);
+ 
++// Constrains every response from this conversation to the supplied JSON
++// Schema using LiteRT-LM's LLGuidance provider. The schema is copied by the
++// config and remains active for the lifetime of the created conversation.
++// Passing NULL clears the constraint.
++LITERT_LM_C_API_EXPORT
++void grok_litert_conversation_config_set_json_schema(
++    LiteRtLmConversationConfig* config, const char* json_schema);
++
+ // Destroys a LiteRT LM Conversation Config.
+ // @param config The config to destroy.
+ LITERT_LM_C_API_EXPORT
+diff --git a/c/engine.cc b/c/engine.cc
+--- a/c/engine.cc
++++ b/c/engine.cc
+@@ -168,6 +168,7 @@ struct LiteRtLmBenchmarkInfo {
+ 
+ struct LiteRtLmConversation {
+   std::unique_ptr<Conversation> conversation;
++  std::string json_schema;
+ };
+ 
+ struct LiteRtLmJsonResponse {
+@@ -183,6 +184,7 @@ struct LiteRtLmConversationConfig {
+   std::string tools_json;
+   std::string messages_json;
+   bool enable_constrained_decoding = false;
++  std::string json_schema;
+ };
+ 
+ struct LiteRtLmDetokenizeResult {
+@@ -301,6 +303,13 @@ void litert_lm_conversation_config_set_enable_constrained_decoding(
+   }
+ }
+ 
++void grok_litert_conversation_config_set_json_schema(
++    LiteRtLmConversationConfig* config, const char* json_schema) {
++  if (config) {
++    config->json_schema = json_schema == nullptr ? "" : json_schema;
++  }
++}
++
+ void litert_lm_conversation_config_delete(LiteRtLmConversationConfig* config) {
+   delete config;
+ }
+@@ -803,6 +813,9 @@ LiteRtLmConversation* litert_lm_conversation_create(
+     }
+     builder.SetPreface(json_preface);
+     builder.SetEnableConstrainedDecoding(c_config->enable_constrained_decoding);
++    if (!c_config->json_schema.empty()) {
++      builder.SetConstraintProviderConfig(litert::lm::LlGuidanceConfig{});
++    }
+     auto config = builder.Build(*engine->engine);
+ 
+     if (!config.ok()) {
+@@ -832,6 +845,9 @@ LiteRtLmConversation* litert_lm_conversation_create(
+   }
+   auto* c_conversation = new LiteRtLmConversation;
+   c_conversation->conversation = *std::move(conversation);
++  if (c_config != nullptr) {
++    c_conversation->json_schema = c_config->json_schema;
++  }
+   return c_conversation;
+ }
+ 
+@@ -850,6 +866,11 @@ LiteRtLmJsonResponse* litert_lm_conversation_send_message(
+   }
+ 
+   litert::lm::OptionalArgs optional_args = CreateOptionalArgs(extra_context);
++  if (!conversation->json_schema.empty()) {
++    optional_args.decoding_constraint = litert::lm::LlGuidanceConstraintArg{
++        litert::lm::LlgConstraintType::kJsonSchema,
++        conversation->json_schema};
++  }
+ 
+   auto response = conversation->conversation->SendMessage(
+       json_message, std::move(optional_args));
+@@ -890,6 +911,11 @@ int litert_lm_conversation_send_message_stream(
+   }
+ 
+   litert::lm::OptionalArgs optional_args = CreateOptionalArgs(extra_context);
++  if (!conversation->json_schema.empty()) {
++    optional_args.decoding_constraint = litert::lm::LlGuidanceConstraintArg{
++        litert::lm::LlgConstraintType::kJsonSchema,
++        conversation->json_schema};
++  }
+ 
+   absl::Status status = conversation->conversation->SendMessageAsync(
+       json_message, CreateConversationCallback(callback, callback_data),

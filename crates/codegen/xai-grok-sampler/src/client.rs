@@ -302,9 +302,13 @@ fn apply_env_http_headers(
     }
 }
 
-/// HTTP client for sampling. Cheap to clone; carries an `Arc`-backed
-/// `reqwest::Client` and the default headers/request-defaults computed from a
-/// [`SamplerConfig`] at construction time.
+/// Sampling client for HTTP backends and auxiliary local-model requests.
+///
+/// HTTP requests use the `Arc`-backed [`reqwest::Client`] below. When the
+/// configured base URL uses the `litert-lm:` scheme, [`Self::conversation_collect`]
+/// dispatches through the sampler actor instead. That is the same native
+/// runtime path used by primary turn generation, so side workflows never try
+/// to reinterpret a local model URL as an HTTP endpoint.
 #[derive(Clone)]
 pub struct SamplingClient {
     http: reqwest::Client,
@@ -322,6 +326,10 @@ pub struct SamplingClient {
     header_injector: Option<crate::config::SharedHeaderInjector>,
     /// Endpoint URL builder, resolved once from `base_url` + `query_params`.
     endpoint: EndpointTemplate,
+    /// Preserved only for the native LiteRT-LM transport. The actor owns
+    /// cancellation and selects the direct local runtime before constructing
+    /// any HTTP request.
+    local_config: Option<Box<SamplerConfig>>,
 }
 
 impl std::fmt::Debug for SamplingClient {
@@ -509,6 +517,10 @@ impl SamplingClient {
     /// pre-computes the default request headers. This does not perform
     /// any network I/O.
     pub fn new(config: SamplerConfig) -> Result<Self> {
+        let local_config = config
+            .base_url
+            .starts_with("litert-lm:")
+            .then(|| Box::new(config.clone()));
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if let Some(ref api_key) = config.api_key {
@@ -659,6 +671,7 @@ impl SamplingClient {
             bearer_resolver: config.bearer_resolver,
             header_injector: config.header_injector,
             endpoint,
+            local_config,
         })
     }
 
@@ -1980,6 +1993,18 @@ impl SamplingClient {
         &self,
         request: ConversationRequest,
     ) -> Result<ConversationResponse> {
+        if let Some(config) = self.local_config.as_deref() {
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let handle = crate::SamplerActor::spawn(
+                config.clone(),
+                crate::config::RetryPolicy::default(),
+                event_tx,
+            );
+            return handle
+                .submit_and_collect(crate::types::RequestId::random(), request)
+                .await
+                .map(|(response, _metrics)| response);
+        }
         let request_id = crate::types::RequestId::random();
         let idle_timeout = std::time::Duration::from_secs(300);
         let result = match self.api_backend() {
@@ -2195,6 +2220,27 @@ mod tests {
     fn new_with_minimal_config_succeeds() {
         let client = SamplingClient::new(minimal_config()).expect("client should construct");
         assert_eq!(client.api_backend(), ApiBackend::ChatCompletions);
+    }
+
+    #[tokio::test]
+    async fn conversation_collect_routes_litert_urls_to_native_dispatch() {
+        let mut config = minimal_config();
+        config.base_url = "litert-lm://remote-host/model".to_string();
+        let client = SamplingClient::new(config).expect("local sampler should construct");
+        let error = client
+            .conversation_collect(ConversationRequest::default())
+            .await
+            .expect_err("invalid local URL must fail in native config parsing");
+        match error {
+            SamplingError::StreamError {
+                error_type,
+                message,
+            } => {
+                assert_eq!(error_type, "litert_lm_config");
+                assert!(message.contains("absolute local path"), "{message}");
+            }
+            other => panic!("expected native config error, got {other}"),
+        }
     }
 
     #[test]

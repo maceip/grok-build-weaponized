@@ -1,0 +1,37 @@
+diff --git a/runtime/components/constrained_decoding/constraint_provider_factory.cc b/runtime/components/constrained_decoding/constraint_provider_factory.cc
+index 30ac124..052b713 100644
+--- a/runtime/components/constrained_decoding/constraint_provider_factory.cc
++++ b/runtime/components/constrained_decoding/constraint_provider_factory.cc
+@@ -31,7 +31,7 @@ absl::StatusOr<std::unique_ptr<ConstraintProvider>> CreateConstraintProvider(
+       // If eos_id is not provided in the config, use the first valid stop token
+       // as the eos_id.
+       for (const auto& stop_sequence : stop_token_ids) {
+-        if (stop_sequence.size() == 1) {
++        if (stop_sequence.size() == 1 && stop_sequence[0] >= 0) {
+           llg_guidance_config.eos_id = stop_sequence[0];
+           break;
+         }
+diff --git a/runtime/components/constrained_decoding/constraint_provider_factory_test.cc b/runtime/components/constrained_decoding/constraint_provider_factory_test.cc
+index deaffca..b21a646 100644
+--- a/runtime/components/constrained_decoding/constraint_provider_factory_test.cc
++++ b/runtime/components/constrained_decoding/constraint_provider_factory_test.cc
+@@ -69,6 +69,19 @@ TEST_F(ConstraintProviderFactoryTest, CreateLlgConstraintProviderInferEosId) {
+   EXPECT_NE(provider.value(), nullptr);
+ }
+ 
++TEST_F(ConstraintProviderFactoryTest,
++       CreateLlgConstraintProviderSkipsNegativeStopToken) {
++  LlGuidanceConfig config;
++  std::vector<std::vector<int>> stop_token_ids = {{-1}, {2}};
++
++  EXPECT_CALL(tokenizer_, GetTokens())
++      .WillOnce(Return(std::vector<std::string>{"<pad>", "<eos>", "a", "b"}));
++
++  auto provider = CreateConstraintProvider(config, tokenizer_, stop_token_ids);
++  ASSERT_TRUE(provider.ok());
++  EXPECT_NE(provider.value(), nullptr);
++}
++
+ TEST_F(ConstraintProviderFactoryTest, CreateLlgConstraintProviderMissingEosId) {
+   LlGuidanceConfig config;
+   // eos_id is missing, and stop_token_ids is empty

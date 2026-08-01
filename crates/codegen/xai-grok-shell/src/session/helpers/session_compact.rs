@@ -71,6 +71,7 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
                     && *status != StatusCode::TOO_MANY_REQUESTS)
         }
         SamplingError::MaxTokensTruncation => true,
+        SamplingError::StreamError { message, .. } if is_context_length_error(message) => true,
         SamplingError::Http(_)
         | SamplingError::EventStreamError(_)
         | SamplingError::StreamError { .. }
@@ -735,6 +736,81 @@ pub(crate) async fn generate_session_compact(
         Ok(output)
     }
 }
+
+/// Generate a compaction summary through the session's sampler actor when the
+/// selected model is local. This keeps LiteRT-LM requests on the native runtime
+/// path and preserves the actor's admission, cancellation, and recovery
+/// semantics; no HTTP request is constructed from a `litert-lm://` URL.
+pub(crate) async fn generate_local_session_compact(
+    chat_history: Vec<ConversationItem>,
+    sampler_handle: xai_grok_sampler::SamplerHandle,
+    session_id: acp::SessionId,
+    sampling_config: &SamplingConfig,
+    idle_timeout: std::time::Duration,
+    wall_clock_budget_secs: u64,
+) -> Result<CompactOutput, CompactFailure> {
+    let request_id =
+        xai_grok_sampler::RequestId::from(format!("xai-compact-{}", uuid::Uuid::new_v4()));
+    let _suppressed = crate::session::acp_session::suppress_sampling(request_id.as_str());
+    let request = ConversationRequest {
+        items: chat_history,
+        // Compaction is a text-only operation. Omitting tool schemas is both
+        // semantically correct and essential for small local context windows.
+        tools: Vec::new(),
+        hosted_tools: Vec::new(),
+        tool_choice: Some(ConversationToolChoice::None),
+        model: Some(sampling_config.model.clone()),
+        temperature: Some(0.0),
+        max_output_tokens: sampling_config.max_completion_tokens,
+        x_grok_conv_id: Some(session_id.to_string()),
+        x_grok_req_id: Some(request_id.to_string()),
+        x_grok_session_id: Some(format!("{session_id}:compaction")),
+        x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
+        ..Default::default()
+    };
+    let mut config = sampling_config.clone();
+    config.idle_timeout_secs = Some(idle_timeout.as_secs().max(1));
+    let started = std::time::Instant::now();
+    let sample = sampler_handle.submit_and_collect_with_config(request_id, request, config);
+    let sampled = if wall_clock_budget_secs == 0 {
+        sample.await
+    } else {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(wall_clock_budget_secs),
+            sample,
+        )
+        .await
+        .map_err(|_| {
+            CompactFailure::Transient(acp::Error::internal_error().data(format!(
+                "compact failed: exceeded wall-clock budget {wall_clock_budget_secs}s"
+            )))
+        })?
+    }
+    .map_err(classify_sampling_error)?;
+    let (response, metrics) = sampled;
+    let content = response.assistant_text();
+    let truncated = matches!(
+        response.stop_reason,
+        Some(xai_grok_sampling_types::StopReason::Length)
+    );
+    let stop_reason = response
+        .stop_reason
+        .map(|reason| reason.as_str().to_string());
+    if content.is_empty() {
+        return Err(CompactFailure::Transient(
+            acp::Error::internal_error().data("compact failed: model returned empty response"),
+        ));
+    }
+    Ok(CompactOutput {
+        content,
+        stop_reason,
+        truncated,
+        ttft_ms: metrics.time_to_first_token_ms,
+        stream_ms: Some(metrics.time_to_last_byte_ms),
+        delta_count: u64::from(metrics.chunk_count),
+        itl_max_ms: metrics.itl_max_ms,
+    })
+}
 /// Tests for `classify_sampling_error` and `classify_response_event_error`.
 /// Pin the deterministic-vs-transient mapping for every `SamplingError`
 /// variant and for the meaningful branches of the response-event classifier
@@ -787,6 +863,12 @@ mod classify_tests {
             SamplingError::StreamError {
                 error_type: "overloaded_error".into(),
                 message: "try again".into(),
+            }
+        )));
+        assert!(is_det(&classify_sampling_error(
+            SamplingError::StreamError {
+                error_type: "litert_lm_context".into(),
+                message: "prepared request exceeds the local context window".into(),
             }
         )));
     }

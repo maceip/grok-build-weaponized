@@ -82,6 +82,9 @@ patches=(
   "${script_dir}/patches/0005-supported-lora-ranks-setting.patch"
   "${script_dir}/patches/0006-legacy-webgpu-sampler-compatibility.patch"
   "${script_dir}/patches/0007-nonblocking-benchmark-warmup.patch"
+  "${script_dir}/patches/0008-json-schema-constrained-decoding.patch"
+  "${script_dir}/patches/0009-constrained-decoding-padded-vocabulary.patch"
+  "${script_dir}/patches/0010-llguidance-valid-eos-selection.patch"
 )
 patch_revision="$(
   shasum -a 256 "${patches[@]}" |

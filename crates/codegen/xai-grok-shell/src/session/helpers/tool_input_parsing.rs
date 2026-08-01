@@ -44,6 +44,40 @@ pub fn normalize_empty_arguments(arguments: &str) -> &str {
     }
 }
 
+/// Canonicalize JSON numbers such as `1000.0` to `1000` when they are exactly
+/// integral and within JSON's lossless integer range. Local language models
+/// frequently render integer-schema values with a decimal suffix; the value
+/// is mathematically identical, but serde intentionally rejects it for Rust
+/// integer fields. Fractional, non-finite, and unsafe-range numbers are never
+/// changed.
+pub fn normalize_integral_numbers(value: &mut serde_json::Value) -> usize {
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+    match value {
+        serde_json::Value::Number(number)
+            if number.as_i64().is_none() && number.as_u64().is_none() =>
+        {
+            let Some(float) = number.as_f64() else {
+                return 0;
+            };
+            if !float.is_finite() || float.fract() != 0.0 || float.abs() > MAX_SAFE_INTEGER {
+                return 0;
+            }
+            *number = if float.is_sign_negative() {
+                serde_json::Number::from(float as i64)
+            } else {
+                serde_json::Number::from(float as u64)
+            };
+            1
+        }
+        serde_json::Value::Array(values) => values.iter_mut().map(normalize_integral_numbers).sum(),
+        serde_json::Value::Object(values) => {
+            values.values_mut().map(normalize_integral_numbers).sum()
+        }
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +204,20 @@ mod tests {
     fn normalize_non_empty_passthrough() {
         assert_eq!(normalize_empty_arguments(r#"{"a":1}"#), r#"{"a":1}"#);
         assert_eq!(normalize_empty_arguments("not json"), "not json");
+    }
+
+    #[test]
+    fn integral_float_arguments_are_canonicalized_recursively() {
+        let mut value = serde_json::json!({
+            "limit": 1000.0,
+            "offset": -2.0,
+            "ratio": 0.5,
+            "nested": [3.0, 4]
+        });
+        assert_eq!(normalize_integral_numbers(&mut value), 3);
+        assert_eq!(value["limit"], 1000);
+        assert_eq!(value["offset"], -2);
+        assert_eq!(value["ratio"], 0.5);
+        assert_eq!(value["nested"], serde_json::json!([3, 4]));
     }
 }

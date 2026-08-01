@@ -430,6 +430,7 @@ pub fn is_context_length_error(message: &str) -> bool {
         || m.contains("maximum prompt length")
         || m.contains("maximum context length")
         || m.contains("context_length_exceeded")
+        || ((m.contains("exceeding") || m.contains("exceeds")) && m.contains("context window"))
 }
 
 /// Decide whether a [`reqwest::Error`] is worth retrying.

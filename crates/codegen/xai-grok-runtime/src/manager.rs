@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, OnceCell, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use xai_grok_protocol::WrappedToolResultEnvelope;
 use xai_grok_sampling_types::SamplingError;
 
 use crate::adapter::{
@@ -121,9 +122,13 @@ impl RuntimeStage {
 
     fn completion_reserve(self, requested: u32, context_window: Option<u32>) -> u32 {
         match self {
-            Self::Planner => 768,
-            Self::Executor => 1_024,
-            Self::Reviewer => 768,
+            // Stage values are floors, not clamps. Reasoning models may have
+            // a larger configured minimum needed to reach their visible final
+            // answer; cutting them back to the generic stage default produces
+            // reasoning-only responses and no typed result.
+            Self::Planner => requested.max(768),
+            Self::Executor => requested.max(1_024),
+            Self::Reviewer => requested.max(768),
             // A caller-supplied direct limit is the selected model's
             // configured maximum and must not be silently increased. Only
             // derive a conservative default when the request did not carry a
@@ -138,9 +143,18 @@ impl RuntimeStage {
 
     fn stage_budget(self, reserve: u32) -> StageBudget {
         match self {
-            Self::Planner => StageBudget::planner(),
-            Self::Executor => StageBudget::executor(),
-            Self::Reviewer => StageBudget::reviewer(),
+            Self::Planner => StageBudget {
+                desired_completion_tokens: reserve,
+                minimum_completion_tokens: 768,
+            },
+            Self::Executor => StageBudget {
+                desired_completion_tokens: reserve,
+                minimum_completion_tokens: 1_024,
+            },
+            Self::Reviewer => StageBudget {
+                desired_completion_tokens: reserve,
+                minimum_completion_tokens: 768,
+            },
             Self::Direct | Self::Embedding | Self::Prewarm => StageBudget::direct(reserve),
         }
     }
@@ -618,6 +632,7 @@ impl RuntimeManager {
                     retrieved_memory: None,
                     messages: "[]".to_string(),
                     tools: "[]".to_string(),
+                    json_schema: None,
                     current_message: serde_json::json!({
                         "role": "user",
                         "content": [{"type": "text", "text": "Reply with READY."}]
@@ -1010,7 +1025,129 @@ impl RuntimeManager {
                 break;
             }
         }
+
+        if measured > target_prompt_tokens && request.stage == RuntimeStage::Executor {
+            let original_tokens = measured;
+            if let Some(compacted_messages) =
+                compact_history_tool_result_envelopes(&request.conversation.messages)?
+            {
+                request.conversation.messages = compacted_messages;
+                measured = self
+                    .measure_without_admission(
+                        &format!("{}:admission:history-tool-envelopes", request.request_id),
+                        &request.model_id,
+                        request.model_config.clone(),
+                        &request.conversation,
+                        request.deadline,
+                    )
+                    .await?;
+                dropped.push((
+                    format!("history_tool_result_previews:{original_tokens}->{measured}"),
+                    ContextComponentKind::ToolResultEnvelope,
+                ));
+            }
+        }
+        if measured > target_prompt_tokens && request.stage == RuntimeStage::Executor {
+            let original_tokens = measured;
+            if let Some(compacted_tokens) = self
+                .fit_current_tool_result_envelope(request, target_prompt_tokens)
+                .await?
+            {
+                measured = compacted_tokens;
+                dropped.push((
+                    format!("current_tool_result_preview:{original_tokens}->{compacted_tokens}"),
+                    ContextComponentKind::ToolResultEnvelope,
+                ));
+            }
+        }
         Ok((measured, dropped))
+    }
+
+    /// Fit the current typed tool result using the same native renderer and
+    /// tokenizer that generation will use. Only duplicated finding strings,
+    /// adapter suffix text, and the unstructured preview are eligible for
+    /// removal. The status, exit code, structural counts, artifact reference,
+    /// cursor, and the surrounding JSON message remain atomic.
+    async fn fit_current_tool_result_envelope(
+        &self,
+        request: &mut RuntimeRequest,
+        target_prompt_tokens: u32,
+    ) -> Result<Option<u32>, SamplingError> {
+        let Some(wrapped) = current_tool_result_envelope(&request.conversation.current_message)?
+        else {
+            return Ok(None);
+        };
+
+        let original_current = request.conversation.current_message.clone();
+        let preview_chars = wrapped.envelope.preview.chars().count();
+        let variants = [(true, true), (false, true), (false, false)];
+
+        for (retain_finding_detail, retain_suffix) in variants {
+            let minimum = render_current_tool_result_variant(
+                &original_current,
+                0,
+                retain_finding_detail,
+                retain_suffix,
+            )?
+            .expect("an envelope parsed from the same current message");
+            let mut candidate = request.conversation.clone();
+            candidate.current_message = minimum.clone();
+            let minimum_tokens = self
+                .measure_without_admission(
+                    &format!(
+                        "{}:admission:tool-envelope:min:{retain_finding_detail}:{retain_suffix}",
+                        request.request_id
+                    ),
+                    &request.model_id,
+                    request.model_config.clone(),
+                    &candidate,
+                    request.deadline,
+                )
+                .await?;
+            if minimum_tokens > target_prompt_tokens {
+                continue;
+            }
+
+            let mut low = 0usize;
+            let mut high = preview_chars;
+            let mut best = (minimum, minimum_tokens);
+            while low <= high {
+                let mid = low + (high - low) / 2;
+                let rendered = render_current_tool_result_variant(
+                    &original_current,
+                    mid,
+                    retain_finding_detail,
+                    retain_suffix,
+                )?
+                .expect("an envelope parsed from the same current message");
+                candidate.current_message = rendered.clone();
+                let tokens = self
+                    .measure_without_admission(
+                        &format!(
+                            "{}:admission:tool-envelope:{retain_finding_detail}:{retain_suffix}:{mid}",
+                            request.request_id
+                        ),
+                        &request.model_id,
+                        request.model_config.clone(),
+                        &candidate,
+                        request.deadline,
+                    )
+                    .await?;
+                if tokens <= target_prompt_tokens {
+                    best = (rendered, tokens);
+                    low = mid.saturating_add(1);
+                } else if mid == 0 {
+                    break;
+                } else {
+                    high = mid - 1;
+                }
+            }
+
+            request.conversation.current_message = best.0;
+            return Ok(Some(best.1));
+        }
+
+        Ok(None)
     }
 
     pub async fn generate(
@@ -1125,8 +1262,13 @@ impl RuntimeManager {
             self.relieve_memory_pressure().await?;
         }
 
-        if request.model_config.context_strategy
+        let coordinated_stage = matches!(
+            request.stage,
+            RuntimeStage::Planner | RuntimeStage::Executor | RuntimeStage::Reviewer
+        );
+        if (request.model_config.context_strategy
             == crate::litert_lm::ContextOverflowStrategy::Strict
+            || coordinated_stage)
             && let Some(context_window) = request.model_config.max_context_tokens
         {
             let (measured, dropped) = self
@@ -1978,6 +2120,7 @@ fn calibration_conversation(session_id: String) -> PreparedConversation {
         retrieved_memory: None,
         messages: "[]".to_string(),
         tools: "[]".to_string(),
+        json_schema: None,
         current_message: serde_json::json!({
             "role": "user",
             "content": [{
@@ -2368,6 +2511,163 @@ fn serialize_admitted_tool_schemas(
     .map_err(SamplingError::Serialization)
 }
 
+fn current_tool_result_envelope(
+    current_message_json: &str,
+) -> Result<Option<WrappedToolResultEnvelope>, SamplingError> {
+    let message = serde_json::from_str::<serde_json::Value>(current_message_json)
+        .map_err(SamplingError::Serialization)?;
+    Ok(find_tool_result_envelope(&message))
+}
+
+fn find_tool_result_envelope(value: &serde_json::Value) -> Option<WrappedToolResultEnvelope> {
+    match value {
+        serde_json::Value::String(text) => WrappedToolResultEnvelope::parse(text),
+        serde_json::Value::Array(values) => values.iter().find_map(find_tool_result_envelope),
+        serde_json::Value::Object(values) => {
+            serde_json::from_value::<xai_grok_protocol::ToolResultEnvelope>(value.clone())
+                .ok()
+                .map(|envelope| WrappedToolResultEnvelope {
+                    prefix: String::new(),
+                    envelope,
+                    suffix: String::new(),
+                })
+                .or_else(|| values.values().find_map(find_tool_result_envelope))
+        }
+        _ => None,
+    }
+}
+
+fn render_current_tool_result_variant(
+    current_message_json: &str,
+    preview_char_budget: usize,
+    retain_finding_detail: bool,
+    retain_suffix: bool,
+) -> Result<Option<String>, SamplingError> {
+    let mut message = serde_json::from_str::<serde_json::Value>(current_message_json)
+        .map_err(SamplingError::Serialization)?;
+    if !replace_first_tool_result_envelope(
+        &mut message,
+        preview_char_budget,
+        retain_finding_detail,
+        retain_suffix,
+    ) {
+        return Ok(None);
+    }
+    serde_json::to_string(&message)
+        .map(Some)
+        .map_err(SamplingError::Serialization)
+}
+
+fn compact_history_tool_result_envelopes(
+    messages_json: &str,
+) -> Result<Option<String>, SamplingError> {
+    let mut messages = serde_json::from_str::<serde_json::Value>(messages_json)
+        .map_err(SamplingError::Serialization)?;
+    if !compact_embedded_tool_result_envelopes(&mut messages) {
+        return Ok(None);
+    }
+    serde_json::to_string(&messages)
+        .map(Some)
+        .map_err(SamplingError::Serialization)
+}
+
+fn compact_embedded_tool_result_envelopes(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => {
+            let Some(mut wrapped) = WrappedToolResultEnvelope::parse(text) else {
+                return false;
+            };
+            wrapped.envelope.preview.clear();
+            // The top-level findings mirror structure.findings. Retain the
+            // structural copy once instead of paying for both on continuations.
+            wrapped.envelope.findings.clear();
+            wrapped.envelope.truncated = true;
+            *text = format!(
+                "{}{}{}",
+                wrapped.prefix,
+                wrapped.envelope.to_prompt_json(),
+                wrapped.suffix
+            );
+            true
+        }
+        serde_json::Value::Array(values) => values
+            .iter_mut()
+            .map(compact_embedded_tool_result_envelopes)
+            .fold(false, |changed, item_changed| changed | item_changed),
+        serde_json::Value::Object(values) => {
+            if let Ok(mut envelope) = serde_json::from_value::<xai_grok_protocol::ToolResultEnvelope>(
+                serde_json::Value::Object(values.clone()),
+            ) {
+                envelope.preview.clear();
+                envelope.findings.clear();
+                envelope.truncated = true;
+                *value = serde_json::to_value(envelope)
+                    .expect("ToolResultEnvelope serialization cannot fail");
+                true
+            } else {
+                values
+                    .values_mut()
+                    .map(compact_embedded_tool_result_envelopes)
+                    .fold(false, |changed, item_changed| changed | item_changed)
+            }
+        }
+        _ => false,
+    }
+}
+
+fn replace_first_tool_result_envelope(
+    value: &mut serde_json::Value,
+    preview_char_budget: usize,
+    retain_finding_detail: bool,
+    retain_suffix: bool,
+) -> bool {
+    match value {
+        serde_json::Value::String(text) => {
+            let Some(mut wrapped) = WrappedToolResultEnvelope::parse(text) else {
+                return false;
+            };
+            if !retain_suffix {
+                wrapped.suffix.clear();
+            }
+            *text = wrapped.render(preview_char_budget, retain_finding_detail);
+            true
+        }
+        serde_json::Value::Array(values) => values.iter_mut().any(|value| {
+            replace_first_tool_result_envelope(
+                value,
+                preview_char_budget,
+                retain_finding_detail,
+                retain_suffix,
+            )
+        }),
+        serde_json::Value::Object(values) => {
+            if let Ok(envelope) = serde_json::from_value::<xai_grok_protocol::ToolResultEnvelope>(
+                serde_json::Value::Object(values.clone()),
+            ) {
+                let wrapped = WrappedToolResultEnvelope {
+                    prefix: String::new(),
+                    envelope,
+                    suffix: String::new(),
+                };
+                let rendered = wrapped.render(preview_char_budget, retain_finding_detail);
+                *value = serde_json::from_str(&rendered)
+                    .expect("rendered ToolResultEnvelope must remain valid JSON");
+                true
+            } else {
+                values.values_mut().any(|value| {
+                    replace_first_tool_result_envelope(
+                        value,
+                        preview_char_budget,
+                        retain_finding_detail,
+                        retain_suffix,
+                    )
+                })
+            }
+        }
+        _ => false,
+    }
+}
+
 fn atomic_history_groups(
     messages_json: &str,
     current_message_json: &str,
@@ -2571,6 +2871,29 @@ mod tests {
     }
 
     #[test]
+    fn coordinated_stage_reserve_honors_larger_model_requirement() {
+        assert_eq!(
+            RuntimeStage::Planner.completion_reserve(2_048, Some(4_096)),
+            2_048
+        );
+        assert_eq!(
+            RuntimeStage::Reviewer.completion_reserve(2_048, Some(4_096)),
+            2_048
+        );
+        assert_eq!(
+            RuntimeStage::Executor.completion_reserve(512, Some(4_096)),
+            1_024
+        );
+        assert_eq!(
+            RuntimeStage::Planner.stage_budget(2_048),
+            StageBudget {
+                desired_completion_tokens: 2_048,
+                minimum_completion_tokens: 768,
+            }
+        );
+    }
+
+    #[test]
     fn replica_gate_requires_throughput_gain_and_ttft_bound() {
         assert!(!replica_calibration_passes(100.0, 114.9, 100, 100));
         assert!(replica_calibration_passes(100.0, 115.0, 100, 120));
@@ -2695,5 +3018,111 @@ mod tests {
         let serialized = serialize_admitted_tool_schemas(&tools, &[true, false]).unwrap();
         let retained: Vec<serde_json::Value> = serde_json::from_str(&serialized).unwrap();
         assert_eq!(retained, vec![tools[0].clone()]);
+    }
+
+    #[test]
+    fn current_tool_result_compaction_keeps_atomic_envelope_inside_message_json() {
+        let envelope = xai_grok_protocol::ToolResultEnvelope {
+            status: "completed".to_string(),
+            exit_code: Some(0),
+            signal: None,
+            structure: xai_grok_protocol::OutputStructure {
+                line_count: 500,
+                error_line_count: 2,
+                findings: vec!["22/tcp open ssh".to_string()],
+                ..xai_grok_protocol::OutputStructure::default()
+            },
+            findings: vec!["22/tcp open ssh".to_string()],
+            preview: "large output line\n".repeat(500),
+            artifact: xai_grok_protocol::OutputArtifactRef {
+                path: "/tmp/artifacts/job-1.stdout".to_string(),
+                total_bytes: 9_000,
+            },
+            cursor: xai_grok_protocol::OutputCursor {
+                next_byte: 9_000,
+                complete: true,
+            },
+            truncated: false,
+        };
+        let current = serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": [{
+                "type": "tool_response",
+                "name": "read_file",
+                "response": format!("exit: 0\n{}", envelope.to_prompt_json()),
+            }],
+        })
+        .to_string();
+
+        let rendered = render_current_tool_result_variant(&current, 64, false, true)
+            .unwrap()
+            .expect("typed envelope");
+        let parsed_message: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed_message["role"], "tool");
+        assert_eq!(parsed_message["tool_call_id"], "call-1");
+        let reparsed = current_tool_result_envelope(&rendered)
+            .unwrap()
+            .expect("valid compacted envelope");
+        assert_eq!(reparsed.envelope.status, "completed");
+        assert_eq!(reparsed.envelope.exit_code, Some(0));
+        assert_eq!(reparsed.envelope.structure.line_count, 500);
+        assert_eq!(reparsed.envelope.structure.error_line_count, 2);
+        assert_eq!(
+            reparsed.envelope.artifact.path,
+            "/tmp/artifacts/job-1.stdout"
+        );
+        assert_eq!(reparsed.envelope.cursor.next_byte, 9_000);
+        assert!(reparsed.envelope.findings.is_empty());
+        assert!(reparsed.envelope.preview.chars().count() <= 64);
+        assert!(reparsed.envelope.truncated);
+    }
+
+    #[test]
+    fn history_tool_result_compaction_keeps_findings_and_artifact_once() {
+        let envelope = xai_grok_protocol::ToolResultEnvelope {
+            status: "completed".to_string(),
+            exit_code: None,
+            signal: None,
+            structure: xai_grok_protocol::OutputStructure {
+                line_count: 3,
+                findings: vec!["config section \"workspace.package\" (complete)".to_string()],
+                ..xai_grok_protocol::OutputStructure::default()
+            },
+            findings: vec!["config section \"workspace.package\" (complete)".to_string()],
+            preview: "full duplicated preview".repeat(100),
+            artifact: xai_grok_protocol::OutputArtifactRef {
+                path: "/tmp/artifact".to_string(),
+                total_bytes: 2_200,
+            },
+            cursor: xai_grok_protocol::OutputCursor {
+                next_byte: 2_200,
+                complete: true,
+            },
+            truncated: false,
+        };
+        let messages = serde_json::json!([{
+            "role": "tool",
+            "content": [{
+                "type": "tool_response",
+                "response": serde_json::to_value(&envelope).unwrap(),
+            }],
+        }])
+        .to_string();
+
+        let compacted = compact_history_tool_result_envelopes(&messages)
+            .unwrap()
+            .expect("history envelope");
+        let parsed: serde_json::Value = serde_json::from_str(&compacted).unwrap();
+        let wrapped = find_tool_result_envelope(&parsed).expect("valid envelope");
+        assert!(wrapped.envelope.preview.is_empty());
+        assert!(wrapped.envelope.findings.is_empty());
+        assert_eq!(
+            wrapped.envelope.structure.findings,
+            vec!["config section \"workspace.package\" (complete)"]
+        );
+        assert_eq!(wrapped.envelope.artifact.path, "/tmp/artifact");
+        assert_eq!(wrapped.envelope.cursor.next_byte, 2_200);
+        assert!(wrapped.envelope.truncated);
     }
 }

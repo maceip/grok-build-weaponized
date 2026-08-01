@@ -110,6 +110,7 @@ unsafe impl Send for Conversation {}
 struct ConversationCompatibility {
     system_message: Option<String>,
     tools: String,
+    json_schema: Option<String>,
     max_output_tokens: Option<u32>,
     temperature_bits: Option<u32>,
     top_p_bits: Option<u32>,
