@@ -5,7 +5,8 @@ use xai_grok_control_plane::{
     AgentExecutionProvider, AgentProviderConfig, ControlPlane, ControlPlaneConfig,
     ControlPlaneServer, NativeExecutionProvider, ServerConfig,
 };
-use xai_grok_protocol::{PROTOCOL_VERSION, RuntimeProfile};
+use xai_grok_native_execution::NativeExecutionLimits;
+use xai_grok_protocol::{PROTOCOL_VERSION, ProviderKind, RuntimeProfile};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -94,9 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let native_provider = if arguments.control_only {
         None
     } else {
-        let provider =
-            NativeExecutionProvider::open(arguments.state_directory.join("native-execution"))
-                .await?;
+        let provider = NativeExecutionProvider::open_with_limits(
+            arguments.state_directory.join("native-execution"),
+            native_execution_limits(profile.as_ref()),
+        )
+        .await?;
         handle.register_provider(provider.clone()).await?;
         Some(provider)
     };
@@ -149,6 +152,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     control_plane.wait().await;
     server_result?;
     Ok(())
+}
+
+fn native_execution_limits(profile: Option<&RuntimeProfile>) -> NativeExecutionLimits {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let Some(profile) = profile else {
+        return NativeExecutionLimits {
+            maximum_parallel: 100,
+            maximum_jobs: 10_000,
+            maximum_spool_bytes_per_job: 4 * GIB,
+            maximum_spool_bytes_per_owner: 16 * GIB,
+            maximum_total_spool_bytes: 128 * GIB,
+        };
+    };
+    let maximum_parallel = profile
+        .providers
+        .iter()
+        .find(|provider| provider.kind == ProviderKind::NativeExecution)
+        .map(|provider| provider.maximum_concurrency)
+        .unwrap_or(profile.limits.maximum_worker_processes)
+        .min(profile.limits.maximum_worker_processes)
+        .max(1) as usize;
+    let maximum_total_spool_bytes = profile.limits.maximum_spool_bytes.max(1024);
+    let maximum_spool_bytes_per_owner = maximum_total_spool_bytes.min(16 * GIB).max(1024);
+    NativeExecutionLimits {
+        maximum_parallel,
+        maximum_jobs: (profile.limits.command_queue as usize)
+            .saturating_add(maximum_parallel)
+            .max(1),
+        maximum_spool_bytes_per_job: maximum_spool_bytes_per_owner.min(4 * GIB).max(1024),
+        maximum_spool_bytes_per_owner,
+        maximum_total_spool_bytes,
+    }
 }
 
 fn resolve_agent_binary(explicit: Option<&PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {

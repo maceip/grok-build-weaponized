@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -49,14 +51,80 @@ pub struct OutputPage {
     pub records: Vec<OutputRecord>,
 }
 
+#[derive(Default)]
+struct BudgetUsage {
+    total: u64,
+    owners: HashMap<String, u64>,
+}
+
+pub(crate) struct SpoolBudget {
+    usage: Mutex<BudgetUsage>,
+    maximum_total_bytes: u64,
+    maximum_owner_bytes: u64,
+}
+
+impl SpoolBudget {
+    pub(crate) fn new(maximum_total_bytes: u64, maximum_owner_bytes: u64) -> Self {
+        Self {
+            usage: Mutex::new(BudgetUsage::default()),
+            maximum_total_bytes,
+            maximum_owner_bytes,
+        }
+    }
+
+    pub(crate) async fn reserve_existing(&self, owner: &str, bytes: u64) -> std::io::Result<()> {
+        self.reserve(owner, bytes).await
+    }
+
+    async fn reserve(&self, owner: &str, bytes: u64) -> std::io::Result<()> {
+        let mut usage = self.usage.lock().await;
+        let owner_bytes = usage.owners.get(owner).copied().unwrap_or(0);
+        let next_total = usage
+            .total
+            .checked_add(bytes)
+            .filter(|next| *next <= self.maximum_total_bytes)
+            .ok_or_else(|| std::io::Error::other("global native output spool limit reached"))?;
+        let next_owner = owner_bytes
+            .checked_add(bytes)
+            .filter(|next| *next <= self.maximum_owner_bytes)
+            .ok_or_else(|| std::io::Error::other("engagement native output spool limit reached"))?;
+        usage.total = next_total;
+        usage.owners.insert(owner.to_owned(), next_owner);
+        Ok(())
+    }
+
+    pub(crate) async fn release(&self, owner: &str, bytes: u64) {
+        let mut usage = self.usage.lock().await;
+        usage.total = usage.total.saturating_sub(bytes);
+        if let Some(owner_bytes) = usage.owners.get_mut(owner) {
+            *owner_bytes = owner_bytes.saturating_sub(bytes);
+            if *owner_bytes == 0 {
+                usage.owners.remove(owner);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn used_bytes(&self) -> u64 {
+        self.usage.lock().await.total
+    }
+}
+
 pub(crate) struct SequencedSpool {
     file: Mutex<tokio::fs::File>,
     next_sequence: AtomicU64,
     maximum_bytes: u64,
+    owner: String,
+    budget: Arc<SpoolBudget>,
 }
 
 impl SequencedSpool {
-    pub(crate) async fn open(path: &Path, maximum_bytes: u64) -> std::io::Result<Self> {
+    pub(crate) async fn open(
+        path: &Path,
+        maximum_bytes: u64,
+        owner: String,
+        budget: Arc<SpoolBudget>,
+    ) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -71,6 +139,8 @@ impl SequencedSpool {
             file: Mutex::new(file),
             next_sequence: AtomicU64::new(next_sequence),
             maximum_bytes,
+            owner,
+            budget,
         })
     }
 
@@ -87,6 +157,7 @@ impl SequencedSpool {
         if current.saturating_add(appended) > self.maximum_bytes {
             return Err(std::io::Error::other("native job spool limit reached"));
         }
+        self.budget.reserve(&self.owner, appended).await?;
         let sequence = self.next_sequence.fetch_add(1, Ordering::AcqRel);
         file.write_all(&sequence.to_be_bytes()).await?;
         file.write_all(&[stream.as_byte()]).await?;

@@ -44,6 +44,7 @@ Commands:
   job output ID [--cursor N] [--records N] [--bytes N] [--raw]
   job result ID
   job cancel ID
+  job cleanup ID
   submit --workspace ID [--exercise ID] [--run ID] --session ID --request TEXT|-
   artifact put FILE --media-type TYPE [--content-hash BLAKE3] [--chunk-bytes N]
   artifact resume UPLOAD_ID FILE [--chunk-bytes N]
@@ -127,10 +128,11 @@ async fn job(
         Some("status") => invoke_job_with_id(control, "native.command.status", arguments).await,
         Some("result") => invoke_job_with_id(control, "native.nmap.result", arguments).await,
         Some("cancel") => invoke_job_with_id(control, "native.command.cancel", arguments).await,
+        Some("cleanup") => invoke_job_with_id(control, "native.command.cleanup", arguments).await,
         Some("wait") => wait_for_job(control, arguments).await,
         Some("output") => read_job_output(control, arguments).await,
         _ => Err(format!(
-            "job requires start, nmap, status, wait, output, result, or cancel\n{USAGE}"
+            "job requires start, nmap, status, wait, output, result, cancel, or cleanup\n{USAGE}"
         )
         .into()),
     }

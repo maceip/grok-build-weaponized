@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use xai_grok_native_execution::{
-    CommandRequest, NativeExecutionError, NativeExecutionSupervisor, NmapRequest,
+    CommandRequest, NativeExecutionError, NativeExecutionLimits, NativeExecutionSupervisor,
+    NmapRequest,
 };
 use xai_grok_protocol::{
     ArtifactContract, CancellationSemantics, CapabilityManifest, ConcurrencyProfile,
@@ -27,9 +28,25 @@ pub struct NativeExecutionProvider {
 
 impl NativeExecutionProvider {
     pub async fn open(root: PathBuf) -> Result<Arc<Self>, NativeExecutionError> {
+        Self::open_with_limits(
+            root,
+            NativeExecutionLimits {
+                maximum_parallel: 100,
+                maximum_jobs: 10_000,
+                maximum_spool_bytes_per_job: 4 * 1024 * 1024 * 1024,
+                maximum_spool_bytes_per_owner: 16 * 1024 * 1024 * 1024,
+                maximum_total_spool_bytes: 128 * 1024 * 1024 * 1024,
+            },
+        )
+        .await
+    }
+
+    pub async fn open_with_limits(
+        root: PathBuf,
+        limits: NativeExecutionLimits,
+    ) -> Result<Arc<Self>, NativeExecutionError> {
         Ok(Arc::new(Self {
-            supervisor: NativeExecutionSupervisor::open(root, 100, 10_000, 4 * 1024 * 1024 * 1024)
-                .await?,
+            supervisor: NativeExecutionSupervisor::open_with_limits(root, limits).await?,
             request_jobs: RwLock::new(HashMap::new()),
         }))
     }
@@ -50,10 +67,16 @@ impl NativeExecutionProvider {
             operation("native.command.wait", "Wait for native command", true),
             operation("native.command.output", "Read native command output", true),
             operation("native.command.cancel", "Cancel native command", false),
+            operation(
+                "native.command.cleanup",
+                "Delete terminal command state",
+                false,
+            ),
             operation("native.nmap.start", "Start typed Nmap scan", true),
             operation("native.nmap.status", "Read Nmap status", false),
             operation("native.nmap.result", "Read normalized Nmap result", true),
             operation("native.nmap.cancel", "Cancel Nmap scan", false),
+            operation("native.nmap.cleanup", "Delete terminal Nmap state", false),
         ];
         let mut platforms = BTreeSet::new();
         platforms.insert(Platform {
@@ -70,10 +93,13 @@ impl NativeExecutionProvider {
                 "bounded_spool",
                 "cursor_artifacts",
                 "durable_job_state",
+                "engagement_spool_budget",
+                "global_spool_budget",
                 "nmap_xml",
                 "process_tree_cancellation",
                 "stream_identity",
                 "stream_sequence",
+                "terminal_cleanup",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -114,6 +140,7 @@ impl ExecutionProvider for NativeExecutionProvider {
 
     async fn execute(&self, dispatch: ProviderDispatch) -> Result<ProviderOutput, ProtocolError> {
         let operation = dispatch.task.capability.operation_id.as_str();
+        let owner_id = dispatch.engagement_id.to_string();
         let input = dispatch.task.input;
         let mut artifacts = Vec::new();
         let output = match operation {
@@ -121,7 +148,7 @@ impl ExecutionProvider for NativeExecutionProvider {
                 let request: CommandRequest = parse(input)?;
                 let snapshot = self
                     .supervisor
-                    .start_command(request)
+                    .start_command_for(owner_id, request)
                     .await
                     .map_err(native_error)?;
                 self.remember(dispatch.request_id, snapshot.job_id.clone())
@@ -132,7 +159,7 @@ impl ExecutionProvider for NativeExecutionProvider {
                 let request: NmapRequest = parse(input)?;
                 let snapshot = self
                     .supervisor
-                    .start_nmap(request)
+                    .start_nmap_for(owner_id, request)
                     .await
                     .map_err(native_error)?;
                 self.remember(dispatch.request_id, snapshot.job_id.clone())
@@ -193,6 +220,16 @@ impl ExecutionProvider for NativeExecutionProvider {
                 serde_json::to_value(
                     self.supervisor
                         .cancel(&input.job_id)
+                        .await
+                        .map_err(native_error)?,
+                )
+                .map_err(internal_error)?
+            }
+            "native.command.cleanup" | "native.nmap.cleanup" => {
+                let input: JobInput = parse(input)?;
+                serde_json::to_value(
+                    self.supervisor
+                        .cleanup(&input.job_id)
                         .await
                         .map_err(native_error)?,
                 )
@@ -433,5 +470,22 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(records.iter().any(|record| record["stream"] == "stdout"));
         assert!(records.iter().any(|record| record["stream"] == "stderr"));
+
+        let cleanup = provider
+            .execute(dispatch(
+                "native.command.cleanup",
+                serde_json::json!({"job_id": job_id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cleanup.output["lifecycle"], "completed");
+        let missing = provider
+            .execute(dispatch(
+                "native.command.status",
+                serde_json::json!({"job_id": job_id}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, ProtocolErrorCode::NotFound);
     }
 }

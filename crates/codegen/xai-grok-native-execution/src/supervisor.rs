@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::nmap::{NmapRequest, NmapResult, parse_result};
-use crate::spool::{OutputPage, OutputStream, SequencedSpool, read_page};
+use crate::spool::{OutputPage, OutputStream, SequencedSpool, SpoolBudget, read_page};
 
 const DEFAULT_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_PAGE_RECORDS: usize = 512;
@@ -127,6 +127,8 @@ pub struct JobSnapshot {
     pub error: Option<String>,
     pub spool_bytes: u64,
     pub result: Option<serde_json::Value>,
+    #[serde(default)]
+    pub owner_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +153,16 @@ pub struct NativeExecutionSupervisor {
     permits: Arc<Semaphore>,
     maximum_jobs: usize,
     maximum_spool_bytes_per_job: u64,
+    spool_budget: Arc<SpoolBudget>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeExecutionLimits {
+    pub maximum_parallel: usize,
+    pub maximum_jobs: usize,
+    pub maximum_spool_bytes_per_job: u64,
+    pub maximum_spool_bytes_per_owner: u64,
+    pub maximum_total_spool_bytes: u64,
 }
 
 impl NativeExecutionSupervisor {
@@ -160,14 +172,42 @@ impl NativeExecutionSupervisor {
         maximum_jobs: usize,
         maximum_spool_bytes_per_job: u64,
     ) -> Result<Arc<Self>, NativeExecutionError> {
+        let maximum_total_spool_bytes = maximum_spool_bytes_per_job
+            .saturating_mul(u64::try_from(maximum_jobs.max(1)).unwrap_or(u64::MAX));
+        Self::open_with_limits(
+            root,
+            NativeExecutionLimits {
+                maximum_parallel,
+                maximum_jobs,
+                maximum_spool_bytes_per_job,
+                maximum_spool_bytes_per_owner: maximum_total_spool_bytes,
+                maximum_total_spool_bytes,
+            },
+        )
+        .await
+    }
+
+    pub async fn open_with_limits(
+        root: impl Into<PathBuf>,
+        limits: NativeExecutionLimits,
+    ) -> Result<Arc<Self>, NativeExecutionError> {
         let root = root.into();
         tokio::fs::create_dir_all(root.join("jobs")).await?;
+        let maximum_total_spool_bytes = limits.maximum_total_spool_bytes.max(1024);
+        let maximum_spool_bytes_per_owner = limits
+            .maximum_spool_bytes_per_owner
+            .max(1024)
+            .min(maximum_total_spool_bytes);
         let supervisor = Arc::new(Self {
             root,
             jobs: RwLock::new(HashMap::new()),
-            permits: Arc::new(Semaphore::new(maximum_parallel.max(1))),
-            maximum_jobs: maximum_jobs.max(1),
-            maximum_spool_bytes_per_job: maximum_spool_bytes_per_job.max(1024),
+            permits: Arc::new(Semaphore::new(limits.maximum_parallel.max(1))),
+            maximum_jobs: limits.maximum_jobs.max(1),
+            maximum_spool_bytes_per_job: limits.maximum_spool_bytes_per_job.max(1024),
+            spool_budget: Arc::new(SpoolBudget::new(
+                maximum_total_spool_bytes,
+                maximum_spool_bytes_per_owner,
+            )),
         });
         supervisor.recover().await?;
         Ok(supervisor)
@@ -177,9 +217,18 @@ impl NativeExecutionSupervisor {
         self: &Arc<Self>,
         request: CommandRequest,
     ) -> Result<JobSnapshot, NativeExecutionError> {
+        self.start_command_for("local", request).await
+    }
+
+    pub async fn start_command_for(
+        self: &Arc<Self>,
+        owner_id: impl Into<String>,
+        request: CommandRequest,
+    ) -> Result<JobSnapshot, NativeExecutionError> {
         request.validate()?;
         let executable = resolve_executable(&request.executable).await?;
         self.start_process(
+            owner_id.into(),
             JobKind::Command,
             executable,
             request.args,
@@ -196,6 +245,14 @@ impl NativeExecutionSupervisor {
         self: &Arc<Self>,
         request: NmapRequest,
     ) -> Result<JobSnapshot, NativeExecutionError> {
+        self.start_nmap_for("local", request).await
+    }
+
+    pub async fn start_nmap_for(
+        self: &Arc<Self>,
+        owner_id: impl Into<String>,
+        request: NmapRequest,
+    ) -> Result<JobSnapshot, NativeExecutionError> {
         request.validate()?;
         let executable = resolve_executable("nmap").await?;
         let job_id = new_job_id();
@@ -204,6 +261,7 @@ impl NativeExecutionSupervisor {
         let args = request.arguments(&xml_path);
         self.start_process_with_id(
             job_id,
+            owner_id.into(),
             JobKind::Nmap,
             executable,
             args,
@@ -298,6 +356,31 @@ impl NativeExecutionSupervisor {
         Ok(artifacts)
     }
 
+    pub async fn cleanup(&self, job_id: &str) -> Result<JobSnapshot, NativeExecutionError> {
+        let job = self.job(job_id).await?;
+        let snapshot = job.snapshot.lock().await.clone();
+        if !snapshot.lifecycle.is_terminal() {
+            return Err(NativeExecutionError::NotComplete);
+        }
+        let spool_bytes = tokio::fs::symlink_metadata(&job.spool_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let job_root = job
+            .metadata_path
+            .parent()
+            .ok_or_else(|| {
+                NativeExecutionError::InvalidOutput("job metadata has no parent".to_owned())
+            })?
+            .to_path_buf();
+        tokio::fs::remove_dir_all(&job_root).await?;
+        self.jobs.write().await.remove(job_id);
+        self.spool_budget
+            .release(&snapshot.owner_id, spool_bytes)
+            .await;
+        Ok(snapshot)
+    }
+
     pub async fn nmap_result(&self, job_id: &str) -> Result<NmapResult, NativeExecutionError> {
         let job = self.job(job_id).await?;
         let snapshot = job.snapshot.lock().await.clone();
@@ -324,6 +407,7 @@ impl NativeExecutionSupervisor {
 
     async fn start_process(
         self: &Arc<Self>,
+        owner_id: String,
         kind: JobKind,
         executable: PathBuf,
         args: Vec<String>,
@@ -335,6 +419,7 @@ impl NativeExecutionSupervisor {
     ) -> Result<JobSnapshot, NativeExecutionError> {
         self.start_process_with_id(
             new_job_id(),
+            owner_id,
             kind,
             executable,
             args,
@@ -351,6 +436,7 @@ impl NativeExecutionSupervisor {
     async fn start_process_with_id(
         self: &Arc<Self>,
         job_id: String,
+        owner_id: String,
         kind: JobKind,
         executable: PathBuf,
         args: Vec<String>,
@@ -384,6 +470,7 @@ impl NativeExecutionSupervisor {
             error: None,
             spool_bytes: 0,
             result: None,
+            owner_id,
         };
         persist_snapshot(&metadata_path, &snapshot).await?;
         let job = Arc::new(JobState {
@@ -422,16 +509,23 @@ impl NativeExecutionSupervisor {
                 return self.finish_with_error(&job, JobLifecycle::Cancelled, "cancelled before start").await;
             }
         };
-        let spool =
-            match SequencedSpool::open(&job.spool_path, self.maximum_spool_bytes_per_job).await {
-                Ok(spool) => Arc::new(spool),
-                Err(error) => {
-                    drop(permit);
-                    return self
-                        .finish_with_error(&job, JobLifecycle::Failed, error.to_string())
-                        .await;
-                }
-            };
+        let owner_id = job.snapshot.lock().await.owner_id.clone();
+        let spool = match SequencedSpool::open(
+            &job.spool_path,
+            self.maximum_spool_bytes_per_job,
+            owner_id,
+            self.spool_budget.clone(),
+        )
+        .await
+        {
+            Ok(spool) => Arc::new(spool),
+            Err(error) => {
+                drop(permit);
+                return self
+                    .finish_with_error(&job, JobLifecycle::Failed, error.to_string())
+                    .await;
+            }
+        };
         let mut command = Command::new(&executable);
         command
             .args(&args)
@@ -508,7 +602,7 @@ impl NativeExecutionSupervisor {
         }
         drop(permit);
         let mut snapshot = job.snapshot.lock().await;
-        snapshot.lifecycle = if reader_error.is_some() && lifecycle == JobLifecycle::Completed {
+        snapshot.lifecycle = if reader_error.is_some() {
             JobLifecycle::Failed
         } else {
             lifecycle
@@ -580,12 +674,25 @@ impl NativeExecutionSupervisor {
             }
             let job_root = entry.path();
             let nmap_xml_path = (snapshot.kind == JobKind::Nmap).then(|| job_root.join("nmap.xml"));
+            let spool_path = job_root.join("output.spool");
+            let spool_bytes = tokio::fs::symlink_metadata(&spool_path)
+                .await
+                .ok()
+                .filter(|metadata| metadata.file_type().is_file())
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if snapshot.owner_id.is_empty() {
+                snapshot.owner_id = "recovered".to_owned();
+            }
+            self.spool_budget
+                .reserve_existing(&snapshot.owner_id, spool_bytes)
+                .await?;
             self.jobs.write().await.insert(
                 snapshot.job_id.clone(),
                 Arc::new(JobState {
                     snapshot: Mutex::new(snapshot),
                     cancellation: CancellationToken::new(),
-                    spool_path: job_root.join("output.spool"),
+                    spool_path,
                     metadata_path,
                     nmap_target: None,
                     nmap_xml_path,
@@ -766,5 +873,75 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let cancelled = supervisor.cancel(&started.job_id).await.unwrap();
         assert_eq!(cancelled.lifecycle, JobLifecycle::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn aggregate_owner_budget_is_enforced_and_terminal_cleanup_reclaims_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let supervisor = NativeExecutionSupervisor::open_with_limits(
+            directory.path(),
+            NativeExecutionLimits {
+                maximum_parallel: 1,
+                maximum_jobs: 8,
+                maximum_spool_bytes_per_job: 1024,
+                maximum_spool_bytes_per_owner: 1024,
+                maximum_total_spool_bytes: 2048,
+            },
+        )
+        .await
+        .unwrap();
+        let request = || CommandRequest {
+            executable: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "head -c 700 /dev/zero".to_owned()],
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout_ms: 5_000,
+        };
+
+        let first = supervisor
+            .start_command_for("engagement-a", request())
+            .await
+            .unwrap();
+        let first = supervisor
+            .wait(&first.job_id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(first.lifecycle, JobLifecycle::Completed);
+        assert_eq!(first.owner_id, "engagement-a");
+        assert_eq!(supervisor.spool_budget.used_bytes().await, 713);
+
+        let blocked = supervisor
+            .start_command_for("engagement-a", request())
+            .await
+            .unwrap();
+        let blocked = supervisor
+            .wait(&blocked.job_id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(blocked.lifecycle, JobLifecycle::Failed);
+        assert!(
+            blocked
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("engagement native output spool limit"))
+        );
+
+        supervisor.cleanup(&blocked.job_id).await.unwrap();
+        supervisor.cleanup(&first.job_id).await.unwrap();
+        assert_eq!(supervisor.spool_budget.used_bytes().await, 0);
+        assert!(matches!(
+            supervisor.snapshot(&first.job_id).await,
+            Err(NativeExecutionError::NotFound(_))
+        ));
+
+        let after_cleanup = supervisor
+            .start_command_for("engagement-a", request())
+            .await
+            .unwrap();
+        let after_cleanup = supervisor
+            .wait(&after_cleanup.job_id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(after_cleanup.lifecycle, JobLifecycle::Completed);
     }
 }
