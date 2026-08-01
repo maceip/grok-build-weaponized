@@ -6,7 +6,9 @@ use xai_grok_control_plane::{
     ControlPlaneServer, NativeExecutionProvider, ServerConfig,
 };
 use xai_grok_native_execution::NativeExecutionLimits;
-use xai_grok_protocol::{PROTOCOL_VERSION, ProviderKind, RuntimeProfile};
+use xai_grok_protocol::{
+    CapabilityManifest, PROTOCOL_VERSION, ProfileProviderRequirement, ProviderKind, RuntimeProfile,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -114,6 +116,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(std::env::current_dir()?)
             .canonicalize()?;
         let mut provider_config = AgentProviderConfig::new(binary, workspace);
+        if let Some(requirement) = profile_requirement(profile.as_ref(), ProviderKind::ModelRuntime)
+        {
+            provider_config.maximum_parallel = requirement.maximum_concurrency;
+            provider_config.queue_capacity = profile
+                .as_ref()
+                .map_or(provider_config.queue_capacity, |profile| {
+                    profile.limits.command_queue.max(1)
+                });
+        }
         provider_config.model_id = arguments.agent_model;
         provider_config
             .environment
@@ -129,6 +140,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handle.register_provider(provider.clone()).await?;
         Some(provider)
     };
+    if let Some(profile) = &profile {
+        validate_active_providers(profile, handle.providers().manifests().await)?;
+    }
     let mut server_config = ServerConfig::new(&socket_path);
     server_config.maximum_connections = arguments
         .maximum_connections
@@ -198,6 +212,61 @@ fn native_execution_limits(profile: Option<&RuntimeProfile>) -> NativeExecutionL
     }
 }
 
+fn profile_requirement(
+    profile: Option<&RuntimeProfile>,
+    kind: ProviderKind,
+) -> Option<&ProfileProviderRequirement> {
+    profile?
+        .providers
+        .iter()
+        .find(|provider| provider.kind == kind)
+}
+
+fn validate_active_providers(
+    profile: &RuntimeProfile,
+    manifests: Vec<CapabilityManifest>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for requirement in &profile.providers {
+        let matching = manifests.iter().find(|manifest| {
+            manifest.kind == requirement.kind
+                && manifest.concurrency.maximum_parallel <= requirement.maximum_concurrency
+                && requirement
+                    .required_features
+                    .iter()
+                    .all(|feature| manifest.features.contains(feature))
+                && requirement
+                    .operations
+                    .iter()
+                    .all(|operation| manifest.operation(operation).is_some())
+        });
+        if matching.is_none() {
+            let providers = manifests
+                .iter()
+                .filter(|manifest| manifest.kind == requirement.kind)
+                .map(|manifest| manifest.provider_id.as_str())
+                .collect::<Vec<_>>();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "runtime profile requires a dispatchable {:?} provider with operations [{}], features [{}], and maximum concurrency {}; active providers of that kind: [{}]",
+                    requirement.kind,
+                    requirement
+                        .operations
+                        .iter()
+                        .map(|operation| operation.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    requirement.required_features.join(", "),
+                    requirement.maximum_concurrency,
+                    providers.join(", "),
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn resolve_agent_binary(explicit: Option<&PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(explicit) = explicit {
         return Ok(explicit.canonicalize()?);
@@ -257,4 +326,99 @@ fn load_profile(path: &PathBuf) -> Result<RuntimeProfile, Box<dyn std::error::Er
         .into());
     }
     Ok(profile)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use xai_grok_protocol::{
+        ArtifactContract, ConcurrencyProfile, DeploymentTarget, LibcTarget, OperationDescriptor,
+        ProfileId, RecoverySemantics, RuntimeResourceLimits, VersionRange,
+    };
+
+    use super::*;
+
+    fn profile(requirement: ProfileProviderRequirement) -> RuntimeProfile {
+        RuntimeProfile {
+            schema_version: xai_grok_protocol::RUNTIME_PROFILE_SCHEMA_VERSION,
+            profile_id: ProfileId::from_string("test-profile"),
+            revision: 1,
+            protocol_range: VersionRange::exact(PROTOCOL_VERSION),
+            targets: vec![DeploymentTarget {
+                target_triple: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+                libc: LibcTarget::Native,
+            }],
+            limits: RuntimeResourceLimits {
+                command_queue: 32,
+                event_batch: 32,
+                maximum_clients: 8,
+                maximum_worker_processes: 4,
+                maximum_memory_bytes: 1 << 30,
+                maximum_spool_bytes: 1 << 30,
+            },
+            providers: vec![requirement],
+            models: Vec::new(),
+            adapters: Vec::new(),
+            tool_bundles: Vec::new(),
+            maximum_headless_binary_bytes: 32 << 20,
+            maximum_daemon_binary_bytes: 32 << 20,
+            gui: None,
+        }
+    }
+
+    fn manifest() -> CapabilityManifest {
+        CapabilityManifest {
+            provider_id: "native-test".into(),
+            provider_version: "1".to_owned(),
+            protocol: VersionRange::exact(PROTOCOL_VERSION),
+            kind: ProviderKind::NativeExecution,
+            features: ["cursor_artifacts".to_owned()].into_iter().collect(),
+            operations: vec![OperationDescriptor {
+                operation_id: "native.test".into(),
+                display_name: "Native test".to_owned(),
+                input_schema: serde_json::json!({"type":"object"}),
+                output_schema: serde_json::json!({"type":"object"}),
+                streaming: false,
+                interactive: true,
+                deferred: true,
+            }],
+            concurrency: ConcurrencyProfile {
+                maximum_parallel: 2,
+                queue_capacity: 16,
+                exclusive_resource: None,
+            },
+            cancellation: xai_grok_protocol::CancellationSemantics::ProcessTree,
+            recovery: RecoverySemantics::Restartable,
+            artifacts: ArtifactContract::CursorStream,
+            platforms: BTreeSet::new(),
+            metadata: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn active_profile_requires_a_real_matching_manifest() {
+        let required = ProfileProviderRequirement {
+            kind: ProviderKind::NativeExecution,
+            operations: vec!["native.test".into()],
+            required_features: vec!["cursor_artifacts".to_owned()],
+            maximum_concurrency: 2,
+        };
+        let profile = profile(required);
+        assert!(validate_active_providers(&profile, vec![manifest()]).is_ok());
+        let error = validate_active_providers(&profile, Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("requires a dispatchable"));
+    }
+
+    #[test]
+    fn active_profile_rejects_manifest_exceeding_its_concurrency_cap() {
+        let required = ProfileProviderRequirement {
+            kind: ProviderKind::NativeExecution,
+            operations: vec!["native.test".into()],
+            required_features: Vec::new(),
+            maximum_concurrency: 1,
+        };
+        let error = validate_active_providers(&profile(required), vec![manifest()]).unwrap_err();
+        assert!(error.to_string().contains("maximum concurrency 1"));
+    }
 }

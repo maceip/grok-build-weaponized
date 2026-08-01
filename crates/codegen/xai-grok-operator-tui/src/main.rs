@@ -483,18 +483,46 @@ impl App {
         let height = area.height.saturating_sub(2) as usize;
         let mut rows = self
             .state
-            .outputs
-            .iter()
-            .filter(|output| self.state.output_is_in_selected_session(output))
-            .flat_map(|output| {
-                output.text.lines().map(|line| {
+            .selected_task_graphs()
+            .into_iter()
+            .flat_map(|graph| {
+                let mut graph_rows = vec![ListItem::new(Line::from(vec![
+                    Span::styled("turn   ", Style::default().fg(ACCENT)),
+                    Span::raw(format!(
+                        "{} r{} — {}",
+                        graph.engagement_id.as_str(),
+                        graph.revision,
+                        graph.objective
+                    )),
+                ]))];
+                graph_rows.extend(graph.tasks.iter().map(|node| {
                     ListItem::new(Line::from(vec![
-                        Span::styled("agent  ", Style::default().fg(ACCENT)),
-                        Span::raw(line.to_owned()),
+                        Span::styled(format!("{:?} ", node.status), Style::default().fg(ACCENT)),
+                        Span::raw(format!(
+                            "{} — {}",
+                            node.task.task_id.as_str(),
+                            node.task.objective
+                        )),
                     ]))
-                })
+                }));
+                graph_rows
             })
             .collect::<Vec<_>>();
+        rows.extend(
+            self.state
+                .outputs
+                .iter()
+                .filter(|output| self.state.output_is_in_selected_session(output))
+                .flat_map(|output| {
+                    output.text.lines().map(|line| {
+                        ListItem::new(Line::from(vec![
+                            Span::styled("agent  ", Style::default().fg(ACCENT)),
+                            Span::raw(line.to_owned()),
+                        ]))
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
         rows.extend(
             self.state
                 .events

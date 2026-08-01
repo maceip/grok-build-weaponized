@@ -3,7 +3,7 @@
 //! Ratatui and egui are adapters over this state machine. Neither renderer
 //! owns exercise/session semantics or constructs control-plane messages.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -15,8 +15,8 @@ use xai_grok_protocol::{
     ArtifactId, ClientId, Command, CommandId, CreateExercise, CreateOperationRun,
     CreateOperatorSession, EngagementId, EventEnvelope, EventReadRequest, ExerciseId,
     IngressEnvelope, IngressSource, OperationRunId, OperatorCatalog, OperatorSessionId,
-    ProjectionQuery, Response, ScopeTarget, SetTeamPresence, TaskId, TeamClient, TeamId,
-    TeamPresenceState, TeamProjection, WorkspaceId,
+    ProjectionQuery, Response, ScopeTarget, SetTeamPresence, TaskGraphProjection, TaskId,
+    TeamClient, TeamId, TeamPresenceState, TeamProjection, WorkspaceId,
 };
 
 pub const MAX_VISIBLE_EVENTS: usize = 2_000;
@@ -72,6 +72,7 @@ pub struct OperatorState {
     pub team: TeamProjection,
     pub events: VecDeque<EventEnvelope>,
     pub outputs: VecDeque<OperatorOutput>,
+    pub task_graphs: HashMap<EngagementId, TaskGraphProjection>,
     pub notice: String,
 }
 
@@ -100,6 +101,7 @@ impl Default for OperatorState {
             },
             events: VecDeque::new(),
             outputs: VecDeque::new(),
+            task_graphs: HashMap::new(),
             notice: "idle".to_owned(),
         }
     }
@@ -148,6 +150,32 @@ impl OperatorState {
                     } if session_id == selected
                 )
         })
+    }
+
+    pub fn engagement_is_in_selected_session(&self, engagement_id: &EngagementId) -> bool {
+        let Some(selected) = self.selection.session_id.as_ref() else {
+            return false;
+        };
+        self.events.iter().any(|event| {
+            event.engagement_id.as_ref() == Some(engagement_id)
+                && matches!(
+                    &event.event,
+                    xai_grok_protocol::Event::EngagementAccepted {
+                        operator_session_id: Some(session_id),
+                        ..
+                    } if session_id == selected
+                )
+        })
+    }
+
+    pub fn selected_task_graphs(&self) -> Vec<&TaskGraphProjection> {
+        let mut graphs = self
+            .task_graphs
+            .values()
+            .filter(|graph| self.engagement_is_in_selected_session(&graph.engagement_id))
+            .collect::<Vec<_>>();
+        graphs.sort_by_key(|graph| graph.last_sequence);
+        graphs
     }
 
     pub fn select_exercise(&mut self, exercise_id: ExerciseId) {
@@ -235,6 +263,9 @@ impl OperatorState {
                 while self.outputs.len() > MAX_VISIBLE_OUTPUTS {
                     self.outputs.pop_front();
                 }
+            }
+            OperatorUpdate::TaskGraph(graph) => {
+                self.task_graphs.insert(graph.engagement_id.clone(), graph);
             }
             OperatorUpdate::Notice(notice) => self.notice = notice,
         }
@@ -502,6 +533,7 @@ pub enum OperatorUpdate {
     Providers(serde_json::Value),
     Team(TeamProjection),
     Output(OperatorOutput),
+    TaskGraph(TaskGraphProjection),
     Notice(String),
 }
 
@@ -647,6 +679,25 @@ async fn client_loop(
             {
                 Ok(batch) => {
                     cursor = batch.next_sequence;
+                    let graph_engagements = batch
+                        .events
+                        .iter()
+                        .filter_map(|event| {
+                            matches!(
+                                event.event,
+                                xai_grok_protocol::Event::PlanAccepted { .. }
+                                    | xai_grok_protocol::Event::TaskStatus { .. }
+                                    | xai_grok_protocol::Event::Observation { .. }
+                                    | xai_grok_protocol::Event::ArtifactAvailable {
+                                        task_id: Some(_),
+                                        ..
+                                    }
+                                    | xai_grok_protocol::Event::ProviderOutput { .. }
+                            )
+                            .then(|| event.engagement_id.clone())
+                            .flatten()
+                        })
+                        .collect::<std::collections::BTreeSet<_>>();
                     let provider_outputs = batch
                         .events
                         .iter()
@@ -684,6 +735,21 @@ async fn client_loop(
                             Err(error) => {
                                 let _ = updates.send(OperatorUpdate::Notice(format!(
                                     "failed to read provider output: {error}"
+                                )));
+                            }
+                        }
+                    }
+                    for engagement_id in graph_engagements {
+                        match read_task_graph(&control, engagement_id).await {
+                            Ok(Some(graph)) => {
+                                if updates.send(OperatorUpdate::TaskGraph(graph)).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let _ = updates.send(OperatorUpdate::Notice(format!(
+                                    "failed to read task graph: {error}"
                                 )));
                             }
                         }
@@ -729,6 +795,25 @@ async fn client_loop(
             }
         }
     }
+}
+
+async fn read_task_graph(
+    control: &ControlPlaneClient,
+    engagement_id: EngagementId,
+) -> Result<Option<TaskGraphProjection>, Box<dyn std::error::Error>> {
+    let response = control
+        .send(
+            Command::QueryProjection(ProjectionQuery::TaskGraph { engagement_id }),
+            Duration::from_secs(2),
+        )
+        .await?;
+    let Response::Projection(snapshot) = response else {
+        return Err("daemon returned an unexpected task graph response".into());
+    };
+    if snapshot.value.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_value(snapshot.value)?))
 }
 
 async fn read_provider_output(
@@ -1004,8 +1089,8 @@ pub fn event_summary(event: &EventEnvelope) -> String {
 #[cfg(test)]
 mod tests {
     use xai_grok_protocol::{
-        Exercise, ExerciseStatus, OperationRun, OperationRunStatus, OperatorSession,
-        OperatorSessionStatus,
+        Event, EventId, Exercise, ExerciseStatus, OperationRun, OperationRunStatus,
+        OperatorSession, OperatorSessionStatus, PROTOCOL_VERSION,
     };
 
     use super::*;
@@ -1055,6 +1140,46 @@ mod tests {
         assert_eq!(state.selected_exercise().unwrap().name, "Assessment");
         assert_eq!(state.selected_operation_run().unwrap().name, "Discovery");
         assert_eq!(state.selected_session().unwrap().name, "Primary");
+    }
+
+    #[test]
+    fn task_graphs_are_scoped_to_the_selected_real_session() {
+        let mut state = OperatorState::default();
+        state.apply(OperatorUpdate::Catalog(catalog()));
+        let engagement_id = EngagementId::from_string("engagement-a");
+        state.apply(OperatorUpdate::Events {
+            events: vec![EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                event_id: EventId::new(),
+                engagement_id: Some(engagement_id.clone()),
+                sequence: 1,
+                causation_id: None,
+                generation: 0,
+                observed_unix_ms: 1,
+                event: Event::EngagementAccepted {
+                    workspace_id: "workspace-a".to_owned(),
+                    session_id: "session-a".to_owned(),
+                    exercise_id: Some(ExerciseId::from_string("exercise-a")),
+                    operation_run_id: Some(OperationRunId::from_string("run-a")),
+                    operator_session_id: Some(OperatorSessionId::from_string("session-a")),
+                    team_id: None,
+                    client_id: None,
+                },
+            }],
+            cursor: 1,
+        });
+        state.apply(OperatorUpdate::TaskGraph(TaskGraphProjection {
+            engagement_id: engagement_id.clone(),
+            revision: 1,
+            objective: "Inventory hosts".to_owned(),
+            tasks: Vec::new(),
+            last_sequence: 1,
+        }));
+        assert_eq!(state.selected_task_graphs().len(), 1);
+        assert_eq!(state.selected_task_graphs()[0].engagement_id, engagement_id);
+
+        state.selection.session_id = Some(OperatorSessionId::from_string("session-other"));
+        assert!(state.selected_task_graphs().is_empty());
     }
 
     #[test]

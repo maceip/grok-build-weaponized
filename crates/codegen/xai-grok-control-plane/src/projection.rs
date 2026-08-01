@@ -6,8 +6,9 @@ use xai_grok_protocol::{
     ExerciseEvidence, ExerciseId, ExerciseRecord, Finding, FindingId, MessageId, OperationRun,
     OperationRunId, OperatorCatalog, OperatorSession, OperatorSessionId, Playbook, PlaybookId,
     ProjectionQuery, ProjectionSnapshot, ProviderId, ResourceClaimId, ServiceHealth, ServiceId,
-    TaskId, TaskStatus, TeamId, TeamMessage, TeamPresence, TeamProjection, TeamResourceClaim,
-    TeamWorkItem, TeamWorkItemId,
+    TaskArtifactProjection, TaskGraphProjection, TaskId, TaskObservationProjection, TaskProjection,
+    TaskStatus, TeamId, TeamMessage, TeamPresence, TeamProjection, TeamResourceClaim, TeamWorkItem,
+    TeamWorkItemId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -59,6 +60,7 @@ pub struct ProviderProjection {
 struct ProjectionState {
     as_of_sequence: u64,
     engagements: HashMap<EngagementId, EngagementProjection>,
+    task_graphs: HashMap<EngagementId, TaskGraphProjection>,
     exercises: HashMap<ExerciseId, Exercise>,
     operation_runs: HashMap<OperationRunId, OperationRun>,
     sessions: HashMap<OperatorSessionId, OperatorSession>,
@@ -179,28 +181,98 @@ impl ProjectionStore {
             Event::PlanAccepted {
                 revision,
                 task_count,
+                plan,
             } => {
                 if let Some(engagement_id) = &envelope.engagement_id {
                     let projection = engagement(&mut state, engagement_id);
                     projection.plan_revision = Some(*revision);
                     projection.task_count = *task_count;
                     projection.last_sequence = envelope.sequence;
+                    if let Some(plan) = plan {
+                        let prior = state.task_graphs.remove(engagement_id);
+                        let tasks = plan
+                            .tasks
+                            .iter()
+                            .cloned()
+                            .map(|task| {
+                                let previous = prior.as_ref().and_then(|graph| {
+                                    graph
+                                        .tasks
+                                        .iter()
+                                        .find(|node| node.task.task_id == task.task_id)
+                                });
+                                TaskProjection {
+                                    task,
+                                    status: previous
+                                        .map_or(TaskStatus::Prepared, |node| node.status),
+                                    provider_id: previous.and_then(|node| node.provider_id.clone()),
+                                    observations: previous
+                                        .map_or_else(Vec::new, |node| node.observations.clone()),
+                                    artifacts: previous
+                                        .map_or_else(Vec::new, |node| node.artifacts.clone()),
+                                    last_sequence: envelope.sequence,
+                                }
+                            })
+                            .collect();
+                        state.task_graphs.insert(
+                            engagement_id.clone(),
+                            TaskGraphProjection {
+                                engagement_id: engagement_id.clone(),
+                                revision: *revision,
+                                objective: plan.objective.clone(),
+                                tasks,
+                                last_sequence: envelope.sequence,
+                            },
+                        );
+                    }
                 }
             }
             Event::TaskStatus {
-                task_id, status, ..
+                task_id,
+                status,
+                provider_id,
             } => {
                 if let Some(engagement_id) = &envelope.engagement_id {
                     let projection = engagement(&mut state, engagement_id);
                     projection.task_status.insert(task_id.clone(), *status);
                     projection.last_sequence = envelope.sequence;
+                    if let Some(node) = state.task_graphs.get_mut(engagement_id).and_then(|graph| {
+                        graph
+                            .tasks
+                            .iter_mut()
+                            .find(|node| node.task.task_id == *task_id)
+                    }) {
+                        node.status = *status;
+                        node.provider_id.clone_from(provider_id);
+                        node.last_sequence = envelope.sequence;
+                    }
+                    if let Some(graph) = state.task_graphs.get_mut(engagement_id) {
+                        graph.last_sequence = envelope.sequence;
+                    }
                 }
             }
-            Event::Observation { .. } => {
+            Event::Observation {
+                task_id,
+                observation,
+            } => {
                 if let Some(engagement_id) = &envelope.engagement_id {
                     let projection = engagement(&mut state, engagement_id);
                     projection.observations = projection.observations.saturating_add(1);
                     projection.last_sequence = envelope.sequence;
+                    if let Some(graph) = state.task_graphs.get_mut(engagement_id) {
+                        if let Some(node) = graph
+                            .tasks
+                            .iter_mut()
+                            .find(|node| node.task.task_id == *task_id)
+                        {
+                            node.observations.push(TaskObservationProjection {
+                                sequence: envelope.sequence,
+                                observation: observation.clone(),
+                            });
+                            node.last_sequence = envelope.sequence;
+                        }
+                        graph.last_sequence = envelope.sequence;
+                    }
                 }
             }
             Event::ArtifactAvailable {
@@ -220,6 +292,25 @@ impl ProjectionStore {
                         sequence: envelope.sequence,
                     });
                     projection.last_sequence = envelope.sequence;
+                    if let Some(task_id) = task_id
+                        && let Some(graph) = state.task_graphs.get_mut(engagement_id)
+                    {
+                        if let Some(node) = graph
+                            .tasks
+                            .iter_mut()
+                            .find(|node| node.task.task_id == *task_id)
+                        {
+                            node.artifacts.push(TaskArtifactProjection {
+                                artifact_id: artifact_id.clone(),
+                                media_type: media_type.clone(),
+                                byte_size: *byte_size,
+                                sequence: envelope.sequence,
+                                provider_output: false,
+                            });
+                            node.last_sequence = envelope.sequence;
+                        }
+                        graph.last_sequence = envelope.sequence;
+                    }
                 }
             }
             Event::ProviderOutput {
@@ -234,6 +325,23 @@ impl ProjectionStore {
                         sequence: envelope.sequence,
                     });
                     projection.last_sequence = envelope.sequence;
+                    if let Some(graph) = state.task_graphs.get_mut(engagement_id) {
+                        if let Some(node) = graph
+                            .tasks
+                            .iter_mut()
+                            .find(|node| node.task.task_id == *task_id)
+                        {
+                            if let Some(artifact) = node
+                                .artifacts
+                                .iter_mut()
+                                .find(|artifact| artifact.artifact_id == *artifact_id)
+                            {
+                                artifact.provider_output = true;
+                            }
+                            node.last_sequence = envelope.sequence;
+                        }
+                        graph.last_sequence = envelope.sequence;
+                    }
                 }
             }
             Event::ProviderState {
@@ -276,6 +384,10 @@ impl ProjectionStore {
         let value = match query {
             ProjectionQuery::Engagement { engagement_id } => {
                 serde_json::to_value(state.engagements.get(&engagement_id))
+                    .unwrap_or(serde_json::Value::Null)
+            }
+            ProjectionQuery::TaskGraph { engagement_id } => {
+                serde_json::to_value(state.task_graphs.get(&engagement_id))
                     .unwrap_or(serde_json::Value::Null)
             }
             ProjectionQuery::OperatorCatalog { workspace_id } => {

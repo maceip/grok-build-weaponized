@@ -326,6 +326,10 @@ pub enum Event {
     PlanAccepted {
         revision: u32,
         task_count: u32,
+        /// Full typed graph for rebuildable dependency and evidence projections.
+        /// Older journals omit this field and remain replayable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<crate::TaskingPlan>,
     },
     TaskStatus {
         task_id: TaskId,
@@ -376,6 +380,9 @@ pub struct EventEnvelope {
 #[serde(tag = "query", rename_all = "snake_case")]
 pub enum ProjectionQuery {
     Engagement {
+        engagement_id: EngagementId,
+    },
+    TaskGraph {
         engagement_id: EngagementId,
     },
     OperatorCatalog {

@@ -20,7 +20,7 @@ const USAGE: &str = "\
 grokctl [--socket PATH] [--team ID --client ID] COMMAND
 
 Commands:
-  status [capacity|providers|catalog [WORKSPACE]|exercise ID|engagement ID]
+  status [capacity|providers|catalog [WORKSPACE]|exercise ID|engagement ID|tasks ENGAGEMENT_ID]
   events [--after N] [--limit N] [--wait-ms N] [--engagement ID] [--follow]
   exercise create --workspace ID --name NAME --objective TEXT --scope SELECTORS
   playbook create --workspace ID --name NAME --description TEXT --steps FILE|-
@@ -623,6 +623,12 @@ async fn status(
             engagement_id: arguments
                 .pop_front()
                 .ok_or("status engagement requires an id")?
+                .into(),
+        },
+        Some("tasks") | Some("task-graph") => ProjectionQuery::TaskGraph {
+            engagement_id: arguments
+                .pop_front()
+                .ok_or("status tasks requires an engagement id")?
                 .into(),
         },
         Some(other) => return Err(format!("unknown status projection {other:?}").into()),

@@ -50,7 +50,8 @@ pub use profile::{
 };
 pub use tasking::{
     CapabilityRequirement, CompletionDecision, CompletionTest, EvidenceObservation, ExecutionMode,
-    ExecutionTask, ProviderDispatch, TaskStatus, TaskingPlan,
+    ExecutionTask, ProviderDispatch, TaskArtifactProjection, TaskGraphProjection,
+    TaskObservationProjection, TaskProjection, TaskStatus, TaskingPlan,
 };
 pub use team::{
     ClaimTeamResource, CreateTeamWorkItem, EventBatch, EventReadRequest, MAX_EVENT_BATCH,

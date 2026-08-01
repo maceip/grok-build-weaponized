@@ -180,6 +180,43 @@ pub struct EvidenceObservation {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskObservationProjection {
+    pub sequence: u64,
+    pub observation: EvidenceObservation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskArtifactProjection {
+    pub artifact_id: ArtifactId,
+    pub media_type: String,
+    pub byte_size: u64,
+    pub sequence: u64,
+    #[serde(default)]
+    pub provider_output: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskProjection {
+    pub task: ExecutionTask,
+    pub status: TaskStatus,
+    pub provider_id: Option<ProviderId>,
+    #[serde(default)]
+    pub observations: Vec<TaskObservationProjection>,
+    #[serde(default)]
+    pub artifacts: Vec<TaskArtifactProjection>,
+    pub last_sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskGraphProjection {
+    pub engagement_id: EngagementId,
+    pub revision: u32,
+    pub objective: String,
+    pub tasks: Vec<TaskProjection>,
+    pub last_sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum CompletionDecision {
     Complete {

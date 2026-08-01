@@ -251,6 +251,56 @@ impl OperatorApp {
             );
         }
         ui.separator();
+        let task_graphs = self.state.selected_task_graphs();
+        if !task_graphs.is_empty() {
+            ui.heading("Execution graphs");
+        }
+        for graph in task_graphs {
+            ui.collapsing(
+                format!(
+                    "Turn {} · revision {}",
+                    graph.engagement_id.as_str(),
+                    graph.revision
+                ),
+                |ui| {
+                    ui.label(&graph.objective);
+                    for node in &graph.tasks {
+                        ui.group(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong(format!("{:?}", node.status));
+                                ui.monospace(node.task.task_id.as_str());
+                                if let Some(provider) = &node.provider_id {
+                                    ui.label(format!("via {}", provider.as_str()));
+                                }
+                            });
+                            ui.label(&node.task.objective);
+                            if !node.task.depends_on.is_empty() {
+                                ui.small(format!(
+                                    "depends on {}",
+                                    node.task
+                                        .depends_on
+                                        .iter()
+                                        .map(|dependency| dependency.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ));
+                            }
+                            for observation in &node.observations {
+                                ui.label(format!("• {}", observation.observation.finding));
+                            }
+                            if !node.artifacts.is_empty() {
+                                ui.monospace(format!(
+                                    "{} artifact{}",
+                                    node.artifacts.len(),
+                                    if node.artifacts.len() == 1 { "" } else { "s" }
+                                ));
+                            }
+                        });
+                    }
+                },
+            );
+        }
+        ui.separator();
         for output in self
             .state
             .outputs

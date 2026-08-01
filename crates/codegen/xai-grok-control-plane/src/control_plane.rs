@@ -1249,6 +1249,7 @@ impl ControlPlaneCore {
                             Event::PlanAccepted {
                                 revision: plan.revision,
                                 task_count: plan.tasks.len() as u32,
+                                plan: Some(plan.clone()),
                             },
                         )
                         .await?;
@@ -1301,6 +1302,7 @@ impl ControlPlaneCore {
                     Event::PlanAccepted {
                         revision: plan.revision,
                         task_count: plan.tasks.len() as u32,
+                        plan: Some(plan.clone()),
                     },
                 )
                 .await?;
@@ -1442,30 +1444,25 @@ impl ControlPlaneCore {
                 Ok(Response::Ack)
             }
             Command::RegisterProvider { manifest } => {
-                let record = self.services.register(manifest).await?;
-                self.emit(
-                    None,
-                    causation_id,
-                    record.generation,
-                    Event::ProviderState {
-                        provider_id: record.provider_id.clone(),
-                        service_id: record.service_id,
-                        generation: record.generation,
-                        health: record.health,
-                    },
-                )
-                .await?;
-                Ok(Response::ProviderRegistered {
-                    provider_id: record.provider_id,
-                    generation: record.generation,
-                    manifest_hash: record.manifest_hash,
-                })
+                let _ = manifest;
+                Err(ProtocolError::new(
+                    ProtocolErrorCode::UnsupportedOperation,
+                    "metadata-only provider registration is disabled because it cannot attach an executable provider; providers must be registered through a supervised executable transport",
+                ))
             }
             Command::ProviderHeartbeat {
                 provider_id,
                 generation,
                 health,
             } => {
+                if self.providers.generation(&provider_id).await != Some(generation) {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::UnknownProvider,
+                        format!(
+                            "provider {provider_id} generation {generation} has no executable registration"
+                        ),
+                    ));
+                }
                 let record = self
                     .services
                     .heartbeat(&provider_id, generation, health)
@@ -2635,8 +2632,8 @@ mod tests {
         FindingSeverity, FindingStatus, IngressEnvelope, IngressSource, OperationDescriptor,
         OperatorCatalog, PlaybookStep, PostTeamMessage, ProjectionQuery, ProviderKind,
         RecordExerciseEvidence, RecoverySemantics, RequestId, ScopeTarget, SetTeamPresence,
-        TargetId, TargetKind, TaskId, TeamClient, TeamId, TeamPresenceState, TeamWorkItemStatus,
-        VersionRange, WorkspaceId,
+        TargetId, TargetKind, TaskGraphProjection, TaskId, TeamClient, TeamId, TeamPresenceState,
+        TeamWorkItemStatus, VersionRange, WorkspaceId,
     };
 
     use super::*;
@@ -3439,6 +3436,38 @@ mod tests {
         manifest
     }
 
+    #[tokio::test]
+    async fn socket_command_cannot_publish_a_metadata_only_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let control_plane = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
+            .await
+            .unwrap();
+        let handle = control_plane.handle();
+        let error = handle
+            .submit(envelope(Command::RegisterProvider {
+                manifest: provider_manifest(),
+            }))
+            .await
+            .unwrap()
+            .response
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::UnsupportedOperation);
+        assert!(handle.providers().manifests().await.is_empty());
+        assert!(
+            handle
+                .submit(envelope(Command::QueryProjection(
+                    ProjectionQuery::Providers,
+                )))
+                .await
+                .unwrap()
+                .response
+                .is_ok()
+        );
+
+        handle.shutdown_token().cancel();
+        control_plane.wait().await;
+    }
+
     async fn all_events(handle: &ControlPlaneHandle) -> Vec<EventEnvelope> {
         let response = handle
             .submit(envelope(Command::ReadEvents(EventReadRequest {
@@ -3703,7 +3732,7 @@ mod tests {
         };
         handle
             .submit(envelope(Command::SubmitPlan(TaskingPlan {
-                engagement_id,
+                engagement_id: engagement_id.clone(),
                 revision: 2,
                 objective: "ordered execution".to_owned(),
                 tasks: vec![
@@ -3727,9 +3756,76 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(*executed.lock().unwrap(), vec![first_id, second_id]);
+        let graph = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = handle
+                    .submit(envelope(Command::QueryProjection(
+                        ProjectionQuery::TaskGraph {
+                            engagement_id: engagement_id.clone(),
+                        },
+                    )))
+                    .await
+                    .unwrap()
+                    .response
+                    .unwrap();
+                let Response::Projection(snapshot) = response else {
+                    panic!("expected task graph projection");
+                };
+                let graph: TaskGraphProjection =
+                    serde_json::from_value(snapshot.value).expect("task graph exists");
+                if graph
+                    .tasks
+                    .iter()
+                    .all(|task| task.status == TaskStatus::Completed)
+                {
+                    break graph;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(graph.revision, 2);
+        assert_eq!(graph.objective, "ordered execution");
+        assert_eq!(
+            graph.tasks[1].task.depends_on,
+            vec![graph.tasks[0].task.task_id.clone()]
+        );
+        assert!(
+            graph
+                .tasks
+                .iter()
+                .all(|task| task.provider_id.as_ref().map(ProviderId::as_str)
+                    == Some("test-provider"))
+        );
+        assert!(graph.tasks.iter().all(|task| {
+            task.artifacts
+                .iter()
+                .any(|artifact| artifact.provider_output)
+        }));
 
         handle.shutdown_token().cancel();
         control_plane.wait().await;
+
+        let reopened = ControlPlane::open(ControlPlaneConfig::new(directory.path()))
+            .await
+            .unwrap();
+        let response = reopened
+            .handle()
+            .submit(envelope(Command::QueryProjection(
+                ProjectionQuery::TaskGraph { engagement_id },
+            )))
+            .await
+            .unwrap()
+            .response
+            .unwrap();
+        let Response::Projection(snapshot) = response else {
+            panic!("expected replayed task graph projection");
+        };
+        let replayed: TaskGraphProjection = serde_json::from_value(snapshot.value).unwrap();
+        assert_eq!(replayed, graph);
+        reopened.handle().shutdown_token().cancel();
+        reopened.wait().await;
     }
 
     async fn register_counting_provider(handle: &ControlPlaneHandle, executions: Arc<AtomicUsize>) {

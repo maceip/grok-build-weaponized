@@ -24,6 +24,8 @@ pub const NATIVE_PROVIDER_ID: &str = "native-execution";
 pub struct NativeExecutionProvider {
     supervisor: Arc<NativeExecutionSupervisor>,
     request_jobs: RwLock<HashMap<RequestId, String>>,
+    maximum_parallel: u32,
+    queue_capacity: u32,
 }
 
 impl NativeExecutionProvider {
@@ -45,13 +47,24 @@ impl NativeExecutionProvider {
         root: PathBuf,
         limits: NativeExecutionLimits,
     ) -> Result<Arc<Self>, NativeExecutionError> {
+        let maximum_parallel = u32::try_from(limits.maximum_parallel.max(1)).unwrap_or(u32::MAX);
+        let queue_capacity = u32::try_from(limits.maximum_jobs.max(1)).unwrap_or(u32::MAX);
         Ok(Arc::new(Self {
             supervisor: NativeExecutionSupervisor::open_with_limits(root, limits).await?,
             request_jobs: RwLock::new(HashMap::new()),
+            maximum_parallel,
+            queue_capacity,
         }))
     }
 
     pub fn capability_manifest() -> CapabilityManifest {
+        Self::capability_manifest_with_capacity(100, 10_000)
+    }
+
+    fn capability_manifest_with_capacity(
+        maximum_parallel: u32,
+        queue_capacity: u32,
+    ) -> CapabilityManifest {
         let operation = |id: &str, name: &str, streaming: bool| OperationDescriptor {
             operation_id: id.into(),
             display_name: name.to_owned(),
@@ -114,8 +127,8 @@ impl NativeExecutionProvider {
             .collect(),
             operations,
             concurrency: ConcurrencyProfile {
-                maximum_parallel: 100,
-                queue_capacity: 512,
+                maximum_parallel,
+                queue_capacity,
                 exclusive_resource: None,
             },
             cancellation: CancellationSemantics::ProcessTree,
@@ -139,7 +152,7 @@ impl NativeExecutionProvider {
 #[async_trait]
 impl ExecutionProvider for NativeExecutionProvider {
     fn manifest(&self) -> CapabilityManifest {
-        Self::capability_manifest()
+        Self::capability_manifest_with_capacity(self.maximum_parallel, self.queue_capacity)
     }
 
     async fn health(&self) -> ServiceHealth {
