@@ -8,7 +8,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agent_client_protocol::{self as acp, Agent as _};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+use tokio_util::{
+    compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _},
+    sync::CancellationToken,
+};
 use xai_acp_lib::LineBufferedRead;
 use xai_grok_protocol::{
     ArtifactContract, CancellationSemantics, CapabilityManifest, ConcurrencyProfile,
@@ -471,6 +474,7 @@ async fn run_generation(
         HashMap::<String, Rc<tokio::sync::Mutex<()>>>::new(),
     ));
     let active = Rc::new(RefCell::new(HashMap::<RequestId, acp::SessionId>::new()));
+    let pending = Rc::new(RefCell::new(HashMap::<RequestId, CancellationToken>::new()));
 
     loop {
         tokio::select! {
@@ -495,15 +499,21 @@ async fn run_generation(
                     }
                     WorkerCommand::Cancel { request_id, respond_to } => {
                         let session_id = active.borrow().get(&request_id).cloned();
-                        let result = if let Some(session_id) = session_id {
+                        let cancellation = pending.borrow().get(&request_id).cloned();
+                        let result = if let Some(cancellation) = cancellation {
+                            cancellation.cancel();
+                            if let Some(session_id) = session_id {
                             connection
                                 .cancel(acp::CancelNotification::new(session_id))
                                 .await
                                 .map_err(|error| unavailable(format!("agent cancellation failed: {error}")))
+                            } else {
+                                Ok(())
+                            }
                         } else {
                             Err(ProtocolError::new(
                                 ProtocolErrorCode::NotFound,
-                                format!("active agent request {request_id} was not found"),
+                                format!("admitted agent request {request_id} was not found"),
                             ))
                         };
                         let _ = respond_to.send(result);
@@ -527,11 +537,24 @@ async fn run_generation(
                         let _ = respond_to.send(result);
                     }
                     WorkerCommand::Execute { dispatch, respond_to } => {
+                        let request_id = dispatch.request_id.clone();
+                        if pending.borrow().contains_key(&request_id) {
+                            let _ = respond_to.send(Err(ProtocolError::new(
+                                ProtocolErrorCode::Conflict,
+                                format!("agent request {request_id} is already active"),
+                            )));
+                            continue;
+                        }
+                        let cancellation = CancellationToken::new();
+                        pending
+                            .borrow_mut()
+                            .insert(request_id.clone(), cancellation.clone());
                         let connection = connection.clone();
                         let captures = captures.clone();
                         let sessions = sessions.clone();
                         let session_locks = session_locks.clone();
                         let active = active.clone();
+                        let pending = pending.clone();
                         let config = config.clone();
                         tokio::task::spawn_local(async move {
                             let result = execute_turn(
@@ -542,8 +565,11 @@ async fn run_generation(
                                 &active,
                                 &config,
                                 *dispatch,
+                                cancellation,
                             )
                             .await;
+                            active.borrow_mut().remove(&request_id);
+                            pending.borrow_mut().remove(&request_id);
                             let _ = respond_to.send(result);
                         });
                     }
@@ -612,6 +638,7 @@ async fn execute_turn(
     active: &RefCell<HashMap<RequestId, acp::SessionId>>,
     config: &AgentProviderConfig,
     dispatch: ProviderDispatch,
+    cancellation: CancellationToken,
 ) -> Result<ProviderOutput, ProtocolError> {
     let input: AgentTurnInput =
         serde_json::from_value(dispatch.task.input.clone()).map_err(|error| {
@@ -630,7 +657,11 @@ async fn execute_turn(
         .entry(session_key.clone())
         .or_insert_with(|| Rc::new(tokio::sync::Mutex::new(())))
         .clone();
-    let _session_guard = lock.lock().await;
+    let _session_guard = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(agent_cancelled(&dispatch.request_id)),
+        guard = lock.lock() => guard,
+    };
     let workspace = input.workspace.as_deref().unwrap_or(&config.workspace);
     let session_id = if let Some(session_id) = sessions.borrow().get(&session_key).cloned() {
         session_id
@@ -644,40 +675,45 @@ async fn execute_turn(
                     .cloned(),
             );
         }
-        let response = connection
-            .new_session(request)
-            .await
-            .map_err(|error| unavailable(format!("agent session creation failed: {error}")))?;
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(agent_cancelled(&dispatch.request_id)),
+            response = connection.new_session(request) => response
+                .map_err(|error| unavailable(format!("agent session creation failed: {error}")))?,
+        };
         sessions
             .borrow_mut()
             .insert(session_key.clone(), response.session_id.clone());
         response.session_id
     };
+    if cancellation.is_cancelled() {
+        return Err(agent_cancelled(&dispatch.request_id));
+    }
     active
         .borrow_mut()
         .insert(dispatch.request_id.clone(), session_id.clone());
     captures.begin(&session_id);
     let remaining_ms = dispatch.task.deadline_unix_ms.saturating_sub(now_unix_ms());
-    let prompt = tokio::time::timeout(
-        Duration::from_millis(remaining_ms.max(1)),
-        connection.prompt(acp::PromptRequest::new(
-            session_id.clone(),
-            vec![acp::ContentBlock::Text(acp::TextContent::new(
-                input.request,
-            ))],
-        )),
-    )
-    .await;
-    active.borrow_mut().remove(&dispatch.request_id);
-    let capture = captures.finish(&session_id);
-    let response = prompt
-        .map_err(|_| {
-            ProtocolError::new(
+    let prompt = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(agent_cancelled(&dispatch.request_id)),
+        response = tokio::time::timeout(
+            Duration::from_millis(remaining_ms.max(1)),
+            connection.prompt(acp::PromptRequest::new(
+                session_id.clone(),
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    input.request,
+                ))],
+            )),
+        ) => response
+            .map_err(|_| ProtocolError::new(
                 ProtocolErrorCode::DeadlineExceeded,
                 "agent turn exceeded its durable task deadline",
-            )
-        })?
-        .map_err(|error| unavailable(format!("agent turn failed: {error}")))?;
+            ))?
+            .map_err(|error| unavailable(format!("agent turn failed: {error}"))),
+    };
+    let capture = captures.finish(&session_id);
+    let response = prompt?;
     let output = serde_json::json!({
         "session_key": session_key,
         "agent_session_id": session_id.0.as_ref(),
@@ -691,6 +727,13 @@ async fn execute_turn(
         artifacts: Vec::new(),
         terminal_status: None,
     })
+}
+
+fn agent_cancelled(request_id: &RequestId) -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::Cancelled,
+        format!("agent request {request_id} was cancelled before completion"),
+    )
 }
 
 fn manifest(config: &AgentProviderConfig) -> CapabilityManifest {
