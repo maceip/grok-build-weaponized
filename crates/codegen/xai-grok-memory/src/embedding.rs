@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
@@ -142,6 +143,13 @@ pub struct LocalEmbeddingProvider {
     inner: Arc<LocalEmbeddingInner>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalEmbeddingStatus {
+    Loading,
+    Ready,
+    Failed(String),
+}
+
 impl LocalEmbeddingProvider {
     pub fn from_config(config: &xai_grok_config_types::MemoryEmbeddingConfig) -> Option<Self> {
         let model = config.model.as_deref()?;
@@ -212,6 +220,40 @@ impl LocalEmbeddingProvider {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
             LocalModelState::Ready { .. }
         )
+    }
+
+    pub fn status(&self) -> LocalEmbeddingStatus {
+        match &*self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            LocalModelState::Loading => LocalEmbeddingStatus::Loading,
+            LocalModelState::Ready { .. } => LocalEmbeddingStatus::Ready,
+            LocalModelState::Failed(error) => LocalEmbeddingStatus::Failed(error.clone()),
+        }
+    }
+
+    /// Wait for an explicitly requested maintenance operation to materialize
+    /// the local model. Interactive retrieval intentionally never calls this:
+    /// it falls back to FTS immediately while the model is loading or busy.
+    pub async fn wait_ready(&self, timeout: Duration) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match self.status() {
+                LocalEmbeddingStatus::Ready => return Ok(()),
+                LocalEmbeddingStatus::Failed(error) => return Err(error),
+                LocalEmbeddingStatus::Loading => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "local embedding model did not become ready within {} seconds",
+                    timeout.as_secs()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     fn prepare(&self, texts: &[&str], query: bool) -> Vec<String> {

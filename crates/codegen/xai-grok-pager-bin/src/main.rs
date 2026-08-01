@@ -2049,7 +2049,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 return xai_grok_pager::trace_cmd::run(trace_args, &agent_config).await;
             }
             Command::Memory(memory_args) => {
-                return xai_grok_pager::memory_cmd::run(memory_args);
+                return xai_grok_pager::memory_cmd::run(memory_args).await;
             }
             Command::Update {
                 check,
